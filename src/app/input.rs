@@ -641,6 +641,9 @@ impl App {
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
                 Action::DeleteSession if !in_diff => self.confirm_delete_selected_session()?,
                 Action::RenameSession if !in_diff => self.open_rename_session()?,
+                Action::OpenCurrentPullRequest if !in_diff && self.current_pr_info().is_some() => {
+                    self.open_current_pr_in_browser()?
+                }
                 Action::ReconnectAgent if !in_diff => {
                     // Allow relaunching an exited agent from the center pane,
                     // or entering interactive mode if the agent is active.
@@ -1777,8 +1780,8 @@ impl App {
                 }
                 _ => {
                     // Text input fallback: Tab (autocomplete), then delegate to TextInput.
-                    if key.code == KeyCode::Tab {
-                        let completion = match &self.prompt {
+                    let tab_completion = if key.code == KeyCode::Tab {
+                        match &self.prompt {
                             PromptState::Command {
                                 input, selected, ..
                             } => self
@@ -1787,21 +1790,22 @@ impl App {
                                 .and_then(|binding| binding.palette_name)
                                 .map(str::to_string),
                             _ => None,
-                        };
-                        if let Some(completion) = completion
-                            && let PromptState::Command {
-                                input, selected, ..
-                            } = &mut self.prompt
-                        {
-                            input.set_text(completion);
-                            *selected = 0;
                         }
-                    } else if let PromptState::Command {
+                    } else {
+                        None
+                    };
+                    if let PromptState::Command {
                         input, selected, ..
                     } = &mut self.prompt
-                        && input.handle_key(key)
                     {
-                        *selected = 0;
+                        if let Some(command) = tab_completion {
+                            input.set_text(command);
+                            *selected = 0;
+                        } else if key.code == KeyCode::Tab {
+                            // No completion matched; leave the command text unchanged.
+                        } else if input.handle_key(key) {
+                            *selected = 0;
+                        }
                     }
                 }
             }
@@ -5432,8 +5436,8 @@ mod tests {
     use crate::editor::{DetectedEditor, EditorKind};
     use crate::keybindings::{Action, BINDING_DEFS, BindingScope, RuntimeBindings};
     use crate::model::{
-        AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProjectBranchStatus,
-        ProviderKind, SessionStatus, SessionSurface,
+        AgentSession, ChangedFile, CompanionTerminalStatus, PrInfo, PrState, Project,
+        ProjectBranchStatus, ProviderKind, SessionStatus, SessionSurface,
     };
     use crate::pty::PtyClient;
     use crate::statusline::StatusLine;
@@ -7926,6 +7930,70 @@ not_a_real_action = ["x"]
             }
             other => panic!("expected command prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn command_palette_hides_current_pr_command_without_known_pr() {
+        let app = test_app(default_bindings());
+        let commands = app.filtered_palette_commands("open-current-pr");
+
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn command_palette_shows_current_pr_command_with_known_pr() {
+        let mut app = test_app(default_bindings());
+        app.pr_statuses.insert(
+            "session-1".to_string(),
+            PrInfo {
+                number: 42,
+                state: PrState::Merged,
+                title: "Demo PR".to_string(),
+                host: "github.com".to_string(),
+                owner_repo: "owner/repo".to_string(),
+                url: "https://github.com/owner/repo/pull/42".to_string(),
+            },
+        );
+
+        let commands = app.filtered_palette_commands("open-current-pr");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].palette_name, Some("open-current-pr"));
+        assert_eq!(
+            app.current_pr_url(),
+            Some("https://github.com/owner/repo/pull/42")
+        );
+    }
+
+    #[test]
+    fn footer_hints_show_pr_only_for_center_focus_with_known_pr() {
+        let mut app = test_app(default_bindings());
+        app.pr_statuses.insert(
+            "session-1".to_string(),
+            PrInfo {
+                number: 42,
+                state: PrState::Closed,
+                title: "Demo PR".to_string(),
+                host: "github.com".to_string(),
+                owner_repo: "owner/repo".to_string(),
+                url: "https://github.com/owner/repo/pull/42".to_string(),
+            },
+        );
+
+        let center_hints = app.footer_hints_for(crate::keybindings::HintContext::Center);
+        let left_hints = app.footer_hints_for(crate::keybindings::HintContext::LeftSession);
+
+        assert_eq!(center_hints.first().map(|hint| hint.1), Some("PR"));
+        assert_eq!(center_hints.first().map(|hint| hint.0.as_str()), Some("p"));
+        assert!(!left_hints.iter().any(|(_, desc)| *desc == "PR"));
+    }
+
+    #[test]
+    fn footer_hints_hide_pr_without_known_pr() {
+        let app = test_app(default_bindings());
+        let center_hints = app.footer_hints_for(crate::keybindings::HintContext::Center);
+
+        assert!(!center_hints.iter().any(|(_, desc)| *desc == "PR"));
     }
 
     #[test]

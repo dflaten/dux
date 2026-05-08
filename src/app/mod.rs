@@ -1532,6 +1532,7 @@ impl App {
                     title: pr.title,
                     host: pr.host,
                     owner_repo: pr.owner_repo,
+                    url: pr.url,
                 },
             );
         }
@@ -1681,6 +1682,13 @@ impl App {
         self.spawn_resource_stats_worker();
     }
 
+    fn is_palette_action_available(&self, action: Action) -> bool {
+        match action {
+            Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
+            _ => true,
+        }
+    }
+
     /// Gather the labeled PIDs that the resource monitor should report on.
     /// Each entry is `(label, root_pid)` — the worker will aggregate the
     /// full process tree under each root.
@@ -1733,7 +1741,9 @@ impl App {
             .filtered_palette(input)
             .into_iter()
             .filter(|binding| {
-                binding.action != Action::NewAgentFromPr || self.github_pr_agent_command_available()
+                self.is_palette_action_available(binding.action)
+                    && (binding.action != Action::NewAgentFromPr
+                        || self.github_pr_agent_command_available())
             })
             .collect()
     }
@@ -1764,6 +1774,7 @@ impl App {
             "copy-path" => self.copy_selected_path(),
             "open-worktree" => self.open_selected_worktree_in_default_editor(),
             "open-worktree-with" => self.open_worktree_editor_picker(),
+            "open-current-pr" => self.open_current_pr_in_browser(),
             "toggle-project" => {
                 self.toggle_collapse_selected_project();
                 Ok(())

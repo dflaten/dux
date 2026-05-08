@@ -1872,7 +1872,7 @@ impl App {
             FocusPane::Center => HintContext::Center,
             FocusPane::Files => HintContext::Files,
         };
-        let hints = self.bindings.hints_for(ctx);
+        let hints = self.footer_hints_for(ctx);
         let [hints_area, status_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -1940,6 +1940,17 @@ impl App {
             .style(Style::default().bg(status_bg))
             .wrap(Wrap { trim: false })
             .render(status_area, frame.buffer_mut());
+    }
+
+    pub(crate) fn footer_hints_for(&self, ctx: HintContext) -> Vec<(String, &'static str)> {
+        let mut hints = self.bindings.hints_for(ctx);
+        if matches!(ctx, HintContext::Center) && self.current_pr_info().is_some() {
+            let key = self.bindings.label_for(Action::OpenCurrentPullRequest);
+            if !key.is_empty() {
+                hints.insert(0, (key, "PR"));
+            }
+        }
+        hints
     }
 
     fn render_help(&mut self, frame: &mut Frame) {

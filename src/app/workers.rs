@@ -216,14 +216,15 @@ impl App {
                                     crate::model::PrState::Merged => "MERGED",
                                     crate::model::PrState::Closed => "CLOSED",
                                 };
-                                let _ = self.session_store.upsert_pr(
-                                    &session_id,
-                                    pr.number,
-                                    &pr.host,
-                                    &pr.owner_repo,
-                                    state_str,
-                                    &pr.title,
-                                );
+                                let _ = self.session_store.upsert_pr(&crate::storage::StoredPr {
+                                    session_id: session_id.clone(),
+                                    pr_number: pr.number,
+                                    host: pr.host.clone(),
+                                    owner_repo: pr.owner_repo.clone(),
+                                    state: state_str.to_string(),
+                                    title: pr.title.clone(),
+                                    url: pr.url.clone(),
+                                });
                                 self.pr_statuses.insert(session_id, pr);
                                 changed = true;
                             }
@@ -1737,6 +1738,7 @@ fn reconstruct_from_stored(stored: &crate::storage::StoredPr) -> Option<crate::m
         title: stored.title.clone(),
         host: stored.host.clone(),
         owner_repo: stored.owner_repo.clone(),
+        url: stored.url.clone(),
     })
 }
 
@@ -1756,7 +1758,7 @@ fn view_pr_by_number(
             "--repo",
             &repo,
             "--json",
-            "number,state,title",
+            "number,state,title,url",
         ])
         .output()
         .ok()?;
@@ -1792,7 +1794,7 @@ fn discover_pr_by_branch(
             "--state",
             "all",
             "--json",
-            "number,state,title",
+            "number,state,title,url",
             "--limit",
             "1",
         ])
@@ -1834,6 +1836,12 @@ fn parse_pr_json_value(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let url = obj
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| pull_request_url(host, owner_repo, number));
     let state = match state_str {
         "OPEN" => PrState::Open,
         "MERGED" => PrState::Merged,
@@ -1847,9 +1855,9 @@ fn parse_pr_json_value(
         title,
         host: normalize_github_host(host).to_string(),
         owner_repo: owner_repo.to_string(),
+        url,
     })
 }
-
 fn parse_resolved_pull_request_json(
     json: &str,
     project: Project,
@@ -1914,6 +1922,7 @@ fn normalize_github_host(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PrState;
 
     #[test]
     fn gh_repo_arg_uses_owner_repo_for_github_dot_com() {
@@ -1935,5 +1944,32 @@ mod tests {
             pull_request_url("", "owner/repo", 12),
             "https://github.com/owner/repo/pull/12"
         );
+    }
+
+    #[test]
+    fn parse_pr_json_object_uses_gh_url_when_present() {
+        let pr = parse_pr_json_object(
+            r#"{"number":42,"state":"OPEN","title":"Demo","url":"https://github.com/owner/repo/pull/42"}"#,
+            "github.com",
+            "owner/repo",
+        )
+        .expect("pr");
+
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.state, PrState::Open);
+        assert_eq!(pr.url, "https://github.com/owner/repo/pull/42");
+    }
+
+    #[test]
+    fn parse_pr_json_object_falls_back_to_host_url() {
+        let pr = parse_pr_json_object(
+            r#"{"number":42,"state":"MERGED","title":"Demo"}"#,
+            "github.example.com",
+            "owner/repo",
+        )
+        .expect("pr");
+
+        assert_eq!(pr.state, PrState::Merged);
+        assert_eq!(pr.url, "https://github.example.com/owner/repo/pull/42");
     }
 }
