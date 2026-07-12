@@ -1003,7 +1003,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     BindingDef {
         action: Action::PasteSelectionToTerminal,
         default_keys: &[key!(ctrl - e)],
-        scopes: &[BindingScope::Center],
+        scopes: &[BindingScope::Interactive, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Agent pane",
             description: "Paste selected agent output into the companion terminal",
@@ -3121,6 +3121,17 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, Action::ExitInteractive);
         assert!(!result.unwrap().1); // not conditional
+    }
+
+    #[test]
+    fn interactive_byte_patterns_matches_paste_selection_shortcut() {
+        let bindings = default_bindings();
+        let patterns = bindings.interactive_byte_patterns();
+        // PasteSelectionToTerminal default is Ctrl-E → 0x05.
+        let result = patterns.match_sequence(&[0x05]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, Action::PasteSelectionToTerminal);
+        assert!(!result.unwrap().1);
     }
 
     #[test]
