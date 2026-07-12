@@ -1,8 +1,10 @@
 # dux
 
-[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/patrickdappollonio/dux/total)](https://github.com/patrickdappollonio/dux/releases/latest) [![NPM Downloads](https://img.shields.io/npm/dm/%40patrickdappollonio%2Fdux)](https://www.npmjs.com/package/@patrickdappollonio/dux) ![GitHub License](https://img.shields.io/github/license/patrickdappollonio/dux)
+![GitHub License](https://img.shields.io/github/license/dflaten/dux)
 
 <img src="assets/dux-logo.png" width="200" align="right" />
+
+This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). It may differ from upstream and is intended to be installed from source rather than through upstream release channels.
 
 Your AI agents deserve a proper office. **dux** (pronounced "dooks") is a terminal UI that lets you run multiple AI coding agents side by side, each in its own git worktree, with full companion terminals, macros, commit generation, and a command palette that knows more tricks than you do.
 
@@ -20,54 +22,28 @@ Every agent runs through a PTY, the same pseudo-terminal your shell uses. That m
 
 ## Install
 
-**Homebrew (macOS and Linux):**
-
-On macOS, Homebrew is the preferred route. This command taps the source and installs dux in one shot, because life's too short for a two-command install:
+Install this fork from the repository:
 
 ```bash
-brew install patrickdappollonio/tap/dux
+git clone https://github.com/dflaten/dux.git
+cd dux
+cargo build --release
+mkdir -p ~/.local/bin
+install -m 755 target/release/dux ~/.local/bin/dux
 ```
 
-**npm:**
-
-Install dux globally so the CLI lands on your `PATH`. Installing it as a dependency of some random project technically works, but that's not where terminal apps go to be useful:
+Make sure `~/.local/bin` is on your `PATH`, then run:
 
 ```bash
-npm install -g @patrickdappollonio/dux
 dux
 ```
 
-For a one-off run without keeping it around:
-
-```bash
-npx -y @patrickdappollonio/dux
-```
-
-**Shell (all platforms):**
-
-The install script sniffs out your operating system and architecture, then grabs the matching release archive. No guessing which tarball has your name on it:
-
-```bash
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | bash
-```
-
-By default, the script installs to `~/.local/bin` if it exists and is in your `PATH`, otherwise `/usr/local/bin`. You can override the install directory or pin a specific version:
-
-```bash
-# Custom install directory
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_INSTALL_DIR=~/.bin bash
-
-# Specific version
-curl -sSfL https://github.com/patrickdappollonio/dux/releases/latest/download/install.sh | DUX_VERSION=v0.1.0 bash
-```
-
-**Binary download:**
-
-Grab the latest release for your platform from the [Releases](https://github.com/patrickdappollonio/dux/releases) page. Extract it, drop the `dux` binary somewhere on your `PATH`, and run it. On first launch, dux creates a fully commented config file. That file *is* the documentation.
+On first launch, dux creates a fully commented config file. That file *is* the documentation.
 
 ## Prerequisites
 
 - **`git`** — dux is built around git worktrees, so git is non-negotiable. If it's not on your PATH, dux won't get very far.
+- **Rust and Cargo** — required to build this fork from source.
 - **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them right in the interface. Not required, but you'll miss it once you've tried it.
 
 ## How It Works
