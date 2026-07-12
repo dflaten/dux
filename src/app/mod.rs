@@ -2178,6 +2178,7 @@ impl App {
     fn is_palette_action_available(&self, action: Action) -> bool {
         match action {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
+            Action::PasteSelectionToTerminal => self.selected_session().is_some(),
             _ => true,
         }
     }
@@ -2290,6 +2291,7 @@ impl App {
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "show-agent" => self.activate_center_agent(),
             "show-terminal" => self.show_or_open_first_terminal(),
+            "paste-selection-to-terminal" => self.paste_selection_to_terminal(),
             "new-terminal" => self.new_companion_terminal(),
             "add-project" => self.open_project_browser(),
             "copy-path" => self.copy_selected_path(),

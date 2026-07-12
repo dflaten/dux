@@ -31,6 +31,7 @@ pub enum Action {
     ShowTerminal,
     ExitInteractive,
     OpenMacroBar,
+    PasteSelectionToTerminal,
     OpenCurrentPullRequest,
     ToggleFullscreen,
     ScrollPageUp,
@@ -224,6 +225,7 @@ impl Action {
             Action::ShowTerminal => "show_terminal",
             Action::ExitInteractive => "exit_interactive",
             Action::OpenMacroBar => "open_macro_bar",
+            Action::PasteSelectionToTerminal => "paste_selection_to_terminal",
             Action::OpenCurrentPullRequest => "open_current_pull_request",
             Action::ToggleFullscreen => "toggle_fullscreen",
             Action::ScrollPageUp => "scroll_page_up",
@@ -336,6 +338,9 @@ impl Action {
             Action::NewTerminal => "Spawn a new companion terminal for the selected agent.",
             Action::ExitInteractive => "Exit interactive mode (stop forwarding keys to agent).",
             Action::OpenMacroBar => "Open the macro command bar to send text macros.",
+            Action::PasteSelectionToTerminal => {
+                "Paste selected agent output into the companion terminal without submitting it."
+            }
             Action::OpenCurrentPullRequest => {
                 "Open the selected agent's current pull request in the default browser."
             }
@@ -449,6 +454,7 @@ impl Action {
             Action::NewAgentFromPr => None,
             Action::ExitInteractive
             | Action::OpenMacroBar
+            | Action::PasteSelectionToTerminal
             | Action::OpenCurrentPullRequest
             | Action::ToggleFullscreen
             | Action::ScrollPageUp
@@ -993,6 +999,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         }),
         hint_contexts: &[],
         palette: None,
+    },
+    BindingDef {
+        action: Action::PasteSelectionToTerminal,
+        default_keys: &[],
+        scopes: &[BindingScope::Center],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "paste-selection-to-terminal",
+            description: "Paste selected agent output into the companion terminal",
+        }),
     },
     BindingDef {
         action: Action::OpenCurrentPullRequest,

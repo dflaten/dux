@@ -741,6 +741,9 @@ impl App {
                 Action::FocusAgent if !in_diff => self.activate_center_agent()?,
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
+                Action::PasteSelectionToTerminal if !in_diff => {
+                    self.paste_selection_to_terminal()?
+                }
                 Action::DeleteSession if !in_diff => self.confirm_delete_selected_session()?,
                 Action::RenameSession if !in_diff => self.open_rename_session()?,
                 Action::OpenCurrentPullRequest if !in_diff && self.current_pr_info().is_some() => {
@@ -6029,13 +6032,25 @@ impl App {
             self.copy_startup_log_selection();
             return;
         }
-        let sel = match self.terminal_selection.clone() {
-            Some(s) => s,
-            None => return,
+        let Some(text) = self.selected_terminal_text() else {
+            return;
         };
+        if !text.is_empty() {
+            let _ = self.clipboard.copy_text(
+                &text,
+                "Terminal text copied to clipboard.",
+                &self.worker_tx,
+            );
+        }
+    }
+
+    fn selected_terminal_text(&mut self) -> Option<String> {
+        if matches!(self.fullscreen_overlay, FullscreenOverlay::StartupLog) {
+            return None;
+        }
+        let sel = self.terminal_selection.clone()?;
         let (start, end) = sel.ordered();
 
-        // Refresh snapshot to get current content.
         self.refresh_snapshot_buf();
 
         let mut lines: Vec<String> = Vec::new();
@@ -6084,14 +6099,47 @@ impl App {
             }
         }
 
-        let text = lines.join("\n");
-        if !text.is_empty() {
-            let _ = self.clipboard.copy_text(
-                &text,
-                "Terminal text copied to clipboard.",
-                &self.worker_tx,
-            );
+        Some(lines.join("\n"))
+    }
+
+    pub(crate) fn paste_selection_to_terminal(&mut self) -> Result<()> {
+        if !matches!(self.session_surface, SessionSurface::Agent) {
+            self.set_error("Select text from an agent output pane first.");
+            return Ok(());
         }
+        let Some(text) = self
+            .selected_terminal_text()
+            .filter(|text| !text.is_empty())
+        else {
+            self.set_error("Select agent output text first.");
+            return Ok(());
+        };
+        self.show_or_open_first_terminal()?;
+        if !matches!(self.session_surface, SessionSurface::Terminal) {
+            self.set_error("Could not open a companion terminal for the selected agent.");
+            return Ok(());
+        }
+        let Some(provider) = self.selected_terminal_surface_client() else {
+            self.set_error("Could not open a companion terminal for the selected agent.");
+            return Ok(());
+        };
+        let mut payload = Vec::with_capacity(
+            crate::raw_input::BRACKET_PASTE_START.len()
+                + text.len()
+                + crate::raw_input::BRACKET_PASTE_END.len(),
+        );
+        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_START);
+        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_END);
+        match provider.write_bytes(&payload) {
+            Ok(()) => {
+                self.set_info("Pasted selected agent output into companion terminal.");
+            }
+            Err(err) => {
+                self.set_error(format!("Failed to paste into companion terminal: {err}"));
+            }
+        }
+        Ok(())
     }
 
     fn screen_to_startup_log_grid(&self, screen_col: u16, screen_row: u16) -> Option<TermGridPos> {
@@ -6318,7 +6366,7 @@ mod tests {
         OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
         PickProjectWorktreePrompt, ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget,
         ResolvedPullRequest, ResourceStats, RightSection, RuntimeTargetId, StartupCommandLogPrompt,
-        TextInput, WorkerEvent,
+        TermGridPos, TerminalSelection, TextInput, WorkerEvent,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -13922,6 +13970,70 @@ cyan = "#00ffff"
             rendered.contains("^[") && rendered.contains("^M"),
             "newline should have been translated to ESC+CR (`^[^M`); got: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn paste_selection_to_terminal_opens_terminal_and_pastes_without_enter() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'aws s3 ls'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 8 },
+            dragging: false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.paste_selection_to_terminal().expect("paste selection");
+
+        assert_eq!(app.session_surface, SessionSurface::Terminal);
+        assert_eq!(app.input_target, InputTarget::Terminal);
+        assert_eq!(app.companion_terminals.len(), 1);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected agent output into companion terminal."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let terminal = app
+            .active_terminal_id
+            .as_ref()
+            .and_then(|id| app.companion_terminals.get(id))
+            .expect("active terminal");
+        let rendered: String = terminal
+            .client
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("aws s3 ls"),
+            "terminal should contain pasted command; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn paste_selection_to_terminal_requires_selection() {
+        let mut app = test_app(default_bindings());
+        app.session_surface = SessionSurface::Agent;
+
+        app.paste_selection_to_terminal().expect("paste selection");
+
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+        assert_eq!(app.status.message(), "Select agent output text first.");
+        assert!(app.companion_terminals.is_empty());
     }
 
     #[test]

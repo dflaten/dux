@@ -132,6 +132,21 @@ exact same state the original agent is in right now.
 This is useful for exploring two different approaches to the same problem: fork
 the agent at the decision point and let each branch go its own way.
 
+## Running commands from agent output
+
+Each agent has companion terminals in the same worktree as the agent. When an
+agent prints a command or script block you want to try, select that text in the
+agent output and run the `paste-selection-to-terminal` palette command. dux opens
+or reuses the first companion terminal for that agent and pastes the selection
+without submitting it.
+
+Review or edit the pasted text in the terminal, then press Enter when you are
+ready. This keeps generated shell commands, cloud CLIs, and multi-line scripts
+out of the auto-execute path while still avoiding manual copy-paste.
+
+The command has no default keybinding. To bind it yourself, set
+`paste_selection_to_terminal` under `[keys]` in `config.toml`.
+
 ## Choosing a provider at creation time
 
 Every agent is tied to one provider. At creation time, dux uses whichever
