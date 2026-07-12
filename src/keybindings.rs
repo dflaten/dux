@@ -1002,9 +1002,12 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::PasteSelectionToTerminal,
-        default_keys: &[],
+        default_keys: &[key!(ctrl - e)],
         scopes: &[BindingScope::Center],
-        help: None,
+        help: Some(HelpEntry {
+            section: "Agent pane",
+            description: "Paste selected agent output into the companion terminal",
+        }),
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "paste-selection-to-terminal",
