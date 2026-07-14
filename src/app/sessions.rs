@@ -314,16 +314,11 @@ impl App {
                     .map(str::to_string)
             }),
         };
-        let randomize_name =
-            initial_name.is_none() && self.config.defaults.enable_randomized_pet_name_by_default;
+        let randomize_name = false;
         let mut input = TextInput::new().with_char_map(crate::git::agent_name_char_map);
-        let mut randomized_name = None;
+        let randomized_name = None;
         if let Some(name) = initial_name {
             input.set_text(name);
-        } else if randomize_name {
-            let name = crate::git::docker_style_name();
-            input.set_text(name.clone());
-            randomized_name = Some(name);
         }
 
         self.input_target = InputTarget::None;

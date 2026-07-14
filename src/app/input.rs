@@ -7994,7 +7994,7 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn create_agent_prefills_name_when_randomized_default_enabled() {
+    fn create_agent_starts_empty_when_randomized_default_enabled() {
         let mut app = test_app(default_bindings());
         app.config.defaults.enable_randomized_pet_name_by_default = true;
 
@@ -8008,16 +8008,16 @@ not_a_real_action = ["x"]
                 randomized_name,
                 ..
             } => {
-                assert!(*randomize_name);
-                assert!(!input.text.is_empty());
-                assert_eq!(randomized_name.as_deref(), Some(input.text.as_str()));
+                assert!(!*randomize_name);
+                assert!(input.text.is_empty());
+                assert!(randomized_name.is_none());
             }
             other => panic!("expected name-new-agent prompt, got {other:?}"),
         }
     }
 
     #[test]
-    fn fork_agent_prefills_name_when_randomized_default_enabled() {
+    fn fork_agent_starts_empty_when_randomized_default_enabled() {
         let mut app = test_app(default_bindings());
         app.config.defaults.enable_randomized_pet_name_by_default = true;
 
@@ -8032,9 +8032,9 @@ not_a_real_action = ["x"]
                 ..
             } => {
                 assert!(matches!(request, CreateAgentRequest::ForkSession { .. }));
-                assert!(*randomize_name);
-                assert!(!input.text.is_empty());
-                assert_eq!(randomized_name.as_deref(), Some(input.text.as_str()));
+                assert!(!*randomize_name);
+                assert!(input.text.is_empty());
+                assert!(randomized_name.is_none());
             }
             other => panic!("expected name-new-agent prompt, got {other:?}"),
         }
