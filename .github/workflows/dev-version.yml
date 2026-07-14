@@ -1,0 +1,51 @@
+name: Dev Version
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump dev version
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Bump DEV_VERSION
+        id: bump
+        run: |
+          set -euo pipefail
+
+          current="$(tr -d '[:space:]' < DEV_VERSION)"
+          if [[ ! "$current" =~ ^dev-([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "DEV_VERSION must match dev-X.Y.Z, got: $current"
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+          next="dev-${major}.${minor}.$((patch + 1))"
+
+          printf '%s\n' "$next" > DEV_VERSION
+          echo "value=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Commit dev version
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add DEV_VERSION
+          git commit -m "Bump dev version to ${{ steps.bump.outputs.value }}"
+          git push

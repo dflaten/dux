@@ -31,6 +31,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("dux {}", env!("DUX_DISPLAY_VERSION"));
+        return Ok(());
+    }
+
     let paths = config::DuxPaths::discover()?;
 
     if args.first().map(|s| s.as_str()) == Some("config") {
@@ -80,6 +85,7 @@ fn print_help() {
          Terminal UI for AI worktree sessions.\n\n\
          Usage:\n\
           dux              Launch the TUI\n\
+          dux --version    Print the version\n\
           dux config       Manage the configuration file\n\n\
          Config subcommands:\n\
           dux config path          Print the config file path\n\

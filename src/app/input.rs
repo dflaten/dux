@@ -14397,7 +14397,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn header_shows_development_version_for_local_builds() {
+    fn header_shows_dev_version_for_local_builds() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -14415,9 +14415,10 @@ cyan = "#00ffff"
             .map(|cell| cell.symbol())
             .collect();
 
+        let expected = format!("dux {}", env!("DUX_DISPLAY_VERSION"));
         assert!(
-            rendered.contains("dux development"),
-            "expected local build version label, got: {rendered}"
+            rendered.contains(&expected),
+            "expected local build version label {expected:?}, got: {rendered}"
         );
     }
 
