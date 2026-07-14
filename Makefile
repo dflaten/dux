@@ -11,6 +11,15 @@ install:
 	@echo "Installing dux $$(cat DEV_VERSION)"
 	@cargo install --path . --force --locked --quiet
 	@echo "Installed dux $$(cat DEV_VERSION)"
+	@cargo_root="$${CARGO_INSTALL_ROOT:-$${CARGO_HOME:-$$HOME/.cargo}}"; \
+	installed="$$cargo_root/bin/dux"; \
+	resolved="$$(command -v dux || true)"; \
+	if [ -n "$$resolved" ] && [ "$$resolved" != "$$installed" ]; then \
+		echo "Warning: your shell resolves dux to $$resolved, not $$installed"; \
+		echo "Put $$(dirname "$$installed") before $$(dirname "$$resolved") in PATH or remove the older dux."; \
+	else \
+		echo "dux resolves to $$installed"; \
+	fi
 
 fmt:
 	cargo fmt
