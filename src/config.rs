@@ -770,9 +770,9 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "enable_randomized_pet_name_by_default",
             comment: Some(CommentSource::Static(
-                "# When true, the new-agent name prompt starts with a random two-word pet name.\n\
-                 # You can still clear it and type a custom name before creating the agent.\n\
-                 # When false, the prompt starts empty and the pet-name checkbox is off.",
+                "# Legacy setting retained for older config files.\n\
+                 # New-agent prompts now start empty by default; use the prompt's pet-name checkbox\n\
+                 # when you want dux to fill in a random two-word pet name.",
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.enable_randomized_pet_name_by_default),
         },
