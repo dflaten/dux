@@ -196,6 +196,8 @@ pub struct App {
     last_snapshot_id: Option<String>,
     /// Active text selection in the terminal viewport, if any.
     pub(crate) terminal_selection: Option<TerminalSelection>,
+    /// Text captured from the most recent completed agent output selection.
+    pub(crate) terminal_selection_text: Option<String>,
     /// Active text selection in the startup command log output pane, if any.
     pub(crate) startup_log_selection: Option<TerminalSelection>,
     /// Exclusive lock held for the lifetime of this `App` so only one dux
@@ -1837,6 +1839,7 @@ impl App {
             snapshot_buf: TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
+            terminal_selection_text: None,
             startup_log_selection: None,
             _single_instance_lock: single_instance_lock,
         };
@@ -3177,6 +3180,7 @@ impl App {
                 provider.mark_dirty();
                 self.last_snapshot_id = Some(client_id);
                 self.terminal_selection = None;
+                self.terminal_selection_text = None;
             }
             provider.snapshot_into(&mut self.snapshot_buf);
             true
