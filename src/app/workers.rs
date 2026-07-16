@@ -276,8 +276,12 @@ impl App {
                         prompt.loading = false;
                         match result {
                             Ok(entries) => {
-                                prompt.selected =
-                                    selectable_project_worktree_indices(&entries).into_iter().next();
+                                prompt.selected = selectable_project_worktree_indices_for_filter(
+                                    &entries,
+                                    &prompt.filter.text,
+                                )
+                                .into_iter()
+                                .next();
                                 prompt.entries = entries;
                                 prompt.error = None;
                                 status_after_update = Some(Ok(

@@ -2439,10 +2439,21 @@ impl App {
         }
 
         if let PromptState::PickProjectWorktree(prompt) = &mut self.prompt {
-            match self.bindings.lookup(&key, BindingScope::Palette) {
+            let is_plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = if is_plain_char {
+                None
+            } else {
+                self.bindings.lookup(&key, BindingScope::Palette)
+            };
+
+            match action {
                 Some(Action::CloseOverlay) => self.prompt = PromptState::None,
                 Some(Action::MoveDown) => {
-                    let selectable = selectable_project_worktree_indices(&prompt.entries);
+                    let selectable = selectable_project_worktree_indices_for_filter(
+                        &prompt.entries,
+                        &prompt.filter.text,
+                    );
                     if let Some(current) = prompt.selected
                         && let Some(position) = selectable.iter().position(|idx| *idx == current)
                         && let Some(next) = selectable.get(position + 1)
@@ -2453,7 +2464,10 @@ impl App {
                     }
                 }
                 Some(Action::MoveUp) => {
-                    let selectable = selectable_project_worktree_indices(&prompt.entries);
+                    let selectable = selectable_project_worktree_indices_for_filter(
+                        &prompt.entries,
+                        &prompt.filter.text,
+                    );
                     if let Some(current) = prompt.selected
                         && let Some(position) = selectable.iter().position(|idx| *idx == current)
                         && position > 0
@@ -2466,7 +2480,21 @@ impl App {
                 Some(Action::Confirm) => {
                     self.open_selected_project_worktree_agent_prompt()?;
                 }
-                _ => {}
+                _ => {
+                    let before = prompt.filter.text.clone();
+                    if prompt.filter.handle_key(key) && prompt.filter.text != before {
+                        let selectable = selectable_project_worktree_indices_for_filter(
+                            &prompt.entries,
+                            &prompt.filter.text,
+                        );
+                        if !prompt
+                            .selected
+                            .is_some_and(|selected| selectable.contains(&selected))
+                        {
+                            prompt.selected = selectable.into_iter().next();
+                        }
+                    }
+                }
             }
             return Ok(false);
         }
@@ -4509,6 +4537,7 @@ impl App {
                     &prompt.entries,
                     prompt.loading,
                     prompt.error.as_deref(),
+                    &prompt.filter.text,
                 );
                 rows.get(visual_index).and_then(|row| match row {
                     ProjectWorktreeVisualRow::Entry(index)
@@ -8054,9 +8083,148 @@ not_a_real_action = ["x"]
                 assert_eq!(prompt.project.id, app.projects[0].id);
                 assert!(prompt.loading);
                 assert!(prompt.entries.is_empty());
+                assert!(prompt.filter.text.is_empty());
             }
             other => panic!("expected PickProjectWorktree prompt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shift_s_opens_project_worktree_picker_from_projects_pane() {
+        let mut app = test_app(default_bindings());
+        app.selected_left = 0;
+        app.focus = FocusPane::Left;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        match &app.prompt {
+            PromptState::PickProjectWorktree(prompt) => {
+                assert_eq!(prompt.project.id, app.projects[0].id);
+                assert!(prompt.loading);
+            }
+            other => panic!("expected PickProjectWorktree prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_worktree_picker_typing_filters_and_selects_first_visible_match() {
+        let mut app = test_app(default_bindings());
+        let project = app.projects[0].clone();
+        app.prompt = PromptState::PickProjectWorktree(PickProjectWorktreePrompt {
+            project,
+            entries: vec![
+                ProjectWorktreeEntry {
+                    path: PathBuf::from("/tmp/alpha"),
+                    branch_name: "alpha".to_string(),
+                    is_managed_by_dux: true,
+                    existing_session_id: None,
+                    is_external: false,
+                    is_project_checkout: false,
+                    is_selectable: true,
+                },
+                ProjectWorktreeEntry {
+                    path: PathBuf::from("/tmp/jukebox"),
+                    branch_name: "feature/jukebox".to_string(),
+                    is_managed_by_dux: true,
+                    existing_session_id: None,
+                    is_external: false,
+                    is_project_checkout: false,
+                    is_selectable: true,
+                },
+            ],
+            filter: TextInput::new(),
+            loading: false,
+            selected: Some(0),
+            error: None,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
+            .unwrap();
+
+        match &app.prompt {
+            PromptState::PickProjectWorktree(prompt) => {
+                assert_eq!(prompt.filter.text, "ju");
+                assert_eq!(prompt.selected, Some(1));
+            }
+            other => panic!("expected PickProjectWorktree prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_worktree_picker_backspace_recomputes_visible_selection() {
+        let mut app = test_app(default_bindings());
+        let project = app.projects[0].clone();
+        app.prompt = PromptState::PickProjectWorktree(PickProjectWorktreePrompt {
+            project,
+            entries: vec![
+                ProjectWorktreeEntry {
+                    path: PathBuf::from("/tmp/alpha"),
+                    branch_name: "alpha".to_string(),
+                    is_managed_by_dux: true,
+                    existing_session_id: None,
+                    is_external: false,
+                    is_project_checkout: false,
+                    is_selectable: true,
+                },
+                ProjectWorktreeEntry {
+                    path: PathBuf::from("/tmp/beta"),
+                    branch_name: "beta".to_string(),
+                    is_managed_by_dux: true,
+                    existing_session_id: None,
+                    is_external: false,
+                    is_project_checkout: false,
+                    is_selectable: true,
+                },
+            ],
+            filter: TextInput::with_text("bt".to_string()),
+            loading: false,
+            selected: Some(1),
+            error: None,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+
+        match &app.prompt {
+            PromptState::PickProjectWorktree(prompt) => {
+                assert_eq!(prompt.filter.text, "b");
+                assert_eq!(prompt.selected, Some(1));
+            }
+            other => panic!("expected PickProjectWorktree prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_worktree_picker_header_shows_project_branch() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let mut project = app.projects[0].clone();
+        project.current_branch = "feature/searchable-worktrees".to_string();
+        app.prompt = PromptState::PickProjectWorktree(PickProjectWorktreePrompt {
+            project,
+            entries: Vec::new(),
+            filter: TextInput::new(),
+            loading: false,
+            selected: None,
+            error: None,
+        });
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Branch:"));
+        assert!(rendered.contains("feature/searchable-worktrees"));
+        assert!(!rendered.contains("Project Checkout"));
     }
 
     #[test]
@@ -8074,6 +8242,7 @@ not_a_real_action = ["x"]
                 is_project_checkout: false,
                 is_selectable: false,
             }],
+            filter: TextInput::new(),
             loading: false,
             selected: None,
             error: None,
@@ -8106,6 +8275,7 @@ not_a_real_action = ["x"]
                 is_project_checkout: false,
                 is_selectable: true,
             }],
+            filter: TextInput::new(),
             loading: false,
             selected: Some(0),
             error: None,
@@ -8149,6 +8319,7 @@ not_a_real_action = ["x"]
                 is_project_checkout: false,
                 is_selectable: true,
             }],
+            filter: TextInput::new(),
             loading: false,
             selected: Some(0),
             error: None,
@@ -8239,6 +8410,7 @@ not_a_real_action = ["x"]
                 is_project_checkout: false,
                 is_selectable: true,
             }],
+            filter: TextInput::new(),
             loading: false,
             selected: Some(0),
             error: None,
@@ -8280,6 +8452,7 @@ not_a_real_action = ["x"]
                 is_project_checkout: false,
                 is_selectable: true,
             }],
+            filter: TextInput::new(),
             loading: false,
             selected: Some(0),
             error: None,

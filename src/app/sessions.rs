@@ -223,6 +223,7 @@ impl App {
         self.prompt = PromptState::PickProjectWorktree(PickProjectWorktreePrompt {
             project: project.clone(),
             entries: Vec::new(),
+            filter: TextInput::new().with_placeholder("Search worktrees..."),
             loading: true,
             selected: None,
             error: None,

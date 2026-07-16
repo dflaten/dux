@@ -642,10 +642,13 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::NewAgentFromWorktree,
-        default_keys: &[],
-        scopes: &[],
-        help: None,
-        hint_contexts: &[],
+        default_keys: &[key!(shift - s)],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "New agent from existing worktree",
+        }),
+        hint_contexts: &[(HintContext::LeftProject, "From worktree")],
         palette: Some(PaletteEntry {
             name: "new-agent-from-worktree",
             description: "Create a new agent from an existing git worktree",
