@@ -6115,6 +6115,7 @@ impl App {
         match mouse_ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(pos) = self.screen_to_grid(mouse_ev.column, mouse_ev.row) {
+                    self.terminal_selection_text = None;
                     self.terminal_selection = Some(TerminalSelection {
                         anchor: pos,
                         end: pos,
@@ -6139,6 +6140,7 @@ impl App {
                     if sel.anchor == sel.end {
                         // Single click, no actual selection.
                         self.terminal_selection = None;
+                        self.terminal_selection_text = None;
                     } else {
                         self.copy_terminal_selection();
                     }
@@ -6159,6 +6161,7 @@ impl App {
             return;
         };
         if !text.is_empty() {
+            self.terminal_selection_text = Some(text.clone());
             let _ = self.clipboard.copy_text(
                 &text,
                 "Terminal text copied to clipboard.",
@@ -6233,6 +6236,11 @@ impl App {
         let Some(text) = self
             .selected_terminal_text()
             .filter(|text| !text.is_empty())
+            .or_else(|| {
+                self.terminal_selection_text
+                    .clone()
+                    .filter(|text| !text.is_empty())
+            })
         else {
             self.set_error("Select agent output text first.");
             return Ok(());
@@ -6762,6 +6770,7 @@ mod tests {
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
+            terminal_selection_text: None,
             startup_log_selection: None,
             _single_instance_lock: single_instance_lock,
         };
@@ -14350,6 +14359,62 @@ cyan = "#00ffff"
         assert!(
             rendered.contains("aws s3 ls"),
             "terminal should contain pasted command; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_e_pastes_captured_selection_after_visual_selection_clears() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'aws s3 ls'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::Agent;
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 8 },
+            dragging: false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.copy_terminal_selection();
+        app.terminal_selection = None;
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("process ctrl-e");
+
+        assert_eq!(app.session_surface, SessionSurface::Terminal);
+        assert_eq!(app.input_target, InputTarget::Terminal);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected agent output into companion terminal."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let terminal = app
+            .active_terminal_id
+            .as_ref()
+            .and_then(|id| app.companion_terminals.get(id))
+            .expect("active terminal");
+        let rendered: String = terminal
+            .client
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("aws s3 ls"),
+            "terminal should contain cached selected command; got: {rendered:?}"
         );
     }
 

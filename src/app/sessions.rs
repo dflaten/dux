@@ -2994,6 +2994,7 @@ mod tests {
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
             last_snapshot_id: None,
             terminal_selection: None,
+            terminal_selection_text: None,
             startup_log_selection: None,
             _single_instance_lock: single_instance_lock,
         };
