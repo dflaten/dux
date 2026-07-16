@@ -380,6 +380,28 @@ impl App {
                         }
                     }
                 }
+                WorkerEvent::WorktreeCleanupRemoveCompleted { candidate, result } => {
+                    for session_id in &candidate.session_ids {
+                        self.pending_deletions.remove(session_id);
+                    }
+                    match result {
+                        Ok(branch_already_deleted) => {
+                            if let Err(e) =
+                                self.finish_worktree_cleanup(candidate, branch_already_deleted)
+                            {
+                                self.set_error(format!(
+                                    "Worktree removed but cleanup bookkeeping failed: {e:#}"
+                                ));
+                            }
+                        }
+                        Err(msg) => {
+                            self.set_error(format!(
+                                "Failed to remove inactive worktree {}: {msg}",
+                                candidate.worktree_path
+                            ));
+                        }
+                    }
+                }
                 WorkerEvent::ResourceStatsReady(stats) => {
                     self.resource_stats_in_flight = false;
                     if let PromptState::ResourceMonitor {

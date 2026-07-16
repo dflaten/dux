@@ -574,6 +574,22 @@ pub(crate) enum DeleteAgentFocus {
     Checkbox,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeCleanupFocus {
+    Cancel,
+    Remove,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeCleanupCandidate {
+    pub(crate) session_ids: Vec<String>,
+    pub(crate) project_id: String,
+    pub(crate) project_name: String,
+    pub(crate) branch_name: String,
+    pub(crate) worktree_path: String,
+    pub(crate) updated_at: chrono::DateTime<Utc>,
+}
+
 /// Which selectable element has focus in the Non-Default Branch confirmation
 /// modal. `Checkbox` is only reachable when `BranchWarningKind::Known` — the
 /// heuristic path has no checkbox to focus.
@@ -668,6 +684,11 @@ pub(crate) enum PromptState {
         /// case the worktree is always preserved regardless of the user's
         /// choice, so the checkbox is hidden and a note is shown instead.
         worktree_shared: bool,
+    },
+    ConfirmWorktreeCleanup {
+        candidates: Vec<WorktreeCleanupCandidate>,
+        focus: WorktreeCleanupFocus,
+        scroll_offset: u16,
     },
     ConfirmDeleteTerminal {
         terminal_id: String,
@@ -1252,6 +1273,10 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         delete_button: Rect,
     },
+    ConfirmWorktreeCleanup {
+        cancel_button: Rect,
+        remove_button: Rect,
+    },
     ConfirmDeleteMacro {
         cancel_button: Rect,
         delete_button: Rect,
@@ -1550,6 +1575,10 @@ pub(crate) enum WorkerEvent {
     /// can retry.
     WorktreeRemoveCompleted {
         session_id: String,
+        result: Result<bool, String>,
+    },
+    WorktreeCleanupRemoveCompleted {
+        candidate: WorktreeCleanupCandidate,
         result: Result<bool, String>,
     },
     /// Background `git switch <target_branch>` run from a non-default branch
@@ -2301,6 +2330,7 @@ impl App {
             "reload-config" => self.reload_config_from_disk(),
             "toggle-project-auto-reopen-agents" => self.toggle_project_auto_reopen_agents(),
             "toggle-agent-auto-reopen" => self.toggle_agent_auto_reopen(),
+            "cleanup-worktrees" => self.open_worktree_cleanup(),
             "configure-startup-command" => self.open_configure_startup_command(),
             "configure-global-env" => self.open_configure_global_env(),
             "configure-project-env" => self.open_configure_project_env(),

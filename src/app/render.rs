@@ -4798,6 +4798,136 @@ impl App {
                     checkbox: checkbox_rect,
                 };
             }
+            PromptState::ConfirmWorktreeCleanup {
+                candidates,
+                focus,
+                scroll_offset,
+            } => {
+                self.render_dim_overlay(frame);
+                let dialog_width = 76.min(frame.area().width.max(1));
+                let dialog_height = 24.min(frame.area().height.max(1));
+                let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Cleanup Worktrees");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+
+                let [intro_area, list_area, buttons_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(5),
+                        Constraint::Min(3),
+                        Constraint::Length(3),
+                    ])
+                    .areas(inner);
+
+                let intro = vec![
+                    Line::from(format!(
+                        " Remove {} inactive dux-managed worktree(s)?",
+                        candidates.len()
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Worktrees listed here have had no session activity for at least two weeks",
+                        Style::default().fg(self.theme.warning_fg),
+                    )),
+                    Line::from(Span::styled(
+                        " and have no currently active agents. Uncommitted changes will be lost.",
+                        Style::default().fg(self.theme.warning_fg),
+                    )),
+                ];
+                Paragraph::new(intro)
+                    .wrap(Wrap { trim: false })
+                    .render(intro_area, frame.buffer_mut());
+
+                let mut rows: Vec<Line<'static>> = Vec::new();
+                let mut current_project: Option<&str> = None;
+                for candidate in candidates {
+                    if current_project != Some(candidate.project_name.as_str()) {
+                        if current_project.is_some() {
+                            rows.push(Line::from(""));
+                        }
+                        current_project = Some(candidate.project_name.as_str());
+                        rows.push(Line::from(Span::styled(
+                            format!(" {}", candidate.project_name),
+                            Style::default()
+                                .fg(self.theme.header_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    let session_count = candidate.session_ids.len();
+                    let session_label = if session_count == 1 {
+                        "1 session".to_string()
+                    } else {
+                        format!("{session_count} sessions")
+                    };
+                    rows.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            candidate.branch_name.clone(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            " - {session_label}, last active {}",
+                            candidate.updated_at.format("%Y-%m-%d")
+                        )),
+                    ]));
+                    rows.push(Line::from(Span::styled(
+                        format!("    {}", candidate.worktree_path),
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )));
+                }
+
+                let start = usize::from(*scroll_offset).min(rows.len().saturating_sub(1));
+                let height = usize::from(list_area.height);
+                let visible_rows: Vec<Line<'static>> =
+                    rows.into_iter().skip(start).take(height).collect();
+                Paragraph::new(visible_rows)
+                    .wrap(Wrap { trim: false })
+                    .render(list_area, frame.buffer_mut());
+
+                let btn_width = shared_button_width(&["Cancel", "Remove"]);
+                let gap = 2u16;
+                let total = btn_width * 2 + gap;
+                let left_offset = buttons_area.width.saturating_sub(total) / 2;
+                let cancel_area = Rect {
+                    x: buttons_area.x + left_offset,
+                    y: buttons_area.y,
+                    width: btn_width,
+                    height: 3,
+                };
+                let remove_area = Rect {
+                    x: cancel_area.x + btn_width + gap,
+                    y: buttons_area.y,
+                    width: btn_width,
+                    height: 3,
+                };
+
+                Button::new("Cancel")
+                    .kind(ButtonKind::Confirm)
+                    .state(button_state_for(
+                        ButtonPressedTarget::ConfirmWorktreeCleanupCancel,
+                        self.pressed_button,
+                        *focus == WorktreeCleanupFocus::Cancel,
+                        true,
+                    ))
+                    .render(frame, cancel_area, &self.theme);
+
+                Button::new("Remove")
+                    .kind(ButtonKind::Danger)
+                    .state(button_state_for(
+                        ButtonPressedTarget::ConfirmWorktreeCleanupRemove,
+                        self.pressed_button,
+                        *focus == WorktreeCleanupFocus::Remove,
+                        true,
+                    ))
+                    .render(frame, remove_area, &self.theme);
+
+                self.overlay_layout.active = OverlayMouseLayout::ConfirmWorktreeCleanup {
+                    cancel_button: cancel_area,
+                    remove_button: remove_area,
+                };
+            }
             PromptState::ConfirmDeleteTerminal {
                 terminal_label,
                 confirm_selected,

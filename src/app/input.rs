@@ -125,6 +125,8 @@ enum PromptMouseTarget {
     ConfirmDeleteTerminalConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
+    ConfirmWorktreeCleanupCancel,
+    ConfirmWorktreeCleanupRemove,
     ConfirmQuitCancel,
     ConfirmQuitConfirm,
     ConfirmDiscardCancel,
@@ -194,6 +196,12 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmDeleteMacroConfirm => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroConfirm)
+            }
+            PromptMouseTarget::ConfirmWorktreeCleanupCancel => {
+                Some(ButtonPressedTarget::ConfirmWorktreeCleanupCancel)
+            }
+            PromptMouseTarget::ConfirmWorktreeCleanupRemove => {
+                Some(ButtonPressedTarget::ConfirmWorktreeCleanupRemove)
             }
             PromptMouseTarget::ConfirmQuitCancel => Some(ButtonPressedTarget::ConfirmQuitCancel),
             PromptMouseTarget::ConfirmQuitConfirm => Some(ButtonPressedTarget::ConfirmQuitConfirm),
@@ -2985,6 +2993,46 @@ impl App {
             return Ok(false);
         }
 
+        if let PromptState::ConfirmWorktreeCleanup {
+            focus,
+            scroll_offset,
+            candidates,
+        } = &mut self.prompt
+        {
+            let max_scroll = u16::try_from(candidates.len().saturating_sub(1)).unwrap_or(u16::MAX);
+            match self.bindings.lookup(&key, BindingScope::Dialog) {
+                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+                Some(Action::ToggleSelection) => {
+                    *focus = match *focus {
+                        WorktreeCleanupFocus::Cancel => WorktreeCleanupFocus::Remove,
+                        WorktreeCleanupFocus::Remove => WorktreeCleanupFocus::Cancel,
+                    };
+                }
+                Some(Action::Confirm) => {
+                    let confirm = matches!(*focus, WorktreeCleanupFocus::Remove);
+                    return Ok(self.resolve_confirm_worktree_cleanup(confirm));
+                }
+                Some(Action::ScrollLineDown | Action::MoveDown) => {
+                    *scroll_offset = scroll_offset.saturating_add(1).min(max_scroll);
+                }
+                Some(Action::ScrollLineUp | Action::MoveUp) => {
+                    *scroll_offset = scroll_offset.saturating_sub(1);
+                }
+                Some(Action::ScrollPageDown) => {
+                    *scroll_offset = scroll_offset.saturating_add(8).min(max_scroll);
+                }
+                Some(Action::ScrollPageUp) => {
+                    *scroll_offset = scroll_offset.saturating_sub(8);
+                }
+                _ if key.code == KeyCode::Char(' ') => {
+                    let confirm = matches!(*focus, WorktreeCleanupFocus::Remove);
+                    return Ok(self.resolve_confirm_worktree_cleanup(confirm));
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if let PromptState::ConfirmDeleteTerminal {
             confirm_selected, ..
         } = &mut self.prompt
@@ -3825,6 +3873,18 @@ impl App {
                     Some(PromptMouseTarget::ConfirmDeleteTerminalCancel)
                 } else if contains_point(delete_button, column, row) {
                     Some(PromptMouseTarget::ConfirmDeleteTerminalConfirm)
+                } else {
+                    None
+                }
+            }
+            OverlayMouseLayout::ConfirmWorktreeCleanup {
+                cancel_button,
+                remove_button,
+            } => {
+                if contains_point(cancel_button, column, row) {
+                    Some(PromptMouseTarget::ConfirmWorktreeCleanupCancel)
+                } else if contains_point(remove_button, column, row) {
+                    Some(PromptMouseTarget::ConfirmWorktreeCleanupRemove)
                 } else {
                     None
                 }
@@ -4697,6 +4757,20 @@ impl App {
         false
     }
 
+    fn resolve_confirm_worktree_cleanup(&mut self, confirm: bool) -> bool {
+        let candidates = match &self.prompt {
+            PromptState::ConfirmWorktreeCleanup { candidates, .. } => candidates.clone(),
+            _ => return false,
+        };
+        self.prompt = PromptState::None;
+        if confirm {
+            self.begin_worktree_cleanup(candidates);
+        } else {
+            self.set_info("Worktree cleanup cancelled. No worktrees were removed.");
+        }
+        false
+    }
+
     fn resolve_confirm_delete_terminal(&mut self, confirm: bool) -> bool {
         let terminal_id = match &self.prompt {
             PromptState::ConfirmDeleteTerminal { terminal_id, .. } => terminal_id.clone(),
@@ -5358,6 +5432,8 @@ impl App {
             | PromptMouseTarget::ConfirmDeleteTerminalConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
+            | PromptMouseTarget::ConfirmWorktreeCleanupCancel
+            | PromptMouseTarget::ConfirmWorktreeCleanupRemove
             | PromptMouseTarget::ConfirmQuitCancel
             | PromptMouseTarget::ConfirmQuitConfirm
             | PromptMouseTarget::ConfirmDiscardCancel
@@ -5458,6 +5534,12 @@ impl App {
             }
             ButtonPressedTarget::ConfirmDeleteTerminalConfirm => {
                 self.resolve_confirm_delete_terminal(true)
+            }
+            ButtonPressedTarget::ConfirmWorktreeCleanupCancel => {
+                self.resolve_confirm_worktree_cleanup(false)
+            }
+            ButtonPressedTarget::ConfirmWorktreeCleanupRemove => {
+                self.resolve_confirm_worktree_cleanup(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)

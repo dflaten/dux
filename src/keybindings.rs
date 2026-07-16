@@ -95,6 +95,7 @@ pub enum Action {
     ToggleGithubIntegration,
     ToggleProjectAutoReopenAgents,
     ToggleAgentAutoReopen,
+    CleanupWorktrees,
     ConfigureStartupCommand,
     ConfigureGlobalEnv,
     ConfigureProjectEnv,
@@ -283,6 +284,7 @@ impl Action {
             Action::ToggleGithubIntegration => "toggle_github_integration",
             Action::ToggleProjectAutoReopenAgents => "toggle_project_auto_reopen_agents",
             Action::ToggleAgentAutoReopen => "toggle_agent_auto_reopen",
+            Action::CleanupWorktrees => "cleanup_worktrees",
             Action::ConfigureStartupCommand => "configure_startup_command",
             Action::ConfigureGlobalEnv => "configure_global_env",
             Action::ConfigureProjectEnv => "configure_project_env",
@@ -403,6 +405,9 @@ impl Action {
                 "Toggle startup auto-reopen for agents in the selected project."
             }
             Action::ToggleAgentAutoReopen => "Toggle startup auto-reopen for the selected agent.",
+            Action::CleanupWorktrees => {
+                "Remove inactive dux-managed worktrees older than two weeks."
+            }
             Action::ConfigureStartupCommand => {
                 "Configure the selected project's startup command for newly created agents."
             }
@@ -512,6 +517,7 @@ impl Action {
             | Action::ToggleGithubIntegration
             | Action::ToggleProjectAutoReopenAgents
             | Action::ToggleAgentAutoReopen
+            | Action::CleanupWorktrees
             | Action::ConfigureStartupCommand
             | Action::ConfigureGlobalEnv
             | Action::ConfigureProjectEnv
@@ -743,6 +749,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "toggle-agent-auto-reopen",
             description: "Opt the selected agent in or out of startup reopening",
+        }),
+    },
+    BindingDef {
+        action: Action::CleanupWorktrees,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "cleanup-worktrees",
+            description: "Remove inactive dux-managed worktrees older than two weeks",
         }),
     },
     BindingDef {
