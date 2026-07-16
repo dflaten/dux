@@ -544,6 +544,7 @@ pub(crate) enum ProjectWorktreeVisualRow {
 pub(crate) struct PickProjectWorktreePrompt {
     pub(crate) project: Project,
     pub(crate) entries: Vec<ProjectWorktreeEntry>,
+    pub(crate) filter: TextInput,
     pub(crate) loading: bool,
     pub(crate) selected: Option<usize>,
     pub(crate) error: Option<String>,
@@ -853,6 +854,7 @@ pub(crate) fn project_worktree_visual_rows(
     entries: &[ProjectWorktreeEntry],
     loading: bool,
     error: Option<&str>,
+    filter: &str,
 ) -> Vec<ProjectWorktreeVisualRow> {
     if loading {
         return vec![ProjectWorktreeVisualRow::Empty(
@@ -865,32 +867,40 @@ pub(crate) fn project_worktree_visual_rows(
         ))];
     }
 
+    let matches = entries
+        .iter()
+        .map(|entry| project_worktree_matches_filter(entry, filter))
+        .collect::<Vec<_>>();
     let available = entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.is_selectable)
+        .filter(|(index, entry)| matches[*index] && entry.is_selectable)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let project_checkout = entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.is_project_checkout)
+        .filter(|(index, entry)| matches[*index] && entry.is_project_checkout)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let disabled = entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| !entry.is_selectable && !entry.is_project_checkout)
+        .filter(|(index, entry)| {
+            matches[*index] && !entry.is_selectable && !entry.is_project_checkout
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
 
     let mut rows = Vec::new();
     rows.push(ProjectWorktreeVisualRow::Header("Available Worktrees"));
     if available.is_empty() {
-        rows.push(ProjectWorktreeVisualRow::Empty(
+        let message = if filter.trim().is_empty() {
             "No available worktrees. Worktrees that already have agents are shown below."
-                .to_string(),
-        ));
+        } else {
+            "No available worktrees match this search."
+        };
+        rows.push(ProjectWorktreeVisualRow::Empty(message.to_string()));
     } else {
         rows.extend(available.into_iter().map(ProjectWorktreeVisualRow::Entry));
     }
@@ -909,11 +919,40 @@ pub(crate) fn project_worktree_visual_rows(
     rows
 }
 
-pub(crate) fn selectable_project_worktree_indices(entries: &[ProjectWorktreeEntry]) -> Vec<usize> {
+pub(crate) fn project_worktree_matches_filter(entry: &ProjectWorktreeEntry, filter: &str) -> bool {
+    let needle = filter.trim();
+    if needle.is_empty() {
+        return true;
+    }
+
+    let candidates = [
+        entry.display_name(),
+        entry.branch_name.clone(),
+        entry.path.display().to_string(),
+    ];
+    candidates
+        .iter()
+        .any(|candidate| fuzzy_subsequence_match(candidate, needle))
+}
+
+pub(crate) fn fuzzy_subsequence_match(candidate: &str, needle: &str) -> bool {
+    let mut chars = candidate.chars().flat_map(char::to_lowercase);
+    needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|needle_ch| chars.by_ref().any(|candidate_ch| candidate_ch == needle_ch))
+}
+
+pub(crate) fn selectable_project_worktree_indices_for_filter(
+    entries: &[ProjectWorktreeEntry],
+    filter: &str,
+) -> Vec<usize> {
     entries
         .iter()
         .enumerate()
-        .filter_map(|(index, entry)| entry.is_selectable.then_some(index))
+        .filter_map(|(index, entry)| {
+            (entry.is_selectable && project_worktree_matches_filter(entry, filter)).then_some(index)
+        })
         .collect()
 }
 
@@ -4283,7 +4322,7 @@ leading_branch = "main"
             },
         ];
 
-        let rows = project_worktree_visual_rows(&entries, false, None);
+        let rows = project_worktree_visual_rows(&entries, false, None, "");
 
         assert!(matches!(
             rows.first(),
@@ -4293,7 +4332,50 @@ leading_branch = "main"
             rows.iter()
                 .any(|row| matches!(row, ProjectWorktreeVisualRow::Header("Project Checkout")))
         );
-        assert_eq!(selectable_project_worktree_indices(&entries), vec![0]);
+        assert_eq!(
+            selectable_project_worktree_indices_for_filter(&entries, ""),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn project_worktree_filter_matches_name_branch_and_path_fuzzily() {
+        let entry = ProjectWorktreeEntry {
+            path: PathBuf::from("/repos/dux/worktrees/customer-search"),
+            branch_name: "feature/recover-agent".to_string(),
+            is_managed_by_dux: true,
+            existing_session_id: None,
+            is_external: false,
+            is_project_checkout: false,
+            is_selectable: true,
+        };
+
+        assert!(project_worktree_matches_filter(&entry, "csr"));
+        assert!(project_worktree_matches_filter(&entry, "RCV"));
+        assert!(project_worktree_matches_filter(&entry, "wtcus"));
+        assert!(!project_worktree_matches_filter(&entry, "zzq"));
+    }
+
+    #[test]
+    fn project_worktree_visual_rows_show_empty_when_filter_has_no_available_matches() {
+        let entries = vec![ProjectWorktreeEntry {
+            path: PathBuf::from("/repo/managed"),
+            branch_name: "feature".to_string(),
+            is_managed_by_dux: true,
+            existing_session_id: None,
+            is_external: false,
+            is_project_checkout: false,
+            is_selectable: true,
+        }];
+
+        let rows = project_worktree_visual_rows(&entries, false, None, "nomatch");
+
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            ProjectWorktreeVisualRow::Empty(message)
+                if message == "No available worktrees match this search."
+        )));
+        assert!(selectable_project_worktree_indices_for_filter(&entries, "nomatch").is_empty());
     }
 
     #[test]

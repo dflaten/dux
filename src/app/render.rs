@@ -3895,9 +3895,13 @@ impl App {
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
 
-                let [details_area, list_area] = Layout::default()
+                let [details_area, search_area, list_area] = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(4), Constraint::Min(6)])
+                    .constraints([
+                        Constraint::Length(4),
+                        Constraint::Length(3),
+                        Constraint::Min(6),
+                    ])
                     .areas(area);
 
                 let detail_lines = vec![
@@ -3925,10 +3929,25 @@ impl App {
                     )
                     .render(details_area, frame.buffer_mut());
 
+                let search_block = Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(self.theme.overlay_border))
+                    .style(Style::default().bg(self.theme.overlay_bg));
+                Paragraph::new(render_single_line_cursor_input(
+                    " Search: ",
+                    &prompt.filter.text,
+                    prompt.filter.cursor,
+                    self.theme.input_cursor_fg,
+                    self.theme.input_cursor_bg,
+                ))
+                .block(search_block)
+                .render(search_area, frame.buffer_mut());
+
                 let rows = project_worktree_visual_rows(
                     &prompt.entries,
                     prompt.loading,
                     prompt.error.as_deref(),
+                    &prompt.filter.text,
                 );
                 let path_col = prompt
                     .entries
