@@ -877,12 +877,6 @@ pub(crate) fn project_worktree_visual_rows(
         .filter(|(index, entry)| matches[*index] && entry.is_selectable)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let project_checkout = entries
-        .iter()
-        .enumerate()
-        .filter(|(index, entry)| matches[*index] && entry.is_project_checkout)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
     let disabled = entries
         .iter()
         .enumerate()
@@ -907,14 +901,6 @@ pub(crate) fn project_worktree_visual_rows(
     if !disabled.is_empty() {
         rows.push(ProjectWorktreeVisualRow::Header("Already Has Agent"));
         rows.extend(disabled.into_iter().map(ProjectWorktreeVisualRow::Entry));
-    }
-    if !project_checkout.is_empty() {
-        rows.push(ProjectWorktreeVisualRow::Header("Project Checkout"));
-        rows.extend(
-            project_checkout
-                .into_iter()
-                .map(ProjectWorktreeVisualRow::Entry),
-        );
     }
     rows
 }
@@ -4300,7 +4286,7 @@ leading_branch = "main"
     }
 
     #[test]
-    fn project_worktree_visual_rows_separate_project_checkout() {
+    fn project_worktree_visual_rows_omit_project_checkout() {
         let entries = vec![
             ProjectWorktreeEntry {
                 path: PathBuf::from("/repo/managed"),
@@ -4328,8 +4314,15 @@ leading_branch = "main"
             rows.first(),
             Some(ProjectWorktreeVisualRow::Header("Available Worktrees"))
         ));
-        assert!(
+        assert_eq!(
             rows.iter()
+                .filter(|row| matches!(row, ProjectWorktreeVisualRow::Entry(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !rows
+                .iter()
                 .any(|row| matches!(row, ProjectWorktreeVisualRow::Header("Project Checkout")))
         );
         assert_eq!(

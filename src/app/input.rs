@@ -8198,6 +8198,36 @@ not_a_real_action = ["x"]
     }
 
     #[test]
+    fn project_worktree_picker_header_shows_project_branch() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let mut project = app.projects[0].clone();
+        project.current_branch = "feature/searchable-worktrees".to_string();
+        app.prompt = PromptState::PickProjectWorktree(PickProjectWorktreePrompt {
+            project,
+            entries: Vec::new(),
+            filter: TextInput::new(),
+            loading: false,
+            selected: None,
+            error: None,
+        });
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Branch:"));
+        assert!(rendered.contains("feature/searchable-worktrees"));
+        assert!(!rendered.contains("Project Checkout"));
+    }
+
+    #[test]
     fn disabled_project_worktree_entries_cannot_be_selected_or_confirmed() {
         let mut app = test_app(default_bindings());
         let project = app.projects[0].clone();

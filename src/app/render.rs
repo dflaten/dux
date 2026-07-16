@@ -3898,7 +3898,7 @@ impl App {
                 let [details_area, search_area, list_area] = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(4),
+                        Constraint::Length(5),
                         Constraint::Length(3),
                         Constraint::Min(6),
                     ])
@@ -3919,6 +3919,13 @@ impl App {
                         Span::styled(
                             prompt.project.path.as_str(),
                             Style::default().fg(self.theme.text_fg),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" Branch: ", Style::default().fg(self.theme.hint_desc_fg)),
+                        Span::styled(
+                            prompt.project.current_branch.as_str(),
+                            Style::default().fg(self.theme.branch_fg),
                         ),
                     ]),
                 ];
