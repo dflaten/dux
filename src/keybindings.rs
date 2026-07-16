@@ -642,7 +642,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::NewAgentFromWorktree,
-        default_keys: &[key!(shift - n)],
+        default_keys: &[key!(shift - s)],
         scopes: &[BindingScope::Left],
         help: Some(HelpEntry {
             section: "Projects pane",

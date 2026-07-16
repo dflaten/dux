@@ -8090,12 +8090,12 @@ not_a_real_action = ["x"]
     }
 
     #[test]
-    fn shift_n_opens_project_worktree_picker_from_projects_pane() {
+    fn shift_s_opens_project_worktree_picker_from_projects_pane() {
         let mut app = test_app(default_bindings());
         app.selected_left = 0;
         app.focus = FocusPane::Left;
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT))
+        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
             .unwrap();
 
         match &app.prompt {
