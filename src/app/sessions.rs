@@ -761,6 +761,194 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn open_worktree_cleanup(&mut self) -> Result<()> {
+        let candidates = self.worktree_cleanup_candidates(Utc::now());
+        if candidates.is_empty() {
+            self.set_info(
+                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity.",
+            );
+            return Ok(());
+        }
+
+        let count = candidates.len();
+        self.prompt = PromptState::ConfirmWorktreeCleanup {
+            candidates,
+            focus: WorktreeCleanupFocus::Cancel,
+            scroll_offset: 0,
+        };
+        self.set_warning(format!(
+            "Review {count} inactive worktree(s) before confirming cleanup."
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn worktree_cleanup_candidates(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Vec<WorktreeCleanupCandidate> {
+        let cutoff = now - chrono::Duration::weeks(2);
+        let mut by_worktree: std::collections::BTreeMap<String, Vec<&AgentSession>> =
+            std::collections::BTreeMap::new();
+        for session in &self.sessions {
+            if !git::is_under(
+                &self.paths.worktrees_root,
+                std::path::Path::new(&session.worktree_path),
+            ) {
+                continue;
+            }
+            by_worktree
+                .entry(session.worktree_path.clone())
+                .or_default()
+                .push(session);
+        }
+
+        let mut candidates = Vec::new();
+        for (worktree_path, sessions) in by_worktree {
+            if sessions
+                .iter()
+                .any(|session| self.providers.contains_key(&session.id))
+            {
+                continue;
+            }
+            let Some(updated_at) = sessions.iter().map(|session| session.updated_at).max() else {
+                continue;
+            };
+            if updated_at > cutoff {
+                continue;
+            }
+            let Some(first_session) = sessions.first() else {
+                continue;
+            };
+            let Some(project) = self
+                .projects
+                .iter()
+                .find(|project| project.id == first_session.project_id)
+            else {
+                continue;
+            };
+            let mut session_ids: Vec<String> =
+                sessions.iter().map(|session| session.id.clone()).collect();
+            session_ids.sort();
+            candidates.push(WorktreeCleanupCandidate {
+                session_ids,
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                branch_name: first_session.branch_name.clone(),
+                worktree_path,
+                updated_at,
+            });
+        }
+
+        candidates.sort_by(|a, b| {
+            a.project_name
+                .cmp(&b.project_name)
+                .then(a.updated_at.cmp(&b.updated_at))
+                .then(a.worktree_path.cmp(&b.worktree_path))
+        });
+        candidates
+    }
+
+    pub(crate) fn begin_worktree_cleanup(&mut self, candidates: Vec<WorktreeCleanupCandidate>) {
+        if candidates.is_empty() {
+            self.set_info("No worktrees selected for cleanup.");
+            return;
+        }
+
+        let mut started = 0usize;
+        for candidate in candidates {
+            if candidate
+                .session_ids
+                .iter()
+                .any(|session_id| self.pending_deletions.contains(session_id))
+            {
+                continue;
+            }
+            let Some(project) = self
+                .projects
+                .iter()
+                .find(|project| project.id == candidate.project_id)
+                .cloned()
+            else {
+                continue;
+            };
+
+            for session_id in &candidate.session_ids {
+                self.pending_deletions.insert(session_id.clone());
+            }
+            let tx = self.worker_tx.clone();
+            let worktree_path = candidate.worktree_path.clone();
+            let branch_name = candidate.branch_name.clone();
+            std::thread::spawn(move || {
+                let result = git::remove_worktree(
+                    std::path::Path::new(&project.path),
+                    std::path::Path::new(&worktree_path),
+                    &branch_name,
+                )
+                .map(|r| r.branch_already_deleted)
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(WorkerEvent::WorktreeCleanupRemoveCompleted { candidate, result });
+            });
+            started += 1;
+        }
+
+        if started == 0 {
+            self.set_info(
+                "Cleanup skipped because the eligible worktrees are already being removed.",
+            );
+        } else {
+            self.set_busy(format!("Removing {started} inactive worktree(s)…"));
+        }
+    }
+
+    pub(crate) fn finish_worktree_cleanup(
+        &mut self,
+        candidate: WorktreeCleanupCandidate,
+        branch_already_deleted: bool,
+    ) -> Result<()> {
+        let session_ids: std::collections::HashSet<String> =
+            candidate.session_ids.iter().cloned().collect();
+
+        for session_id in &candidate.session_ids {
+            if self
+                .sessions
+                .iter()
+                .any(|session| session.id == *session_id)
+            {
+                self.session_store.delete_session(session_id)?;
+                Self::spawn_delete_startup_command_logs(
+                    self.paths.clone(),
+                    candidate.project_id.clone(),
+                    session_id.clone(),
+                );
+            }
+            self.providers.remove(session_id);
+            self.running_provider_pins.remove(session_id);
+            self.last_pty_activity.remove(session_id);
+            self.resume_fallback_candidates.remove(session_id);
+            self.clear_companion_terminals_for_session(session_id);
+        }
+
+        self.sessions
+            .retain(|session| !session_ids.contains(&session.id));
+        self.update_branch_sync_sessions();
+        self.rebuild_left_items();
+        self.ensure_selectable_left_item();
+        self.reload_changed_files();
+
+        if branch_already_deleted {
+            self.set_info(format!(
+                "Removed inactive worktree for project \"{}\". Branch \"{}\" was already gone.",
+                candidate.project_name, candidate.branch_name
+            ));
+        } else {
+            self.set_info(format!(
+                "Removed inactive worktree for project \"{}\" with branch \"{}\".",
+                candidate.project_name, candidate.branch_name
+            ));
+        }
+        Ok(())
+    }
+
     /// Delete the agent session identified by `session_id`, blocking the
     /// calling thread for any git work. Used by bulk flows like project
     /// deletion, where we must complete all removals before the parent
@@ -2858,6 +3046,98 @@ mod tests {
             crate::pty::PtyClient::spawn("echo", &[], std::path::Path::new("/tmp"), 24, 80, 1000)
                 .expect("spawn echo for test");
         app.providers.insert(session_id.to_string(), client);
+    }
+
+    fn set_session_worktree(app: &mut App, session_id: &str, path: std::path::PathBuf) {
+        std::fs::create_dir_all(&path).expect("worktree dir");
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .expect("session");
+        session.worktree_path = path.to_string_lossy().to_string();
+    }
+
+    fn set_session_updated_at(app: &mut App, session_id: &str, updated_at: chrono::DateTime<Utc>) {
+        let session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .expect("session");
+        session.updated_at = updated_at;
+    }
+
+    #[test]
+    fn worktree_cleanup_candidates_include_old_inactive_managed_worktrees() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(
+            vec![make_session("old", "codex", "/tmp/placeholder")],
+            vec![project],
+        );
+        let worktree = app.paths.worktrees_root.join("old");
+        set_session_worktree(&mut app, "old", worktree.clone());
+        let now = Utc::now();
+        set_session_updated_at(&mut app, "old", now - chrono::Duration::days(15));
+
+        let candidates = app.worktree_cleanup_candidates(now);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_ids, vec!["old".to_string()]);
+        assert_eq!(
+            candidates[0].worktree_path,
+            worktree.to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn worktree_cleanup_candidates_skip_recent_active_and_external_worktrees() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(
+            vec![
+                make_session("recent", "codex", "/tmp/placeholder-recent"),
+                make_session("active", "codex", "/tmp/placeholder-active"),
+                make_session("external", "codex", "/tmp/external-worktree"),
+            ],
+            vec![project],
+        );
+        let now = Utc::now();
+        let recent_worktree = app.paths.worktrees_root.join("recent");
+        let active_worktree = app.paths.worktrees_root.join("active");
+        set_session_worktree(&mut app, "recent", recent_worktree);
+        set_session_worktree(&mut app, "active", active_worktree);
+        set_session_updated_at(&mut app, "recent", now - chrono::Duration::days(13));
+        set_session_updated_at(&mut app, "active", now - chrono::Duration::days(30));
+        set_session_updated_at(&mut app, "external", now - chrono::Duration::days(30));
+        mark_active(&mut app, "active");
+
+        let candidates = app.worktree_cleanup_candidates(now);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn worktree_cleanup_candidates_group_shared_stale_worktrees() {
+        let project = make_project("project-1", "codex");
+        let mut first = make_session("first", "codex", "/tmp/placeholder");
+        first.branch_name = "shared-branch".to_string();
+        let mut second = make_session("second", "codex", "/tmp/placeholder");
+        second.branch_name = "shared-branch".to_string();
+        let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        let worktree = app.paths.worktrees_root.join("shared");
+        set_session_worktree(&mut app, "first", worktree.clone());
+        set_session_worktree(&mut app, "second", worktree);
+        let now = Utc::now();
+        set_session_updated_at(&mut app, "first", now - chrono::Duration::days(30));
+        set_session_updated_at(&mut app, "second", now - chrono::Duration::days(16));
+
+        let candidates = app.worktree_cleanup_candidates(now);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].session_ids,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(candidates[0].updated_at, now - chrono::Duration::days(16));
     }
 
     #[test]
