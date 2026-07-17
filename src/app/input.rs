@@ -14419,6 +14419,67 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn iterm_colon_sgr_mouse_selection_pastes_to_terminal() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'aws s3 ls'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // iTerm2 can report SGR mouse parameters with colon delimiters.
+        // Coordinates are wire-format 1-based screen cells; the installed
+        // terminal area starts at screen column 21, row 1.
+        app.process_raw_input_bytes(b"\x1b[<0:22:2M")
+            .expect("mouse down");
+        app.process_raw_input_bytes(b"\x1b[<32:30:2M")
+            .expect("mouse drag");
+        app.process_raw_input_bytes(b"\x1b[<0:30:2m")
+            .expect("mouse up");
+
+        assert_eq!(app.terminal_selection_text.as_deref(), Some("aws s3 ls"));
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("process ctrl-e");
+
+        assert_eq!(app.session_surface, SessionSurface::Terminal);
+        assert_eq!(app.input_target, InputTarget::Terminal);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected agent output into companion terminal."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let terminal = app
+            .active_terminal_id
+            .as_ref()
+            .and_then(|id| app.companion_terminals.get(id))
+            .expect("active terminal");
+        let rendered: String = terminal
+            .client
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("aws s3 ls"),
+            "terminal should contain pasted command; got: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn paste_selection_to_terminal_requires_selection() {
         let mut app = test_app(default_bindings());
         app.session_surface = SessionSurface::Agent;
