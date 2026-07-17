@@ -30,7 +30,7 @@ pub fn parse_sgr_mouse(seq: &[u8]) -> Option<MouseEvent> {
     let final_byte = *seq.last()?;
     // Extract the parameter string between '<' and the final byte.
     let params = std::str::from_utf8(&seq[3..seq.len() - 1]).ok()?;
-    let mut parts = params.split(';');
+    let mut parts = params.split([';', ':']);
     let cb: u16 = parts.next()?.parse().ok()?;
     let cx: u16 = parts.next()?.parse().ok()?;
     let cy: u16 = parts.next()?.parse().ok()?;
@@ -124,7 +124,7 @@ pub fn translate_sgr_mouse(seq: &[u8], origin_col: u16, origin_row: u16) -> Opti
     }
     let final_byte = *seq.last()?;
     let params = std::str::from_utf8(&seq[3..seq.len() - 1]).ok()?;
-    let mut parts = params.split(';');
+    let mut parts = params.split([';', ':']);
     let cb: u16 = parts.next()?.parse().ok()?;
     let cx: u16 = parts.next()?.parse().ok()?; // 1-based screen column
     let cy: u16 = parts.next()?.parse().ok()?; // 1-based screen row
@@ -522,6 +522,26 @@ mod tests {
     }
 
     #[test]
+    fn sgr_mouse_colon_parameters() {
+        let seq = b"\x1b[<0:50:10M";
+        assert!(is_sgr_mouse(seq));
+        let ev = parse_sgr_mouse(seq).unwrap();
+        assert_eq!(ev.kind, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(ev.column, 49);
+        assert_eq!(ev.row, 9);
+    }
+
+    #[test]
+    fn sgr_mouse_colon_extra_parameter() {
+        let seq = b"\x1b[<0:50:10:1M";
+        assert!(is_sgr_mouse(seq));
+        let ev = parse_sgr_mouse(seq).unwrap();
+        assert_eq!(ev.kind, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(ev.column, 49);
+        assert_eq!(ev.row, 9);
+    }
+
+    #[test]
     fn sgr_mouse_left_release() {
         let seq = b"\x1b[<0;50;10m";
         assert!(is_sgr_mouse(seq));
@@ -854,6 +874,13 @@ mod tests {
         // Screen click at 1-based (50, 15), terminal area origin at (5, 3).
         // Expected translated coords: (50-5, 15-3) = (45, 12).
         let seq = b"\x1b[<0;50;15M";
+        let translated = translate_sgr_mouse(seq, 5, 3).unwrap();
+        assert_eq!(translated, b"\x1b[<0;45;12M");
+    }
+
+    #[test]
+    fn translate_sgr_mouse_colon_parameters() {
+        let seq = b"\x1b[<0:50:15M";
         let translated = translate_sgr_mouse(seq, 5, 3).unwrap();
         assert_eq!(translated, b"\x1b[<0;45;12M");
     }
