@@ -154,7 +154,7 @@ The right pane is a full git staging area. Stage and unstage files, view syntax-
 
 Each agent gets its own companion terminal: a separate shell session in the same worktree. Use it for builds, tests, git operations, or anything else you'd normally do in a terminal. You can spawn multiple companion terminals per agent.
 
-When an agent prints a command or script you want to run, select the text in the agent output and run `paste-selection-to-terminal` from the command palette. dux opens or reuses that agent's companion terminal and pastes the selection without submitting it, so you can inspect or edit before pressing Enter.
+When an agent prints a command or script you want to run, select the text in the agent output and run `paste-selection-to-terminal` from the command palette. dux opens or reuses that agent's companion terminal and pastes the selection without submitting it, so you can inspect or edit before pressing Enter. The reverse works too: select terminal output and run `paste-selection-to-agent` to paste it back into the owning agent without submitting it.
 
 ### Forking Sessions
 
