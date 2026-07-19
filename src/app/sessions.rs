@@ -703,7 +703,7 @@ impl App {
         {
             self.selected_left = pos;
         }
-        self.reload_changed_files();
+        self.reload_changed_files_quiet();
 
         self.active_terminal_id = Some(terminal_id);
         self.terminal_return_to_list = false;
@@ -762,95 +762,86 @@ impl App {
     }
 
     pub(crate) fn open_worktree_cleanup(&mut self) -> Result<()> {
-        let candidates = self.worktree_cleanup_candidates(Utc::now());
-        if candidates.is_empty() {
-            self.set_info(
-                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity.",
-            );
-            return Ok(());
-        }
-
-        let count = candidates.len();
-        self.prompt = PromptState::ConfirmWorktreeCleanup {
-            candidates,
-            focus: WorktreeCleanupFocus::Cancel,
-            scroll_offset: 0,
-        };
-        self.set_warning(format!(
-            "Review {count} inactive worktree(s) before confirming cleanup."
+        self.prompt = PromptState::WorktreeCleanupStart;
+        let confirm_key = self.bindings.label_for(Action::Confirm);
+        self.set_info(format!(
+            "Worktree cleanup ready. Press {confirm_key} to scan for eligible inactive worktrees."
         ));
         Ok(())
     }
 
+    pub(crate) fn prepare_worktree_cleanup_candidates(&mut self) {
+        let sessions = self.sessions.clone();
+        let projects = self.projects.clone();
+        let worktrees_root = self.paths.worktrees_root.clone();
+        let active_session_ids = self.providers.keys().cloned().collect();
+        let tx = self.worker_tx.clone();
+        self.set_busy(
+            "Scanning for inactive dux-managed worktrees eligible for cleanup. The review list will appear when the scan finishes.",
+        );
+        std::thread::spawn(move || {
+            let candidates = build_worktree_cleanup_candidates(
+                &worktrees_root,
+                &sessions,
+                &projects,
+                &active_session_ids,
+                Utc::now(),
+            );
+            let _ = tx.send(WorkerEvent::WorktreeCleanupCandidatesReady { candidates });
+        });
+    }
+
+    pub(crate) fn show_worktree_cleanup_candidates(
+        &mut self,
+        candidates: Vec<WorktreeCleanupCandidate>,
+    ) {
+        let selected = vec![true; candidates.len()];
+        let count = candidates.len();
+        self.prompt = PromptState::ConfirmWorktreeCleanup {
+            candidates,
+            selected,
+            cursor: 0,
+            scroll_offset: 0,
+        };
+        if count == 0 {
+            self.set_info(
+                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity.",
+            );
+        } else {
+            let confirm_key = self.bindings.label_for(Action::Confirm);
+            self.set_warning(format!(
+                "Review {count} inactive worktree(s). Press Space to toggle selected rows, then {confirm_key} to remove checked worktrees."
+            ));
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn worktree_cleanup_candidates(
         &self,
         now: chrono::DateTime<Utc>,
     ) -> Vec<WorktreeCleanupCandidate> {
-        let cutoff = now - chrono::Duration::weeks(2);
-        let mut by_worktree: std::collections::BTreeMap<String, Vec<&AgentSession>> =
-            std::collections::BTreeMap::new();
-        for session in &self.sessions {
-            if !git::is_under(
-                &self.paths.worktrees_root,
-                std::path::Path::new(&session.worktree_path),
-            ) {
-                continue;
-            }
-            by_worktree
-                .entry(session.worktree_path.clone())
-                .or_default()
-                .push(session);
-        }
-
-        let mut candidates = Vec::new();
-        for (worktree_path, sessions) in by_worktree {
-            if sessions
-                .iter()
-                .any(|session| self.providers.contains_key(&session.id))
-            {
-                continue;
-            }
-            let Some(updated_at) = sessions.iter().map(|session| session.updated_at).max() else {
-                continue;
-            };
-            if updated_at > cutoff {
-                continue;
-            }
-            let Some(first_session) = sessions.first() else {
-                continue;
-            };
-            let Some(project) = self
-                .projects
-                .iter()
-                .find(|project| project.id == first_session.project_id)
-            else {
-                continue;
-            };
-            let mut session_ids: Vec<String> =
-                sessions.iter().map(|session| session.id.clone()).collect();
-            session_ids.sort();
-            candidates.push(WorktreeCleanupCandidate {
-                session_ids,
-                project_id: project.id.clone(),
-                project_name: project.name.clone(),
-                branch_name: first_session.branch_name.clone(),
-                worktree_path,
-                updated_at,
-            });
-        }
-
-        candidates.sort_by(|a, b| {
-            a.project_name
-                .cmp(&b.project_name)
-                .then(a.updated_at.cmp(&b.updated_at))
-                .then(a.worktree_path.cmp(&b.worktree_path))
-        });
-        candidates
+        let active_session_ids = self.providers.keys().cloned().collect();
+        build_worktree_cleanup_candidates(
+            &self.paths.worktrees_root,
+            &self.sessions,
+            &self.projects,
+            &active_session_ids,
+            now,
+        )
     }
 
     pub(crate) fn begin_worktree_cleanup(&mut self, candidates: Vec<WorktreeCleanupCandidate>) {
+        self.worktree_cleanup_pending = 0;
+        self.worktree_cleanup_removed.clear();
+        self.worktree_cleanup_failed.clear();
+
         if candidates.is_empty() {
-            self.set_info("No worktrees selected for cleanup.");
+            self.prompt = PromptState::WorktreeCleanupSummary {
+                removed: Vec::new(),
+                failed: Vec::new(),
+                scroll_offset: 0,
+            };
+            self.set_info("Worktree cleanup complete. No worktrees were selected.");
             return;
         }
 
@@ -869,6 +860,10 @@ impl App {
                 .find(|project| project.id == candidate.project_id)
                 .cloned()
             else {
+                self.worktree_cleanup_failed.push(WorktreeCleanupFailure {
+                    candidate,
+                    message: "Project record is no longer available, so dux could not determine the source checkout for removal.".to_string(),
+                });
                 continue;
             };
 
@@ -891,11 +886,26 @@ impl App {
             started += 1;
         }
 
+        self.worktree_cleanup_pending = started;
         if started == 0 {
-            self.set_info(
-                "Cleanup skipped because the eligible worktrees are already being removed.",
-            );
+            let failed = self.worktree_cleanup_failed.clone();
+            self.prompt = PromptState::WorktreeCleanupSummary {
+                removed: Vec::new(),
+                failed,
+                scroll_offset: 0,
+            };
+            if self.worktree_cleanup_failed.is_empty() {
+                self.set_info(
+                    "Cleanup skipped because the eligible worktrees are already being removed.",
+                );
+            } else {
+                self.set_error(format!(
+                    "Worktree cleanup could not start for {} selected worktree(s).",
+                    self.worktree_cleanup_failed.len()
+                ));
+            }
         } else {
+            self.prompt = PromptState::None;
             self.set_busy(format!("Removing {started} inactive worktree(s)…"));
         }
     }
@@ -933,7 +943,7 @@ impl App {
         self.update_branch_sync_sessions();
         self.rebuild_left_items();
         self.ensure_selectable_left_item();
-        self.reload_changed_files();
+        self.reload_changed_files_quiet();
 
         if branch_already_deleted {
             self.set_info(format!(
@@ -947,6 +957,39 @@ impl App {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn finish_worktree_cleanup_job_if_done(&mut self) {
+        if self.worktree_cleanup_pending == 0 {
+            return;
+        }
+        self.worktree_cleanup_pending = self.worktree_cleanup_pending.saturating_sub(1);
+        if self.worktree_cleanup_pending > 0 {
+            let remaining = self.worktree_cleanup_pending;
+            self.set_busy(format!(
+                "Cleaning up worktrees... {remaining} removal(s) remaining."
+            ));
+            return;
+        }
+
+        let removed = self.worktree_cleanup_removed.clone();
+        let failed = self.worktree_cleanup_failed.clone();
+        let removed_count = removed.len();
+        let failed_count = failed.len();
+        self.prompt = PromptState::WorktreeCleanupSummary {
+            removed,
+            failed,
+            scroll_offset: 0,
+        };
+        if failed_count == 0 {
+            self.set_info(format!(
+                "Worktree cleanup complete. Removed {removed_count} worktree(s)."
+            ));
+        } else {
+            self.set_error(format!(
+                "Worktree cleanup finished with {failed_count} failure(s) and {removed_count} removal(s)."
+            ));
+        }
     }
 
     /// Delete the agent session identified by `session_id`, blocking the
@@ -2311,10 +2354,12 @@ impl App {
             return Ok(());
         };
         let worktree_path = session.worktree_path.clone();
+        let base_ref = self.diff_base_ref_for_session(session);
         let rel_path = file.path.clone();
-        let output = crate::diff::diff_file(
+        let output = crate::diff::diff_file_against_ref(
             Path::new(&worktree_path),
             &rel_path,
+            &base_ref,
             &self.theme,
             &self.syntax_cache,
             self.show_diff_line_numbers,
@@ -2326,6 +2371,7 @@ impl App {
             gutter_width: output.gutter_width,
             worktree_path,
             rel_path,
+            base_ref,
         };
         self.focus = FocusPane::Center;
         Ok(())
@@ -2333,18 +2379,25 @@ impl App {
 
     /// Re-generate the currently displayed diff (e.g. after toggling line numbers).
     pub(crate) fn refresh_current_diff(&mut self) -> Result<()> {
-        let (worktree_path, rel_path, scroll) = match &self.center_mode {
+        let (worktree_path, rel_path, base_ref, scroll) = match &self.center_mode {
             CenterMode::Diff {
                 worktree_path,
                 rel_path,
+                base_ref,
                 scroll,
                 ..
-            } => (worktree_path.clone(), rel_path.clone(), *scroll),
+            } => (
+                worktree_path.clone(),
+                rel_path.clone(),
+                base_ref.clone(),
+                *scroll,
+            ),
             _ => return Ok(()),
         };
-        let output = crate::diff::diff_file(
+        let output = crate::diff::diff_file_against_ref(
             Path::new(&worktree_path),
             &rel_path,
+            &base_ref,
             &self.theme,
             &self.syntax_cache,
             self.show_diff_line_numbers,
@@ -2356,6 +2409,7 @@ impl App {
             gutter_width: output.gutter_width,
             worktree_path,
             rel_path,
+            base_ref,
         };
         Ok(())
     }
@@ -2848,6 +2902,71 @@ fn parse_github_pull_url_parts(input: &str) -> Option<(String, String)> {
     Some((host.to_string(), rest))
 }
 
+fn build_worktree_cleanup_candidates(
+    worktrees_root: &Path,
+    sessions: &[AgentSession],
+    projects: &[Project],
+    active_session_ids: &std::collections::HashSet<String>,
+    now: chrono::DateTime<Utc>,
+) -> Vec<WorktreeCleanupCandidate> {
+    let cutoff = now - chrono::Duration::weeks(2);
+    let mut by_worktree: std::collections::BTreeMap<String, Vec<&AgentSession>> =
+        std::collections::BTreeMap::new();
+    for session in sessions {
+        if !git::is_under(worktrees_root, std::path::Path::new(&session.worktree_path)) {
+            continue;
+        }
+        by_worktree
+            .entry(session.worktree_path.clone())
+            .or_default()
+            .push(session);
+    }
+
+    let mut candidates = Vec::new();
+    for (worktree_path, sessions) in by_worktree {
+        if sessions
+            .iter()
+            .any(|session| active_session_ids.contains(&session.id))
+        {
+            continue;
+        }
+        let Some(updated_at) = sessions.iter().map(|session| session.updated_at).max() else {
+            continue;
+        };
+        if updated_at > cutoff {
+            continue;
+        }
+        let Some(first_session) = sessions.first() else {
+            continue;
+        };
+        let Some(project) = projects
+            .iter()
+            .find(|project| project.id == first_session.project_id)
+        else {
+            continue;
+        };
+        let mut session_ids: Vec<String> =
+            sessions.iter().map(|session| session.id.clone()).collect();
+        session_ids.sort();
+        candidates.push(WorktreeCleanupCandidate {
+            session_ids,
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            branch_name: first_session.branch_name.clone(),
+            worktree_path,
+            updated_at,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        a.project_name
+            .cmp(&b.project_name)
+            .then(a.updated_at.cmp(&b.updated_at))
+            .then(a.worktree_path.cmp(&b.worktree_path))
+    });
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2945,6 +3064,10 @@ mod tests {
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
+            worktree_cleanup_pending: 0,
+            worktree_cleanup_removed: Vec::new(),
+            worktree_cleanup_failed: Vec::new(),
+            worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: std::collections::HashMap::new(),
             prev_scrollback_offset: 0,
@@ -2954,7 +3077,7 @@ mod tests {
             tick_count: 0,
             start_time: std::time::Instant::now(),
             readonly_nudge_tick: None,
-            watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),
+            watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
             left_items_cache: Vec::new(),
@@ -3066,6 +3189,217 @@ mod tests {
             .find(|session| session.id == session_id)
             .expect("session");
         session.updated_at = updated_at;
+    }
+
+    #[test]
+    fn open_worktree_cleanup_starts_with_run_prompt() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(
+            vec![make_session("old", "codex", "/tmp/placeholder")],
+            vec![project],
+        );
+
+        app.open_worktree_cleanup().expect("open cleanup");
+
+        assert!(matches!(app.prompt, PromptState::WorktreeCleanupStart));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup ready. Press Enter to scan for eligible inactive worktrees."
+        );
+    }
+
+    #[test]
+    fn show_worktree_cleanup_candidates_lists_old_inactive_worktrees_selected() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(
+            vec![make_session("old", "codex", "/tmp/placeholder")],
+            vec![project],
+        );
+        let worktree = app.paths.worktrees_root.join("old");
+        set_session_worktree(&mut app, "old", worktree);
+        set_session_updated_at(&mut app, "old", Utc::now() - chrono::Duration::days(15));
+
+        let candidates = app.worktree_cleanup_candidates(Utc::now());
+        app.show_worktree_cleanup_candidates(candidates);
+
+        let PromptState::ConfirmWorktreeCleanup {
+            candidates,
+            selected,
+            cursor,
+            scroll_offset,
+        } = &app.prompt
+        else {
+            panic!("expected cleanup review prompt");
+        };
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(selected, &vec![true]);
+        assert_eq!(*cursor, 0);
+        assert_eq!(*scroll_offset, 0);
+    }
+
+    #[test]
+    fn show_worktree_cleanup_candidates_shows_empty_review_when_none_eligible() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(
+            vec![make_session("recent", "codex", "/tmp/placeholder")],
+            vec![project],
+        );
+        let worktree = app.paths.worktrees_root.join("recent");
+        set_session_worktree(&mut app, "recent", worktree);
+
+        let candidates = app.worktree_cleanup_candidates(Utc::now());
+        app.show_worktree_cleanup_candidates(candidates);
+
+        let PromptState::ConfirmWorktreeCleanup {
+            candidates,
+            selected,
+            ..
+        } = &app.prompt
+        else {
+            panic!("expected cleanup review prompt");
+        };
+        assert!(candidates.is_empty());
+        assert!(selected.is_empty());
+        assert_eq!(
+            app.status.message(),
+            "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity."
+        );
+    }
+
+    #[test]
+    fn worktree_cleanup_candidates_ready_populates_review_only_when_start_prompt_is_open() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        let candidate = WorktreeCleanupCandidate {
+            session_ids: vec!["old".to_string()],
+            project_id: "project-1".to_string(),
+            project_name: "demo".to_string(),
+            branch_name: "branch-old".to_string(),
+            worktree_path: app
+                .paths
+                .worktrees_root
+                .join("old")
+                .to_string_lossy()
+                .to_string(),
+            updated_at: Utc::now() - chrono::Duration::days(15),
+        };
+        app.prompt = PromptState::WorktreeCleanupStart;
+
+        app.worker_tx
+            .send(WorkerEvent::WorktreeCleanupCandidatesReady {
+                candidates: vec![candidate.clone()],
+            })
+            .expect("send cleanup candidates");
+        app.drain_events();
+
+        assert!(matches!(
+            app.prompt,
+            PromptState::ConfirmWorktreeCleanup { ref candidates, .. }
+                if candidates == &vec![candidate]
+        ));
+
+        app.prompt = PromptState::None;
+        app.worker_tx
+            .send(WorkerEvent::WorktreeCleanupCandidatesReady {
+                candidates: Vec::new(),
+            })
+            .expect("send stale cleanup candidates");
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::None));
+    }
+
+    #[test]
+    fn begin_worktree_cleanup_with_no_selection_opens_empty_summary() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+
+        app.begin_worktree_cleanup(Vec::new());
+
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.is_empty() && failed.is_empty()
+        ));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup complete. No worktrees were selected."
+        );
+    }
+
+    #[test]
+    fn begin_worktree_cleanup_reports_missing_project_as_failure() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        let candidate = WorktreeCleanupCandidate {
+            session_ids: vec!["old".to_string()],
+            project_id: "missing-project".to_string(),
+            project_name: "missing".to_string(),
+            branch_name: "branch-old".to_string(),
+            worktree_path: app
+                .paths
+                .worktrees_root
+                .join("old")
+                .to_string_lossy()
+                .to_string(),
+            updated_at: Utc::now() - chrono::Duration::days(15),
+        };
+
+        app.begin_worktree_cleanup(vec![candidate]);
+
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.is_empty()
+                && failed.len() == 1
+                && failed[0].message.contains("Project record is no longer available")
+        ));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup could not start for 1 selected worktree(s)."
+        );
+    }
+
+    #[test]
+    fn finish_worktree_cleanup_job_if_done_opens_summary() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        let candidate = WorktreeCleanupCandidate {
+            session_ids: vec!["old".to_string()],
+            project_id: "project-1".to_string(),
+            project_name: "demo".to_string(),
+            branch_name: "branch-old".to_string(),
+            worktree_path: app
+                .paths
+                .worktrees_root
+                .join("old")
+                .to_string_lossy()
+                .to_string(),
+            updated_at: Utc::now() - chrono::Duration::days(15),
+        };
+        app.worktree_cleanup_pending = 1;
+        app.worktree_cleanup_removed.push(candidate);
+
+        app.finish_worktree_cleanup_job_if_done();
+
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.len() == 1 && failed.is_empty()
+        ));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup complete. Removed 1 worktree(s)."
+        );
     }
 
     #[test]
@@ -3275,6 +3609,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }
     }
 

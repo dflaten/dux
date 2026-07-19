@@ -1693,16 +1693,36 @@ impl App {
         let inner = block.inner(area);
         block.render(area, frame.buffer_mut());
 
+        let (summary_area, after_summary) = if inner.height >= 3 {
+            let [summary, rest] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(0)])
+                .areas(inner);
+            (Some(summary), rest)
+        } else {
+            (None, inner)
+        };
+
+        if let Some(summary_area) = summary_area {
+            Paragraph::new(file_list_summary_line(files, &self.theme))
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(Style::default().fg(self.theme.border_normal)),
+                )
+                .render(summary_area, frame.buffer_mut());
+        }
+
         let show_search =
             is_active_section && (self.files_search_active || self.has_files_search());
-        let (search_area, list_inner) = if show_search && inner.height >= 4 {
+        let (search_area, list_inner) = if show_search && after_summary.height >= 4 {
             let [sa, la] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(2), Constraint::Min(1)])
-                .areas(inner);
+                .areas(after_summary);
             (Some(sa), la)
         } else {
-            (None, inner)
+            (None, after_summary)
         };
 
         // Optionally reserve 2 lines at the bottom for the hint bar (border + text).
@@ -4798,9 +4818,40 @@ impl App {
                     checkbox: checkbox_rect,
                 };
             }
+            PromptState::WorktreeCleanupStart => {
+                self.render_dim_overlay(frame);
+                let dialog_width = 72.min(frame.area().width.max(1));
+                let dialog_height = 12.min(frame.area().height.max(1));
+                let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Cleanup Worktrees");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(" Worktree cleanup removes inactive dux-managed worktrees."),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " Worktrees are eligible after two weeks without session activity and no active agents.",
+                        Style::default().fg(self.theme.warning_fg),
+                    )),
+                    Line::from(""),
+                    Line::from(format!(
+                        " Press {confirm_key} to scan for eligible worktrees. Press {close_key} to cancel."
+                    )),
+                ];
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .render(inner, frame.buffer_mut());
+                self.overlay_layout.active = OverlayMouseLayout::None;
+            }
             PromptState::ConfirmWorktreeCleanup {
                 candidates,
-                focus,
+                selected,
+                cursor,
                 scroll_offset,
             } => {
                 self.render_dim_overlay(frame);
@@ -4812,69 +4863,185 @@ impl App {
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
-                let [intro_area, list_area, buttons_area] = Layout::default()
+                let [intro_area, list_area, footer_area] = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(5),
+                        Constraint::Length(6),
                         Constraint::Min(3),
-                        Constraint::Length(3),
+                        Constraint::Length(2),
                     ])
                     .areas(inner);
+                self.worktree_cleanup_visible_candidates =
+                    (usize::from(list_area.height) / 2).max(1);
 
-                let intro = vec![
-                    Line::from(format!(
-                        " Remove {} inactive dux-managed worktree(s)?",
-                        candidates.len()
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        " Worktrees listed here have had no session activity for at least two weeks",
-                        Style::default().fg(self.theme.warning_fg),
-                    )),
-                    Line::from(Span::styled(
-                        " and have no currently active agents. Uncommitted changes will be lost.",
-                        Style::default().fg(self.theme.warning_fg),
-                    )),
-                ];
+                let selected_count = selected.iter().filter(|is_selected| **is_selected).count();
+                let move_up = self.bindings.labels_for(Action::MoveUp);
+                let move_down = self.bindings.labels_for(Action::MoveDown);
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let intro = if candidates.is_empty() {
+                    vec![
+                        Line::from(""),
+                        Line::from(" No inactive dux-managed worktrees meet the cleanup criteria."),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " Worktrees are eligible after two weeks without session activity and no active agents.",
+                            Style::default().fg(self.theme.warning_fg),
+                        )),
+                    ]
+                } else {
+                    vec![
+                        Line::from(format!(
+                            " {} inactive worktree(s) found. {} selected for cleanup.",
+                            candidates.len(),
+                            selected_count
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " Uncommitted changes in selected worktrees will be lost.",
+                            Style::default().fg(self.theme.warning_fg),
+                        )),
+                        Line::from(""),
+                        Line::from(format!(
+                            " Use {move_up}/{move_down} to move, Space to keep/remove a worktree, {confirm_key} to remove selected."
+                        )),
+                    ]
+                };
                 Paragraph::new(intro)
                     .wrap(Wrap { trim: false })
                     .render(intro_area, frame.buffer_mut());
 
                 let mut rows: Vec<Line<'static>> = Vec::new();
-                let mut current_project: Option<&str> = None;
-                for candidate in candidates {
-                    if current_project != Some(candidate.project_name.as_str()) {
-                        if current_project.is_some() {
-                            rows.push(Line::from(""));
-                        }
-                        current_project = Some(candidate.project_name.as_str());
-                        rows.push(Line::from(Span::styled(
-                            format!(" {}", candidate.project_name),
-                            Style::default()
-                                .fg(self.theme.header_fg)
-                                .add_modifier(Modifier::BOLD),
-                        )));
-                    }
+                for (index, candidate) in candidates.iter().enumerate() {
                     let session_count = candidate.session_ids.len();
                     let session_label = if session_count == 1 {
                         "1 session".to_string()
                     } else {
                         format!("{session_count} sessions")
                     };
+                    let is_cursor = index == *cursor;
+                    let style = if is_cursor {
+                        self.theme.selection_style()
+                    } else {
+                        Style::default()
+                    };
+                    let marker = if selected.get(index).copied().unwrap_or(false) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
                     rows.push(Line::from(vec![
-                        Span::raw("  "),
+                        Span::styled(format!(" {marker} "), style),
                         Span::styled(
-                            candidate.branch_name.clone(),
+                            format!("{} / {}", candidate.project_name, candidate.branch_name),
+                            style.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(
+                                " - {session_label}, last active {}",
+                                candidate.updated_at.format("%Y-%m-%d")
+                            ),
+                            style,
+                        ),
+                    ]));
+                    rows.push(Line::from(Span::styled(
+                        format!("    {}", candidate.worktree_path),
+                        style.fg(self.theme.hint_desc_fg),
+                    )));
+                }
+
+                let start = usize::from(*scroll_offset)
+                    .saturating_mul(2)
+                    .min(rows.len().saturating_sub(1));
+                let height = usize::from(list_area.height);
+                let visible_rows: Vec<Line<'static>> =
+                    rows.into_iter().skip(start).take(height).collect();
+                Paragraph::new(visible_rows)
+                    .wrap(Wrap { trim: false })
+                    .render(list_area, frame.buffer_mut());
+
+                let footer = if candidates.is_empty() {
+                    Line::from(format!(" {close_key} close"))
+                } else {
+                    Line::from(format!(
+                        " Space toggle  {confirm_key} cleanup selected  {close_key} cancel"
+                    ))
+                };
+                Paragraph::new(footer)
+                    .block(
+                        Block::default()
+                            .borders(Borders::TOP)
+                            .border_style(Style::default().fg(self.theme.border_normal)),
+                    )
+                    .render(footer_area, frame.buffer_mut());
+                self.overlay_layout.active = OverlayMouseLayout::None;
+            }
+            PromptState::WorktreeCleanupSummary {
+                removed,
+                failed,
+                scroll_offset,
+            } => {
+                self.render_dim_overlay(frame);
+                let dialog_width = 76.min(frame.area().width.max(1));
+                let dialog_height = 24.min(frame.area().height.max(1));
+                let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Cleanup Complete");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+
+                let [intro_area, list_area, footer_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(4),
+                        Constraint::Min(3),
+                        Constraint::Length(2),
+                    ])
+                    .areas(inner);
+
+                let intro = vec![
+                    Line::from(format!(
+                        " Removed {} worktree(s). {} failure(s).",
+                        removed.len(),
+                        failed.len()
+                    )),
+                    Line::from(""),
+                    Line::from(" Cleanup summary:"),
+                ];
+                Paragraph::new(intro).render(intro_area, frame.buffer_mut());
+
+                let mut rows: Vec<Line<'static>> = Vec::new();
+                for candidate in removed {
+                    rows.push(Line::from(vec![
+                        Span::styled(" removed ", Style::default().fg(self.theme.session_active)),
+                        Span::styled(
+                            format!("{} / {}", candidate.project_name, candidate.branch_name),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(format!(
-                            " - {session_label}, last active {}",
-                            candidate.updated_at.format("%Y-%m-%d")
-                        )),
                     ]));
                     rows.push(Line::from(Span::styled(
                         format!("    {}", candidate.worktree_path),
                         Style::default().fg(self.theme.hint_desc_fg),
+                    )));
+                }
+                for failure in failed {
+                    rows.push(Line::from(vec![
+                        Span::styled(" failed  ", Style::default().fg(self.theme.status_error_fg)),
+                        Span::styled(
+                            format!(
+                                "{} / {}",
+                                failure.candidate.project_name, failure.candidate.branch_name
+                            ),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    rows.push(Line::from(Span::styled(
+                        format!("    {}", failure.candidate.worktree_path),
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )));
+                    rows.push(Line::from(Span::styled(
+                        format!("    {}", failure.message),
+                        Style::default().fg(self.theme.status_error_fg),
                     )));
                 }
 
@@ -4886,47 +5053,15 @@ impl App {
                     .wrap(Wrap { trim: false })
                     .render(list_area, frame.buffer_mut());
 
-                let btn_width = shared_button_width(&["Cancel", "Remove"]);
-                let gap = 2u16;
-                let total = btn_width * 2 + gap;
-                let left_offset = buttons_area.width.saturating_sub(total) / 2;
-                let cancel_area = Rect {
-                    x: buttons_area.x + left_offset,
-                    y: buttons_area.y,
-                    width: btn_width,
-                    height: 3,
-                };
-                let remove_area = Rect {
-                    x: cancel_area.x + btn_width + gap,
-                    y: buttons_area.y,
-                    width: btn_width,
-                    height: 3,
-                };
-
-                Button::new("Cancel")
-                    .kind(ButtonKind::Confirm)
-                    .state(button_state_for(
-                        ButtonPressedTarget::ConfirmWorktreeCleanupCancel,
-                        self.pressed_button,
-                        *focus == WorktreeCleanupFocus::Cancel,
-                        true,
-                    ))
-                    .render(frame, cancel_area, &self.theme);
-
-                Button::new("Remove")
-                    .kind(ButtonKind::Danger)
-                    .state(button_state_for(
-                        ButtonPressedTarget::ConfirmWorktreeCleanupRemove,
-                        self.pressed_button,
-                        *focus == WorktreeCleanupFocus::Remove,
-                        true,
-                    ))
-                    .render(frame, remove_area, &self.theme);
-
-                self.overlay_layout.active = OverlayMouseLayout::ConfirmWorktreeCleanup {
-                    cancel_button: cancel_area,
-                    remove_button: remove_area,
-                };
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                Paragraph::new(Line::from(format!(" {close_key} close")))
+                    .block(
+                        Block::default()
+                            .borders(Borders::TOP)
+                            .border_style(Style::default().fg(self.theme.border_normal)),
+                    )
+                    .render(footer_area, frame.buffer_mut());
+                self.overlay_layout.active = OverlayMouseLayout::None;
             }
             PromptState::ConfirmDeleteTerminal {
                 terminal_label,
@@ -7145,6 +7280,30 @@ pub(crate) fn format_line_stats(
         ));
     }
     spans
+}
+
+fn file_list_summary_line(files: &[ChangedFile], theme: &crate::theme::Theme) -> Line<'static> {
+    let additions = files.iter().map(|file| file.additions).sum::<usize>();
+    let deletions = files.iter().map(|file| file.deletions).sum::<usize>();
+    let file_word = if files.len() == 1 { "file" } else { "files" };
+
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} {file_word}", files.len()),
+            Style::default().fg(theme.text_fg),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("+{additions}"),
+            Style::default().fg(theme.diff_stat_add_fg),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("-{deletions}"),
+            Style::default().fg(theme.diff_stat_remove_fg),
+        ),
+    ])
 }
 
 pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

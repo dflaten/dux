@@ -125,8 +125,6 @@ enum PromptMouseTarget {
     ConfirmDeleteTerminalConfirm,
     ConfirmDeleteMacroCancel,
     ConfirmDeleteMacroConfirm,
-    ConfirmWorktreeCleanupCancel,
-    ConfirmWorktreeCleanupRemove,
     ConfirmQuitCancel,
     ConfirmQuitConfirm,
     ConfirmDiscardCancel,
@@ -196,12 +194,6 @@ impl ButtonPressedTarget {
             }
             PromptMouseTarget::ConfirmDeleteMacroConfirm => {
                 Some(ButtonPressedTarget::ConfirmDeleteMacroConfirm)
-            }
-            PromptMouseTarget::ConfirmWorktreeCleanupCancel => {
-                Some(ButtonPressedTarget::ConfirmWorktreeCleanupCancel)
-            }
-            PromptMouseTarget::ConfirmWorktreeCleanupRemove => {
-                Some(ButtonPressedTarget::ConfirmWorktreeCleanupRemove)
             }
             PromptMouseTarget::ConfirmQuitCancel => Some(ButtonPressedTarget::ConfirmQuitCancel),
             PromptMouseTarget::ConfirmQuitConfirm => Some(ButtonPressedTarget::ConfirmQuitConfirm),
@@ -302,6 +294,25 @@ fn clamp_left_width_pct(left_width_pct: u16, right_width_pct: u16) -> u16 {
 fn clamp_right_width_pct(right_width_pct: u16, left_width_pct: u16) -> u16 {
     let max_right = MAX_RIGHT_WIDTH_PCT.min(100 - MIN_CENTER_WIDTH_PCT - left_width_pct);
     right_width_pct.clamp(MIN_RIGHT_WIDTH_PCT, max_right.max(MIN_RIGHT_WIDTH_PCT))
+}
+
+fn keep_worktree_cleanup_cursor_visible(
+    cursor: usize,
+    scroll_offset: &mut u16,
+    visible_candidates: usize,
+) {
+    let visible_candidates = visible_candidates.max(1);
+    let top = usize::from(*scroll_offset);
+    if cursor < top {
+        *scroll_offset = u16::try_from(cursor).unwrap_or(u16::MAX);
+        return;
+    }
+
+    let bottom = top.saturating_add(visible_candidates.saturating_sub(1));
+    if cursor > bottom {
+        let new_top = cursor.saturating_sub(visible_candidates - 1);
+        *scroll_offset = u16::try_from(new_top).unwrap_or(u16::MAX);
+    }
 }
 
 const MIN_TERMINAL_PANE_HEIGHT_PCT: u16 = 10;
@@ -1197,6 +1208,12 @@ impl App {
             RightSection::CommitInput => return Ok(()),
         };
         let Some(file) = file else { return Ok(()) };
+        if file.is_branch_only() {
+            self.set_info(
+                "This file only differs from the base branch. Commit, revert, or edit it with git to change it.",
+            );
+            return Ok(());
+        }
         let path = file.path.clone();
         match self.right_section {
             RightSection::Unstaged => {
@@ -1229,6 +1246,12 @@ impl App {
             RightSection::CommitInput => return Ok(()),
         };
         let Some(file) = file else { return Ok(()) };
+        if file.is_branch_only() {
+            self.set_info(
+                "This file only differs from the base branch. Use git revert or edit it manually to discard committed changes.",
+            );
+            return Ok(());
+        }
         self.prompt = PromptState::ConfirmDiscardFile {
             file_path: file.path.clone(),
             is_untracked: file.status == "?",
@@ -3004,40 +3027,128 @@ impl App {
             return Ok(false);
         }
 
-        if let PromptState::ConfirmWorktreeCleanup {
-            focus,
-            scroll_offset,
-            candidates,
-        } = &mut self.prompt
-        {
-            let max_scroll = u16::try_from(candidates.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        if matches!(self.prompt, PromptState::WorktreeCleanupStart) {
             match self.bindings.lookup(&key, BindingScope::Dialog) {
-                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
-                Some(Action::ToggleSelection) => {
-                    *focus = match *focus {
-                        WorktreeCleanupFocus::Cancel => WorktreeCleanupFocus::Remove,
-                        WorktreeCleanupFocus::Remove => WorktreeCleanupFocus::Cancel,
-                    };
+                Some(Action::CloseOverlay) => {
+                    self.prompt = PromptState::None;
+                    self.set_info("Worktree cleanup cancelled. No worktrees were removed.");
                 }
                 Some(Action::Confirm) => {
-                    let confirm = matches!(*focus, WorktreeCleanupFocus::Remove);
-                    return Ok(self.resolve_confirm_worktree_cleanup(confirm));
+                    self.prepare_worktree_cleanup_candidates();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if matches!(self.prompt, PromptState::WorktreeCleanupSummary { .. }) {
+            if matches!(
+                self.bindings.lookup(&key, BindingScope::Dialog),
+                Some(Action::CloseOverlay)
+            ) {
+                self.prompt = PromptState::None;
+                self.set_info("Closed worktree cleanup summary.");
+                return Ok(false);
+            }
+            if let PromptState::WorktreeCleanupSummary { scroll_offset, .. } = &mut self.prompt {
+                match self.bindings.lookup(&key, BindingScope::Dialog) {
+                    Some(Action::ScrollLineDown | Action::MoveDown) => {
+                        *scroll_offset = scroll_offset.saturating_add(1);
+                    }
+                    Some(Action::ScrollLineUp | Action::MoveUp) => {
+                        *scroll_offset = scroll_offset.saturating_sub(1);
+                    }
+                    Some(Action::ScrollPageDown) => {
+                        *scroll_offset = scroll_offset.saturating_add(8);
+                    }
+                    Some(Action::ScrollPageUp) => {
+                        *scroll_offset = scroll_offset.saturating_sub(8);
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+
+        if let PromptState::ConfirmWorktreeCleanup {
+            scroll_offset,
+            candidates,
+            selected,
+            cursor,
+        } = &mut self.prompt
+        {
+            let max_index = candidates.len().saturating_sub(1);
+            let visible_candidates = self.worktree_cleanup_visible_candidates;
+            let selected_candidates = || {
+                candidates
+                    .iter()
+                    .zip(selected.iter())
+                    .filter(|(_, is_selected)| **is_selected)
+                    .map(|(candidate, _)| candidate.clone())
+                    .collect::<Vec<_>>()
+            };
+            match self.bindings.lookup(&key, BindingScope::Dialog) {
+                Some(Action::CloseOverlay) => {
+                    self.prompt = PromptState::None;
+                    self.set_info("Worktree cleanup cancelled. No worktrees were removed.");
+                }
+                Some(Action::Confirm) if candidates.is_empty() => {}
+                Some(Action::Confirm) => {
+                    let candidates = selected_candidates();
+                    return Ok(self.resolve_confirm_worktree_cleanup(candidates));
                 }
                 Some(Action::ScrollLineDown | Action::MoveDown) => {
-                    *scroll_offset = scroll_offset.saturating_add(1).min(max_scroll);
+                    *cursor = cursor.saturating_add(1).min(max_index);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
+                }
+                _ if key.code == KeyCode::Down => {
+                    *cursor = cursor.saturating_add(1).min(max_index);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
                 }
                 Some(Action::ScrollLineUp | Action::MoveUp) => {
-                    *scroll_offset = scroll_offset.saturating_sub(1);
+                    *cursor = cursor.saturating_sub(1);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
+                }
+                _ if key.code == KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
                 }
                 Some(Action::ScrollPageDown) => {
-                    *scroll_offset = scroll_offset.saturating_add(8).min(max_scroll);
+                    *cursor = cursor.saturating_add(8).min(max_index);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
                 }
                 Some(Action::ScrollPageUp) => {
-                    *scroll_offset = scroll_offset.saturating_sub(8);
+                    *cursor = cursor.saturating_sub(8);
+                    keep_worktree_cleanup_cursor_visible(
+                        *cursor,
+                        scroll_offset,
+                        visible_candidates,
+                    );
                 }
-                _ if key.code == KeyCode::Char(' ') => {
-                    let confirm = matches!(*focus, WorktreeCleanupFocus::Remove);
-                    return Ok(self.resolve_confirm_worktree_cleanup(confirm));
+                _ if key.code == KeyCode::Char(' ') && !candidates.is_empty() => {
+                    if let Some(is_selected) = selected.get_mut(*cursor) {
+                        *is_selected = !*is_selected;
+                    }
                 }
                 _ => {}
             }
@@ -3884,18 +3995,6 @@ impl App {
                     Some(PromptMouseTarget::ConfirmDeleteTerminalCancel)
                 } else if contains_point(delete_button, column, row) {
                     Some(PromptMouseTarget::ConfirmDeleteTerminalConfirm)
-                } else {
-                    None
-                }
-            }
-            OverlayMouseLayout::ConfirmWorktreeCleanup {
-                cancel_button,
-                remove_button,
-            } => {
-                if contains_point(cancel_button, column, row) {
-                    Some(PromptMouseTarget::ConfirmWorktreeCleanupCancel)
-                } else if contains_point(remove_button, column, row) {
-                    Some(PromptMouseTarget::ConfirmWorktreeCleanupRemove)
                 } else {
                     None
                 }
@@ -4768,17 +4867,12 @@ impl App {
         false
     }
 
-    fn resolve_confirm_worktree_cleanup(&mut self, confirm: bool) -> bool {
-        let candidates = match &self.prompt {
-            PromptState::ConfirmWorktreeCleanup { candidates, .. } => candidates.clone(),
-            _ => return false,
-        };
+    fn resolve_confirm_worktree_cleanup(
+        &mut self,
+        candidates: Vec<WorktreeCleanupCandidate>,
+    ) -> bool {
         self.prompt = PromptState::None;
-        if confirm {
-            self.begin_worktree_cleanup(candidates);
-        } else {
-            self.set_info("Worktree cleanup cancelled. No worktrees were removed.");
-        }
+        self.begin_worktree_cleanup(candidates);
         false
     }
 
@@ -5443,8 +5537,6 @@ impl App {
             | PromptMouseTarget::ConfirmDeleteTerminalConfirm
             | PromptMouseTarget::ConfirmDeleteMacroCancel
             | PromptMouseTarget::ConfirmDeleteMacroConfirm
-            | PromptMouseTarget::ConfirmWorktreeCleanupCancel
-            | PromptMouseTarget::ConfirmWorktreeCleanupRemove
             | PromptMouseTarget::ConfirmQuitCancel
             | PromptMouseTarget::ConfirmQuitConfirm
             | PromptMouseTarget::ConfirmDiscardCancel
@@ -5545,12 +5637,6 @@ impl App {
             }
             ButtonPressedTarget::ConfirmDeleteTerminalConfirm => {
                 self.resolve_confirm_delete_terminal(true)
-            }
-            ButtonPressedTarget::ConfirmWorktreeCleanupCancel => {
-                self.resolve_confirm_worktree_cleanup(false)
-            }
-            ButtonPressedTarget::ConfirmWorktreeCleanupRemove => {
-                self.resolve_confirm_worktree_cleanup(true)
             }
             ButtonPressedTarget::ConfirmDeleteMacroCancel => {
                 self.resolve_confirm_delete_macro(false)
@@ -6508,7 +6594,8 @@ mod tests {
         OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
         PickProjectWorktreePrompt, ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget,
         ResolvedPullRequest, ResourceStats, RightSection, RuntimeTargetId, StartupCommandLogPrompt,
-        TermGridPos, TerminalSelection, TextInput, WorkerEvent,
+        TermGridPos, TerminalSelection, TextInput, WatchedWorktree, WorkerEvent,
+        WorktreeCleanupCandidate,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -6732,6 +6819,10 @@ mod tests {
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
+            worktree_cleanup_pending: 0,
+            worktree_cleanup_removed: Vec::new(),
+            worktree_cleanup_failed: Vec::new(),
+            worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: std::collections::HashMap::new(),
             prev_scrollback_offset: 0,
@@ -6741,7 +6832,7 @@ mod tests {
             tick_count: 0,
             start_time: std::time::Instant::now(),
             readonly_nudge_tick: None,
-            watched_worktree: Arc::new(Mutex::new(None::<PathBuf>)),
+            watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
             left_items_cache: Vec::new(),
@@ -7131,7 +7222,7 @@ not_a_real_action = ["x"]
         std::fs::create_dir_all(worktree).expect("worktree dir");
 
         Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(worktree)
             .output()
             .expect("git init");
@@ -8901,6 +8992,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                branch_only: false,
             },
             ChangedFile {
                 path: "src/main.rs".into(),
@@ -8908,6 +9000,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                branch_only: false,
             },
         ];
         app.staged_files = vec![ChangedFile {
@@ -8916,6 +9009,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
@@ -8956,6 +9050,7 @@ not_a_real_action = ["x"]
             additions: 2,
             deletions: 1,
             binary: false,
+            branch_only: false,
         }];
 
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
@@ -8990,6 +9085,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            branch_only: false,
         }];
         app.selected_left = 1;
         app.focus = FocusPane::Files;
@@ -9051,6 +9147,7 @@ not_a_real_action = ["x"]
                 additions: 1,
                 deletions: 0,
                 binary: false,
+                branch_only: false,
             },
             ChangedFile {
                 path: "b.txt".into(),
@@ -9058,6 +9155,7 @@ not_a_real_action = ["x"]
                 additions: 2,
                 deletions: 1,
                 binary: false,
+                branch_only: false,
             },
         ];
         app.focus = FocusPane::Center;
@@ -9255,6 +9353,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         app.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -9262,6 +9361,7 @@ not_a_real_action = ["x"]
             additions: 3,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 79, 1));
@@ -9292,6 +9392,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            branch_only: false,
         }];
         app.selected_left = 1;
         app.focus = FocusPane::Files;
@@ -9323,6 +9424,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 1,
             binary: false,
+            branch_only: false,
         }];
         app.selected_left = 1;
 
@@ -9364,6 +9466,7 @@ not_a_real_action = ["x"]
             gutter_width: 0,
             worktree_path: String::new(),
             rel_path: String::new(),
+            base_ref: "main".to_string(),
         };
         app.last_diff_height = 2;
         app.last_diff_visual_lines = 10;
@@ -9383,6 +9486,7 @@ not_a_real_action = ["x"]
             gutter_width: 0,
             worktree_path: String::new(),
             rel_path: String::new(),
+            base_ref: "main".to_string(),
         };
     }
 
@@ -9627,6 +9731,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         app.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -9634,6 +9739,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         let original = app.staged_pane_height_pct;
 
@@ -9678,6 +9784,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         app.staged_files = vec![ChangedFile {
             path: "b.txt".into(),
@@ -9685,6 +9792,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         let original = app.staged_pane_height_pct;
 
@@ -9712,6 +9820,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         let original = app.commit_pane_height_pct;
 
@@ -9755,6 +9864,7 @@ not_a_real_action = ["x"]
             additions: 1,
             deletions: 0,
             binary: false,
+            branch_only: false,
         }];
         let original = app.commit_pane_height_pct;
 
@@ -11526,6 +11636,7 @@ cyan = "#00ffff"
             additions: 1,
             deletions: 1,
             binary: false,
+            branch_only: false,
         }];
         app.prompt = PromptState::ConfirmDiscardFile {
             file_path: "src/main.rs".to_string(),
@@ -14097,6 +14208,179 @@ cyan = "#00ffff"
 
         assert!(pending_delete_state(&app).is_none());
         assert!(!app.config.macros.entries.contains_key("greet"));
+    }
+
+    #[test]
+    fn worktree_cleanup_start_uses_enter_to_scan_before_reviewing_candidates() {
+        let mut app = test_app(default_bindings());
+        app.prompt = PromptState::WorktreeCleanupStart;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("handle unrelated key");
+
+        assert!(
+            matches!(app.prompt, PromptState::WorktreeCleanupStart),
+            "unrelated keys should not scan or remove worktrees from the start prompt"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("handle enter");
+
+        assert!(
+            matches!(app.prompt, PromptState::WorktreeCleanupStart),
+            "scan runs asynchronously while the start prompt remains open"
+        );
+        assert_eq!(
+            app.status.message(),
+            "Scanning for inactive dux-managed worktrees eligible for cleanup. The review list will appear when the scan finishes."
+        );
+    }
+
+    #[test]
+    fn worktree_cleanup_space_toggles_selection_and_enter_shows_summary_when_none_selected() {
+        let mut app = test_app(default_bindings());
+        app.prompt = PromptState::ConfirmWorktreeCleanup {
+            candidates: vec![WorktreeCleanupCandidate {
+                session_ids: vec!["old".to_string()],
+                project_id: "project-1".to_string(),
+                project_name: "demo".to_string(),
+                branch_name: "branch-old".to_string(),
+                worktree_path: app
+                    .paths
+                    .worktrees_root
+                    .join("old")
+                    .to_string_lossy()
+                    .to_string(),
+                updated_at: Utc::now() - chrono::Duration::days(15),
+            }],
+            selected: vec![true],
+            cursor: 0,
+            scroll_offset: 0,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("handle space");
+
+        let PromptState::ConfirmWorktreeCleanup { selected, .. } = &app.prompt else {
+            panic!("expected cleanup review prompt");
+        };
+        assert_eq!(selected, &vec![false]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("handle enter");
+
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.is_empty() && failed.is_empty()
+        ));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup complete. No worktrees were selected."
+        );
+    }
+
+    #[test]
+    fn worktree_cleanup_scroll_tracks_actual_visible_candidates() {
+        let mut app = test_app(default_bindings());
+        app.worktree_cleanup_visible_candidates = 1;
+        app.prompt = PromptState::ConfirmWorktreeCleanup {
+            candidates: (0..3)
+                .map(|index| WorktreeCleanupCandidate {
+                    session_ids: vec![format!("old-{index}")],
+                    project_id: "project-1".to_string(),
+                    project_name: "demo".to_string(),
+                    branch_name: format!("branch-old-{index}"),
+                    worktree_path: app
+                        .paths
+                        .worktrees_root
+                        .join(format!("old-{index}"))
+                        .to_string_lossy()
+                        .to_string(),
+                    updated_at: Utc::now() - chrono::Duration::days(15),
+                })
+                .collect(),
+            selected: vec![true, true, true],
+            cursor: 0,
+            scroll_offset: 0,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("handle down");
+
+        let PromptState::ConfirmWorktreeCleanup {
+            cursor,
+            scroll_offset,
+            ..
+        } = &app.prompt
+        else {
+            panic!("expected cleanup review prompt");
+        };
+        assert_eq!(*cursor, 1);
+        assert_eq!(*scroll_offset, 1);
+    }
+
+    #[test]
+    fn changed_files_worker_ignores_stale_results() {
+        let mut app = test_app(default_bindings());
+        let current = WatchedWorktree {
+            path: app.paths.worktrees_root.join("current"),
+            base_ref: "main".to_string(),
+        };
+        let stale = WatchedWorktree {
+            path: app.paths.worktrees_root.join("stale"),
+            base_ref: "main".to_string(),
+        };
+        *app.watched_worktree.lock().expect("watched lock") = Some(current.clone());
+        app.unstaged_files = vec![ChangedFile {
+            path: "existing.txt".to_string(),
+            status: "M".to_string(),
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            branch_only: false,
+        }];
+
+        app.worker_tx
+            .send(WorkerEvent::ChangedFilesReady {
+                watched: stale,
+                quiet: false,
+                staged: Vec::new(),
+                unstaged: vec![ChangedFile {
+                    path: "stale.txt".to_string(),
+                    status: "M".to_string(),
+                    additions: 10,
+                    deletions: 0,
+                    binary: false,
+                    branch_only: false,
+                }],
+            })
+            .expect("send stale changed files");
+        app.drain_events();
+
+        assert_eq!(app.unstaged_files[0].path, "existing.txt");
+
+        app.worker_tx
+            .send(WorkerEvent::ChangedFilesReady {
+                watched: current,
+                quiet: false,
+                staged: Vec::new(),
+                unstaged: vec![ChangedFile {
+                    path: "current.txt".to_string(),
+                    status: "M".to_string(),
+                    additions: 2,
+                    deletions: 1,
+                    binary: false,
+                    branch_only: false,
+                }],
+            })
+            .expect("send current changed files");
+        app.drain_events();
+
+        assert_eq!(app.unstaged_files[0].path, "current.txt");
     }
 
     #[test]

@@ -105,6 +105,10 @@ pub struct App {
     pub(crate) agent_launches_in_flight: HashSet<String>,
     pub(crate) pulls_in_flight: HashSet<String>,
     pub(crate) resource_stats_in_flight: bool,
+    pub(crate) worktree_cleanup_pending: usize,
+    pub(crate) worktree_cleanup_removed: Vec<WorktreeCleanupCandidate>,
+    pub(crate) worktree_cleanup_failed: Vec<WorktreeCleanupFailure>,
+    pub(crate) worktree_cleanup_visible_candidates: usize,
     pub(crate) last_pty_size: (u16, u16),
     /// Tracks when each agent last received PTY data, for the streaming
     /// activity spinner in the left pane.
@@ -120,7 +124,7 @@ pub struct App {
     /// regardless of how fast the event loop is running.
     pub(crate) start_time: Instant,
     pub(crate) readonly_nudge_tick: Option<u64>,
-    pub(crate) watched_worktree: Arc<Mutex<Option<PathBuf>>>,
+    pub(crate) watched_worktree: Arc<Mutex<Option<WatchedWorktree>>>,
     pub(crate) has_active_processes: Arc<AtomicBool>,
     pub(crate) collapsed_projects: HashSet<String>,
     pub(crate) left_items_cache: Vec<LeftItem>,
@@ -316,7 +320,14 @@ pub(crate) enum CenterMode {
         /// Source paths for re-generating the diff on setting changes.
         worktree_path: String,
         rel_path: String,
+        base_ref: String,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WatchedWorktree {
+    pub(crate) path: PathBuf,
+    pub(crate) base_ref: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -576,12 +587,6 @@ pub(crate) enum DeleteAgentFocus {
     Checkbox,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorktreeCleanupFocus {
-    Cancel,
-    Remove,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorktreeCleanupCandidate {
     pub(crate) session_ids: Vec<String>,
@@ -590,6 +595,12 @@ pub(crate) struct WorktreeCleanupCandidate {
     pub(crate) branch_name: String,
     pub(crate) worktree_path: String,
     pub(crate) updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeCleanupFailure {
+    pub(crate) candidate: WorktreeCleanupCandidate,
+    pub(crate) message: String,
 }
 
 /// Which selectable element has focus in the Non-Default Branch confirmation
@@ -689,7 +700,14 @@ pub(crate) enum PromptState {
     },
     ConfirmWorktreeCleanup {
         candidates: Vec<WorktreeCleanupCandidate>,
-        focus: WorktreeCleanupFocus,
+        selected: Vec<bool>,
+        cursor: usize,
+        scroll_offset: u16,
+    },
+    WorktreeCleanupStart,
+    WorktreeCleanupSummary {
+        removed: Vec<WorktreeCleanupCandidate>,
+        failed: Vec<WorktreeCleanupFailure>,
         scroll_offset: u16,
     },
     ConfirmDeleteTerminal {
@@ -1275,10 +1293,6 @@ pub(crate) enum OverlayMouseLayout {
         cancel_button: Rect,
         delete_button: Rect,
     },
-    ConfirmWorktreeCleanup {
-        cancel_button: Rect,
-        remove_button: Rect,
-    },
     ConfirmDeleteMacro {
         cancel_button: Rect,
         delete_button: Rect,
@@ -1532,8 +1546,15 @@ pub(crate) enum WorkerEvent {
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
     ChangedFilesReady {
+        watched: WatchedWorktree,
+        quiet: bool,
         staged: Vec<ChangedFile>,
         unstaged: Vec<ChangedFile>,
+    },
+    ChangedFilesFailed {
+        watched: WatchedWorktree,
+        quiet: bool,
+        message: String,
     },
     CommitMessageGenerated(String),
     CommitMessageFailed(String),
@@ -1582,6 +1603,9 @@ pub(crate) enum WorkerEvent {
     WorktreeCleanupRemoveCompleted {
         candidate: WorktreeCleanupCandidate,
         result: Result<bool, String>,
+    },
+    WorktreeCleanupCandidatesReady {
+        candidates: Vec<WorktreeCleanupCandidate>,
     },
     /// Background `git switch <target_branch>` run from a non-default branch
     /// warning modal has finished. On `Ok`, the main loop continues the
@@ -1722,7 +1746,7 @@ impl App {
         )?;
         let sessions = session_store.load_sessions()?;
         let (worker_tx, worker_rx) = mpsc::channel();
-        let watched_worktree: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let watched_worktree: Arc<Mutex<Option<WatchedWorktree>>> = Arc::new(Mutex::new(None));
         let initial_status = format!(
             "Press {} to add a project, {} to create an agent, {} for help.",
             bindings.label_for(Action::OpenProjectBrowser),
@@ -1789,6 +1813,10 @@ impl App {
             agent_launches_in_flight: HashSet::new(),
             pulls_in_flight: HashSet::new(),
             resource_stats_in_flight: false,
+            worktree_cleanup_pending: 0,
+            worktree_cleanup_removed: Vec::new(),
+            worktree_cleanup_failed: Vec::new(),
+            worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: HashMap::new(),
             prev_scrollback_offset: 0,
@@ -2784,6 +2812,14 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    pub(crate) fn diff_base_ref_for_session(&self, session: &AgentSession) -> String {
+        self.projects
+            .iter()
+            .find(|p| p.id == session.project_id)
+            .and_then(|p| p.leading_branch.clone())
+            .unwrap_or_else(|| session.source_branch.clone())
+    }
+
     /// Provider currently driving the session's live PTY, if any. After an
     /// in-place provider swap while the agent is still running, this returns
     /// the *original* provider until the user exits and relaunches — so the
@@ -2796,22 +2832,70 @@ impl App {
     }
 
     pub(crate) fn reload_changed_files(&mut self) {
-        let session_id = self.selected_session().map(|s| s.id.clone());
-        let worktree = self
-            .selected_session()
-            .map(|s| PathBuf::from(&s.worktree_path));
+        self.reload_changed_files_with_status(true);
+    }
+
+    pub(crate) fn reload_changed_files_quiet(&mut self) {
+        self.reload_changed_files_with_status(false);
+    }
+
+    fn reload_changed_files_with_status(&mut self, show_status: bool) {
+        let selected = self.selected_session().map(|s| {
+            (
+                s.id.clone(),
+                PathBuf::from(&s.worktree_path),
+                self.diff_base_ref_for_session(s),
+            )
+        });
         // Keep the background poller in sync with the currently selected session.
         if let Ok(mut guard) = self.watched_worktree.lock() {
-            *guard = worktree.clone();
+            *guard = selected
+                .as_ref()
+                .map(|(_, path, base_ref)| WatchedWorktree {
+                    path: path.clone(),
+                    base_ref: base_ref.clone(),
+                });
         }
-        let (staged, unstaged) = worktree
-            .and_then(|p| git::changed_files(&p).ok())
-            .unwrap_or_default();
-        self.staged_files = staged;
-        self.unstaged_files = unstaged;
-        self.clamp_files_cursor();
+        match selected.as_ref() {
+            Some((_, path, base_ref)) => {
+                let watched = WatchedWorktree {
+                    path: path.clone(),
+                    base_ref: base_ref.clone(),
+                };
+                let tx = self.worker_tx.clone();
+                if show_status {
+                    self.set_busy(format!(
+                        "Refreshing changes against {} for {}.",
+                        watched.base_ref,
+                        watched.path.display()
+                    ));
+                }
+                std::thread::spawn(move || {
+                    let event =
+                        match git::changed_files_against_base(&watched.path, &watched.base_ref) {
+                            Ok((staged, unstaged)) => WorkerEvent::ChangedFilesReady {
+                                watched,
+                                quiet: !show_status,
+                                staged,
+                                unstaged,
+                            },
+                            Err(err) => WorkerEvent::ChangedFilesFailed {
+                                watched,
+                                quiet: !show_status,
+                                message: format!("Failed to refresh changes against base: {err}"),
+                            },
+                        };
+                    let _ = tx.send(event);
+                });
+            }
+            None => {
+                self.staged_files.clear();
+                self.unstaged_files.clear();
+                self.clamp_files_cursor();
+            }
+        }
         // Opportunistically check PR status for the newly-selected session.
-        if let Some(sid) = session_id {
+        if let Some((sid, _, _)) = selected {
             self.spawn_pr_check_for_session(&sid);
         }
     }
