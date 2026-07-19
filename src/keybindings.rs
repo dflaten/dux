@@ -32,6 +32,7 @@ pub enum Action {
     ExitInteractive,
     OpenMacroBar,
     PasteSelectionToTerminal,
+    PasteSelectionToAgent,
     OpenCurrentPullRequest,
     ToggleFullscreen,
     ScrollPageUp,
@@ -227,6 +228,7 @@ impl Action {
             Action::ExitInteractive => "exit_interactive",
             Action::OpenMacroBar => "open_macro_bar",
             Action::PasteSelectionToTerminal => "paste_selection_to_terminal",
+            Action::PasteSelectionToAgent => "paste_selection_to_agent",
             Action::OpenCurrentPullRequest => "open_current_pull_request",
             Action::ToggleFullscreen => "toggle_fullscreen",
             Action::ScrollPageUp => "scroll_page_up",
@@ -341,7 +343,10 @@ impl Action {
             Action::ExitInteractive => "Exit interactive mode (stop forwarding keys to agent).",
             Action::OpenMacroBar => "Open the macro command bar to send text macros.",
             Action::PasteSelectionToTerminal => {
-                "Paste selected agent output into the companion terminal without submitting it."
+                "Paste selected text into the opposite agent or terminal pane without submitting it."
+            }
+            Action::PasteSelectionToAgent => {
+                "Paste selected terminal text into the agent without submitting it."
             }
             Action::OpenCurrentPullRequest => {
                 "Open the selected agent's current pull request in the default browser."
@@ -460,6 +465,7 @@ impl Action {
             Action::ExitInteractive
             | Action::OpenMacroBar
             | Action::PasteSelectionToTerminal
+            | Action::PasteSelectionToAgent
             | Action::OpenCurrentPullRequest
             | Action::ToggleFullscreen
             | Action::ScrollPageUp
@@ -1026,12 +1032,23 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Interactive, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Agent pane",
-            description: "Paste selected agent output into the companion terminal",
+            description: "Paste selected text into the opposite agent or terminal pane",
         }),
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "paste-selection-to-terminal",
             description: "Paste selected agent output into the companion terminal",
+        }),
+    },
+    BindingDef {
+        action: Action::PasteSelectionToAgent,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "paste-selection-to-agent",
+            description: "Paste selected terminal text into the agent",
         }),
     },
     BindingDef {

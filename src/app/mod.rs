@@ -2264,6 +2264,7 @@ impl App {
         match action {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
             Action::PasteSelectionToTerminal => self.selected_session().is_some(),
+            Action::PasteSelectionToAgent => self.active_terminal_id.is_some(),
             _ => true,
         }
     }
@@ -2378,6 +2379,7 @@ impl App {
             "show-agent" => self.activate_center_agent(),
             "show-terminal" => self.show_or_open_first_terminal(),
             "paste-selection-to-terminal" => self.paste_selection_to_terminal(),
+            "paste-selection-to-agent" => self.paste_selection_to_agent(),
             "new-terminal" => self.new_companion_terminal(),
             "add-project" => self.open_project_browser(),
             "copy-path" => self.copy_selected_path(),

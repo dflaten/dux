@@ -761,8 +761,9 @@ impl App {
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
                 Action::PasteSelectionToTerminal if !in_diff => {
-                    self.paste_selection_to_terminal()?
+                    self.paste_selection_to_opposite_surface()?
                 }
+                Action::PasteSelectionToAgent if !in_diff => self.paste_selection_to_agent()?,
                 Action::DeleteSession if !in_diff => self.confirm_delete_selected_session()?,
                 Action::RenameSession if !in_diff => self.open_rename_session()?,
                 Action::OpenCurrentPullRequest if !in_diff && self.current_pr_info().is_some() => {
@@ -1743,7 +1744,19 @@ impl App {
                         &mut needs_selection_clear,
                         self.selected_terminal_surface_client(),
                     );
-                    self.paste_selection_to_terminal()?;
+                    self.paste_selection_to_opposite_surface()?;
+                    self.raw_input_buf.clear();
+                    self.raw_input_parser.clear();
+                    return Ok(false);
+                }
+                SeqAction::Intercept(Action::PasteSelectionToAgent, _, _) => {
+                    flush_forward_batch(
+                        &mut forward_batch,
+                        is_scrolled_back,
+                        &mut needs_selection_clear,
+                        self.selected_terminal_surface_client(),
+                    );
+                    self.paste_selection_to_agent()?;
                     self.raw_input_buf.clear();
                     self.raw_input_parser.clear();
                     return Ok(false);
@@ -6325,20 +6338,41 @@ impl App {
         Some(lines.join("\n"))
     }
 
-    pub(crate) fn paste_selection_to_terminal(&mut self) -> Result<()> {
-        if !matches!(self.session_surface, SessionSurface::Agent) {
-            self.set_error("Select text from an agent output pane first.");
-            return Ok(());
+    pub(crate) fn paste_selection_to_opposite_surface(&mut self) -> Result<()> {
+        match self.session_surface {
+            SessionSurface::Agent => self.paste_selection_to_terminal(),
+            SessionSurface::Terminal => self.paste_selection_to_agent(),
         }
-        let Some(text) = self
-            .selected_terminal_text()
+    }
+
+    fn selected_or_cached_terminal_text(&mut self) -> Option<String> {
+        self.selected_terminal_text()
             .filter(|text| !text.is_empty())
             .or_else(|| {
                 self.terminal_selection_text
                     .clone()
                     .filter(|text| !text.is_empty())
             })
-        else {
+    }
+
+    fn bracket_paste_payload(text: &str) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(
+            crate::raw_input::BRACKET_PASTE_START.len()
+                + text.len()
+                + crate::raw_input::BRACKET_PASTE_END.len(),
+        );
+        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_START);
+        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_END);
+        payload
+    }
+
+    pub(crate) fn paste_selection_to_terminal(&mut self) -> Result<()> {
+        if !matches!(self.session_surface, SessionSurface::Agent) {
+            self.set_error("Select text from an agent output pane first.");
+            return Ok(());
+        }
+        let Some(text) = self.selected_or_cached_terminal_text() else {
             self.set_error("Select agent output text first.");
             return Ok(());
         };
@@ -6351,20 +6385,89 @@ impl App {
             self.set_error("Could not open a companion terminal for the selected agent.");
             return Ok(());
         };
-        let mut payload = Vec::with_capacity(
-            crate::raw_input::BRACKET_PASTE_START.len()
-                + text.len()
-                + crate::raw_input::BRACKET_PASTE_END.len(),
-        );
-        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_START);
-        payload.extend_from_slice(text.as_bytes());
-        payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_END);
+        let payload = Self::bracket_paste_payload(&text);
         match provider.write_bytes(&payload) {
             Ok(()) => {
                 self.set_info("Pasted selected agent output into companion terminal.");
             }
             Err(err) => {
                 self.set_error(format!("Failed to paste into companion terminal: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn paste_selection_to_agent(&mut self) -> Result<()> {
+        if !matches!(self.session_surface, SessionSurface::Terminal) {
+            self.set_error("Select text from a companion terminal first.");
+            return Ok(());
+        }
+        let Some(text) = self.selected_or_cached_terminal_text() else {
+            self.set_error("Select terminal text first.");
+            return Ok(());
+        };
+        let Some(terminal_id) = self.active_terminal_id.clone() else {
+            self.set_error("Open a companion terminal first.");
+            return Ok(());
+        };
+        let Some(session_id) = self
+            .companion_terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.session_id.clone())
+        else {
+            self.set_error("The active companion terminal is no longer available.");
+            return Ok(());
+        };
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            self.set_error("The companion terminal's agent session no longer exists.");
+            return Ok(());
+        };
+        if !self.providers.contains_key(&session_id) {
+            self.set_error(format!(
+                "Agent \"{}\" is not running. Reconnect it before pasting terminal text.",
+                session.branch_name
+            ));
+            return Ok(());
+        }
+        if let Some(pos) = self.left_items().iter().position(|item| {
+            matches!(
+                item,
+                LeftItem::Session(index)
+                    if self
+                        .sessions
+                        .get(*index)
+                        .map(|candidate| candidate.id.as_str())
+                        == Some(session_id.as_str())
+            )
+        }) {
+            self.selected_left = pos;
+        }
+        self.reload_changed_files_quiet();
+        self.focus = FocusPane::Center;
+        self.center_mode = CenterMode::Agent;
+        self.session_surface = SessionSurface::Agent;
+        self.fullscreen_overlay = FullscreenOverlay::Agent;
+        self.input_target = InputTarget::Agent;
+
+        let Some(provider) = self.providers.get(&session_id) else {
+            self.set_error(format!(
+                "Agent \"{}\" is not running. Reconnect it before pasting terminal text.",
+                session.branch_name
+            ));
+            return Ok(());
+        };
+        let payload = Self::bracket_paste_payload(&text);
+        match provider.write_bytes(&payload) {
+            Ok(()) => {
+                self.set_info("Pasted selected terminal text into agent.");
+            }
+            Err(err) => {
+                self.set_error(format!("Failed to paste into agent: {err}"));
             }
         }
         Ok(())
@@ -14851,6 +14954,206 @@ cyan = "#00ffff"
         assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
         assert_eq!(app.status.message(), "Select agent output text first.");
         assert!(app.companion_terminals.is_empty());
+    }
+
+    #[test]
+    fn ctrl_e_pastes_terminal_selection_to_agent_without_enter() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id.clone(), agent);
+        let terminal = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'cargo test'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn terminal pty");
+        app.companion_terminals.insert(
+            "term-test".to_string(),
+            crate::app::CompanionTerminal {
+                session_id,
+                label: "test".to_string(),
+                foreground_cmd: None,
+                client: terminal,
+            },
+        );
+        app.active_terminal_id = Some("term-test".to_string());
+        app.session_surface = SessionSurface::Terminal;
+        app.input_target = InputTarget::Terminal;
+        app.fullscreen_overlay = FullscreenOverlay::Terminal;
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 9 },
+            dragging: false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert_eq!(
+            app.interactive_patterns
+                .match_sequence(&[0x05])
+                .map(|(action, _)| action),
+            Some(Action::PasteSelectionToTerminal),
+            "Ctrl-e remains the context-sensitive paste shortcut"
+        );
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("process ctrl-e");
+
+        assert_eq!(app.session_surface, SessionSurface::Agent);
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert_eq!(app.fullscreen_overlay, FullscreenOverlay::Agent);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected terminal text into agent."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let provider = app.providers.values().next().expect("provider");
+        let rendered: String = provider
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("cargo test"),
+            "agent should contain pasted terminal text; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_e_pastes_cached_terminal_selection_after_visual_selection_clears() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id.clone(), agent);
+        let terminal = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'cargo test'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn terminal pty");
+        app.companion_terminals.insert(
+            "term-test".to_string(),
+            crate::app::CompanionTerminal {
+                session_id,
+                label: "test".to_string(),
+                foreground_cmd: None,
+                client: terminal,
+            },
+        );
+        app.active_terminal_id = Some("term-test".to_string());
+        app.session_surface = SessionSurface::Terminal;
+        app.input_target = InputTarget::Terminal;
+        app.fullscreen_overlay = FullscreenOverlay::Terminal;
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 9 },
+            dragging: false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.copy_terminal_selection();
+        app.terminal_selection = None;
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("process ctrl-e");
+
+        assert_eq!(app.session_surface, SessionSurface::Agent);
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected terminal text into agent."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let provider = app.providers.values().next().expect("provider");
+        let rendered: String = provider
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("cargo test"),
+            "agent should contain cached terminal text; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn paste_selection_to_agent_requires_selection() {
+        let mut app = test_app(default_bindings());
+        app.session_surface = SessionSurface::Terminal;
+
+        app.paste_selection_to_agent().expect("paste selection");
+
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+        assert_eq!(app.status.message(), "Select terminal text first.");
+    }
+
+    #[test]
+    fn paste_selection_to_agent_requires_running_agent() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let terminal = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "printf 'cargo test'; sleep 1".to_string()],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn terminal pty");
+        app.companion_terminals.insert(
+            "term-test".to_string(),
+            crate::app::CompanionTerminal {
+                session_id,
+                label: "test".to_string(),
+                foreground_cmd: None,
+                client: terminal,
+            },
+        );
+        app.active_terminal_id = Some("term-test".to_string());
+        app.session_surface = SessionSurface::Terminal;
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 9 },
+            dragging: false,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        app.paste_selection_to_agent().expect("paste selection");
+
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+        assert_eq!(
+            app.status.message(),
+            "Agent \"agent-branch\" is not running. Reconnect it before pasting terminal text."
+        );
     }
 
     #[test]
