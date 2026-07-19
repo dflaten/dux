@@ -160,4 +160,11 @@ pub struct ChangedFile {
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    pub branch_only: bool,
+}
+
+impl ChangedFile {
+    pub fn is_branch_only(&self) -> bool {
+        self.branch_only
+    }
 }

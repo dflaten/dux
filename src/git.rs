@@ -53,7 +53,6 @@ struct StatusEntry {
 }
 
 const NULL_DEVICE: &str = "/dev/null";
-
 pub fn current_branch(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
@@ -493,7 +492,22 @@ pub fn remove_worktree(
     })
 }
 
-pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
+pub fn changed_files_against_base(
+    worktree_path: &Path,
+    base_ref: &str,
+) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
+    changed_files_with_base(worktree_path, Some(base_ref))
+}
+
+#[cfg(test)]
+fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
+    changed_files_with_base(worktree_path, None)
+}
+
+fn changed_files_with_base(
+    worktree_path: &Path,
+    base_ref: Option<&str>,
+) -> Result<(Vec<ChangedFile>, Vec<ChangedFile>)> {
     let wt = worktree_path.to_string_lossy();
 
     let output = Command::new("git")
@@ -528,6 +542,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                branch_only: false,
             });
             continue;
         }
@@ -539,6 +554,7 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                branch_only: false,
             });
         }
 
@@ -549,69 +565,106 @@ pub fn changed_files(worktree_path: &Path) -> Result<(Vec<ChangedFile>, Vec<Chan
                 additions: 0,
                 deletions: 0,
                 binary: false,
+                branch_only: false,
             });
         }
     }
 
-    if let Ok(ns) = Command::new("git")
-        .args(["-C", wt.as_ref(), "diff", "--numstat", "-z"])
-        .output()
-        && ns.status.success()
-    {
-        let stats = parse_numstat(&ns.stdout);
-        for file in &mut unstaged {
-            if let Some(stat) = stats.get(&file.path) {
-                match stat {
-                    DiffStat::Text(a, d) => {
-                        file.additions = *a;
-                        file.deletions = *d;
-                    }
-                    DiffStat::Binary => {
-                        file.binary = true;
+    let unstaged_numstat_args = match base_ref {
+        Some(base_ref) => vec!["-C", wt.as_ref(), "diff", "--numstat", "-z", base_ref],
+        None => vec!["-C", wt.as_ref(), "diff", "--numstat", "-z"],
+    };
+    match Command::new("git").args(unstaged_numstat_args).output() {
+        Ok(ns) if !ns.status.success() => {
+            if base_ref.is_some() {
+                return Err(anyhow!(
+                    "git diff against base failed: {}",
+                    String::from_utf8_lossy(&ns.stderr).trim()
+                ));
+            }
+        }
+        Ok(ns) => {
+            let stats = parse_numstat(&ns.stdout);
+            for file in &mut staged {
+                if let Some(stat) = stats.get(&file.path) {
+                    apply_diff_stat(file, stat);
+                }
+            }
+            for file in &mut unstaged {
+                if let Some(stat) = stats.get(&file.path) {
+                    apply_diff_stat(file, stat);
+                } else if file.status == "?" {
+                    match untracked_file_diff_stat(worktree_path, &file.path) {
+                        Some(stat) => apply_diff_stat(file, &stat),
+                        None => {
+                            let (additions, binary) =
+                                classify_untracked_file_fallback(&worktree_path.join(&file.path));
+                            file.additions = additions;
+                            file.binary = binary;
+                        }
                     }
                 }
-            } else if file.status == "?" {
-                match untracked_file_diff_stat(worktree_path, &file.path) {
-                    Some(DiffStat::Text(a, d)) => {
-                        file.additions = a;
-                        file.deletions = d;
+            }
+            if base_ref.is_some() {
+                for (path, stat) in stats {
+                    if staged.iter().any(|file| file.path == path)
+                        || unstaged.iter().any(|file| file.path == path)
+                    {
+                        continue;
                     }
-                    Some(DiffStat::Binary) => {
-                        file.binary = true;
-                    }
-                    None => {
-                        let (additions, binary) =
-                            classify_untracked_file_fallback(&worktree_path.join(&file.path));
-                        file.additions = additions;
-                        file.binary = binary;
-                    }
+                    let mut file = ChangedFile {
+                        status: "B".to_string(),
+                        path,
+                        additions: 0,
+                        deletions: 0,
+                        binary: false,
+                        branch_only: true,
+                    };
+                    apply_diff_stat(&mut file, &stat);
+                    unstaged.push(file);
                 }
+            }
+        }
+        Err(err) => {
+            if let Some(base_ref) = base_ref {
+                return Err(anyhow!("failed to diff against base {base_ref}: {err}"));
             }
         }
     }
 
-    if let Ok(ns) = Command::new("git")
-        .args(["-C", wt.as_ref(), "diff", "--cached", "--numstat", "-z"])
-        .output()
+    if base_ref.is_none()
+        && let Ok(ns) = Command::new("git")
+            .args(["-C", wt.as_ref(), "diff", "--cached", "--numstat", "-z"])
+            .output()
         && ns.status.success()
     {
         let stats = parse_numstat(&ns.stdout);
         for file in &mut staged {
             if let Some(stat) = stats.get(&file.path) {
-                match stat {
-                    DiffStat::Text(a, d) => {
-                        file.additions = *a;
-                        file.deletions = *d;
-                    }
-                    DiffStat::Binary => {
-                        file.binary = true;
-                    }
-                }
+                apply_diff_stat(file, stat);
             }
         }
     }
 
+    sort_changed_files(&mut staged);
+    sort_changed_files(&mut unstaged);
     Ok((staged, unstaged))
+}
+
+fn apply_diff_stat(file: &mut ChangedFile, stat: &DiffStat) {
+    match stat {
+        DiffStat::Text(additions, deletions) => {
+            file.additions = *additions;
+            file.deletions = *deletions;
+        }
+        DiffStat::Binary => {
+            file.binary = true;
+        }
+    }
+}
+
+fn sort_changed_files(files: &mut [ChangedFile]) {
+    files.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.status.cmp(&b.status)));
 }
 
 fn untracked_file_diff_stat(worktree_path: &Path, rel_path: &str) -> Option<DiffStat> {
@@ -856,24 +909,49 @@ pub fn push(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Return the contents of a file as raw bytes as it exists at HEAD, or `None`
-/// for new (untracked) files. Uses the plumbing command `cat-file` which is
-/// immune to user configuration.
-pub fn file_bytes_at_head(worktree_path: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+/// Return the contents of a file as raw bytes as it exists at `ref_name`, or
+/// `None` when that ref exists but the path does not. Uses plumbing commands
+/// that are immune to user configuration.
+pub fn file_bytes_at_ref(
+    worktree_path: &Path,
+    ref_name: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>> {
+    verify_commit_ref(worktree_path, ref_name)?;
     let output = Command::new("git")
         .args([
             "-C",
             worktree_path.to_string_lossy().as_ref(),
             "cat-file",
             "-p",
-            &format!("HEAD:{path}"),
+            &format!("{ref_name}:{path}"),
         ])
         .output()?;
     if !output.status.success() {
-        // File doesn't exist at HEAD (new/untracked file).
+        // File doesn't exist at the base ref (new/untracked file).
         return Ok(None);
     }
     Ok(Some(output.stdout))
+}
+
+fn verify_commit_ref(worktree_path: &Path, ref_name: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            worktree_path.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{ref_name}^{{commit}}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "base ref \"{ref_name}\" could not be resolved for {}",
+            worktree_path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub fn is_under(base: &Path, candidate: &Path) -> bool {
@@ -1568,6 +1646,120 @@ mod tests {
                     false
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn changed_files_against_base_includes_committed_branch_changes() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(repo.path(), &["commit", "-m", "add tracked"]);
+        let wt = add_worktree(repo.path(), "branch-diff");
+
+        fs::write(wt.join("tracked.txt"), "branch\n").unwrap();
+        run_git(&wt, &["commit", "-am", "change tracked"]);
+
+        let (staged, unstaged) = changed_files_against_base(&wt, "main").unwrap();
+
+        assert!(staged.is_empty());
+        assert_eq!(unstaged.len(), 1);
+        assert_eq!(unstaged[0].path, "tracked.txt");
+        assert_eq!(unstaged[0].status, "B");
+        assert!(unstaged[0].is_branch_only());
+        assert_eq!(unstaged[0].additions, 1);
+        assert_eq!(unstaged[0].deletions, 1);
+    }
+
+    #[test]
+    fn changed_files_against_base_stats_include_committed_and_uncommitted_changes() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(repo.path(), &["commit", "-m", "add tracked"]);
+        let wt = add_worktree(repo.path(), "mixed-diff");
+
+        fs::write(wt.join("tracked.txt"), "committed\n").unwrap();
+        run_git(&wt, &["commit", "-am", "change tracked"]);
+        fs::write(wt.join("tracked.txt"), "committed\nuncommitted\n").unwrap();
+
+        let (staged, unstaged) = changed_files_against_base(&wt, "main").unwrap();
+
+        assert!(staged.is_empty());
+        assert_eq!(unstaged.len(), 1);
+        assert_eq!(unstaged[0].path, "tracked.txt");
+        assert_eq!(unstaged[0].status, "M");
+        assert_eq!(unstaged[0].additions, 2);
+        assert_eq!(unstaged[0].deletions, 1);
+    }
+
+    #[test]
+    fn changed_files_against_base_uses_worktree_stats_for_staged_rows() {
+        let repo = init_test_repo();
+        fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "tracked.txt"]);
+        run_git(repo.path(), &["commit", "-m", "add tracked"]);
+        let wt = add_worktree(repo.path(), "staged-base-diff");
+
+        fs::write(wt.join("tracked.txt"), "committed\n").unwrap();
+        run_git(&wt, &["commit", "-am", "change tracked"]);
+        fs::write(wt.join("tracked.txt"), "committed\nstaged\n").unwrap();
+        run_git(&wt, &["add", "tracked.txt"]);
+
+        let (staged, unstaged) = changed_files_against_base(&wt, "main").unwrap();
+
+        assert_eq!(staged.len(), 1);
+        assert!(unstaged.is_empty());
+        assert_eq!(staged[0].path, "tracked.txt");
+        assert_eq!(staged[0].status, "M");
+        assert_eq!(staged[0].additions, 2);
+        assert_eq!(staged[0].deletions, 1);
+    }
+
+    #[test]
+    fn changed_files_against_base_sorts_files_by_path() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "sorted-base-diff");
+
+        for path in ["zeta.txt", "alpha.txt", "middle.txt"] {
+            fs::write(wt.join(path), format!("{path}\n")).unwrap();
+            run_git(&wt, &["add", path]);
+        }
+        run_git(&wt, &["commit", "-m", "add files"]);
+
+        let (_staged, unstaged) = changed_files_against_base(&wt, "main").unwrap();
+        let paths = unstaged
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["alpha.txt", "middle.txt", "zeta.txt"]);
+    }
+
+    #[test]
+    fn changed_files_against_base_errors_when_base_ref_is_missing() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "missing-base-diff");
+
+        let err = changed_files_against_base(&wt, "missing-main").unwrap_err();
+
+        assert!(
+            err.to_string().contains("git diff against base failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn file_bytes_at_ref_errors_when_base_ref_is_missing() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "missing-base-file");
+
+        let err = file_bytes_at_ref(&wt, "missing-main", "tracked.txt").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("base ref \"missing-main\" could not be resolved"),
+            "unexpected error: {err}"
         );
     }
 

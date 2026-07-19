@@ -38,6 +38,7 @@ pub struct DiffOutput {
 ///
 /// `worktree_path` is the root of the git worktree and `rel_path` is the
 /// file path relative to it (as reported by `git status --porcelain`).
+#[cfg(test)]
 pub fn diff_file(
     worktree_path: &Path,
     rel_path: &str,
@@ -46,7 +47,28 @@ pub fn diff_file(
     show_line_numbers: bool,
     diff_tab_width: u16,
 ) -> Result<DiffOutput> {
-    let old_bytes = crate::git::file_bytes_at_head(worktree_path, rel_path)?.unwrap_or_default();
+    diff_file_against_ref(
+        worktree_path,
+        rel_path,
+        "HEAD",
+        theme,
+        cache,
+        show_line_numbers,
+        diff_tab_width,
+    )
+}
+
+pub fn diff_file_against_ref(
+    worktree_path: &Path,
+    rel_path: &str,
+    base_ref: &str,
+    theme: &AppTheme,
+    cache: &SyntaxCache,
+    show_line_numbers: bool,
+    diff_tab_width: u16,
+) -> Result<DiffOutput> {
+    let old_bytes =
+        crate::git::file_bytes_at_ref(worktree_path, base_ref, rel_path)?.unwrap_or_default();
     let abs_path = worktree_path.join(rel_path);
     let new_bytes = std::fs::read(&abs_path).unwrap_or_default();
 

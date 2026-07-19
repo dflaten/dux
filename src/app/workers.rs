@@ -1,6 +1,16 @@
 use super::*;
 
 impl App {
+    fn is_current_watched_worktree(&self, watched: &WatchedWorktree) -> bool {
+        self.watched_worktree
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_some_and(|current| {
+                current.path == watched.path && current.base_ref == watched.base_ref
+            })
+    }
+
     pub(crate) fn drain_events(&mut self) {
         while let Ok(event) = self.worker_rx.try_recv() {
             match event {
@@ -15,10 +25,32 @@ impl App {
                 WorkerEvent::AgentLaunchFailed(boxed) => {
                     self.handle_agent_launch_failed(*boxed);
                 }
-                WorkerEvent::ChangedFilesReady { staged, unstaged } => {
-                    self.staged_files = staged;
-                    self.unstaged_files = unstaged;
-                    self.clamp_files_cursor();
+                WorkerEvent::ChangedFilesReady {
+                    watched,
+                    quiet,
+                    staged,
+                    unstaged,
+                } => {
+                    if self.is_current_watched_worktree(&watched) {
+                        self.staged_files = staged;
+                        self.unstaged_files = unstaged;
+                        self.clamp_files_cursor();
+                        if !quiet {
+                            self.set_info(format!(
+                                "Changes refreshed against {}.",
+                                watched.base_ref
+                            ));
+                        }
+                    }
+                }
+                WorkerEvent::ChangedFilesFailed {
+                    watched,
+                    quiet,
+                    message,
+                } => {
+                    if self.is_current_watched_worktree(&watched) && !quiet {
+                        self.set_error(message);
+                    }
                 }
                 WorkerEvent::CommitMessageGenerated(msg) => {
                     self.commit_input.clear_overlay();
@@ -386,20 +418,33 @@ impl App {
                     }
                     match result {
                         Ok(branch_already_deleted) => {
+                            let summary_candidate = candidate.clone();
                             if let Err(e) =
                                 self.finish_worktree_cleanup(candidate, branch_already_deleted)
                             {
-                                self.set_error(format!(
-                                    "Worktree removed but cleanup bookkeeping failed: {e:#}"
-                                ));
+                                self.worktree_cleanup_failed.push(WorktreeCleanupFailure {
+                                    candidate: summary_candidate,
+                                    message: format!(
+                                        "Worktree removed but cleanup bookkeeping failed: {e:#}"
+                                    ),
+                                });
+                            } else {
+                                self.worktree_cleanup_removed.push(summary_candidate);
                             }
                         }
                         Err(msg) => {
-                            self.set_error(format!(
-                                "Failed to remove inactive worktree {}: {msg}",
-                                candidate.worktree_path
-                            ));
+                            self.worktree_cleanup_failed
+                                .push(WorktreeCleanupFailure {
+                                    candidate,
+                                    message: msg,
+                                });
                         }
+                    }
+                    self.finish_worktree_cleanup_job_if_done();
+                }
+                WorkerEvent::WorktreeCleanupCandidatesReady { candidates } => {
+                    if matches!(self.prompt, PromptState::WorktreeCleanupStart) {
+                        self.show_worktree_cleanup_candidates(candidates);
                     }
                 }
                 WorkerEvent::ResourceStatsReady(stats) => {
@@ -1596,14 +1641,40 @@ impl App {
                     Duration::from_secs(10)
                 };
                 thread::sleep(interval);
-                let path = watched.lock().ok().and_then(|guard| guard.clone());
-                if let Some(worktree_path) = path
-                    && let Ok((staged, unstaged)) = git::changed_files(&worktree_path)
-                    && tx
-                        .send(WorkerEvent::ChangedFilesReady { staged, unstaged })
-                        .is_err()
-                {
-                    break; // receiver dropped, app is shutting down
+                let watched_worktree = watched.lock().ok().and_then(|guard| guard.clone());
+                if let Some(watched_worktree) = watched_worktree {
+                    match git::changed_files_against_base(
+                        &watched_worktree.path,
+                        &watched_worktree.base_ref,
+                    ) {
+                        Ok((staged, unstaged)) => {
+                            if tx
+                                .send(WorkerEvent::ChangedFilesReady {
+                                    watched: watched_worktree,
+                                    quiet: true,
+                                    staged,
+                                    unstaged,
+                                })
+                                .is_err()
+                            {
+                                break; // receiver dropped, app is shutting down
+                            }
+                        }
+                        Err(err) => {
+                            if tx
+                                .send(WorkerEvent::ChangedFilesFailed {
+                                    watched: watched_worktree,
+                                    quiet: true,
+                                    message: format!(
+                                        "Failed to refresh changes against base: {err}"
+                                    ),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         });
