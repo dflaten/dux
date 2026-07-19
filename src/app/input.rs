@@ -6284,10 +6284,10 @@ impl App {
         if matches!(self.fullscreen_overlay, FullscreenOverlay::StartupLog) {
             return None;
         }
+        self.refresh_snapshot_buf();
+
         let sel = self.terminal_selection.clone()?;
         let (start, end) = sel.ordered();
-
-        self.refresh_snapshot_buf();
 
         let mut lines: Vec<String> = Vec::new();
         let mut current_row = start.row;
@@ -14662,12 +14662,13 @@ cyan = "#00ffff"
         .expect("spawn agent pty");
         app.providers.insert(session_id, agent);
         app.session_surface = SessionSurface::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 8 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         app.paste_selection_to_terminal().expect("paste selection");
 
@@ -14715,12 +14716,13 @@ cyan = "#00ffff"
         app.providers.insert(session_id, agent);
         app.session_surface = SessionSurface::Agent;
         app.input_target = InputTarget::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 8 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(
             app.interactive_patterns
@@ -14777,12 +14779,13 @@ cyan = "#00ffff"
         app.providers.insert(session_id, agent);
         app.session_surface = SessionSurface::Agent;
         app.input_target = InputTarget::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 8 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         app.copy_terminal_selection();
         app.terminal_selection = None;
@@ -14844,6 +14847,7 @@ cyan = "#00ffff"
                 .is_some_and(|provider| provider.has_mouse_mode()),
             "test setup should enable child mouse reporting"
         );
+        assert!(app.refresh_snapshot_buf());
 
         app.process_raw_input_bytes(b"\x1b[<0;22;2M")
             .expect("mouse down");
@@ -14902,6 +14906,7 @@ cyan = "#00ffff"
         app.session_surface = SessionSurface::Agent;
         app.input_target = InputTarget::Agent;
         std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
 
         // iTerm2 can report SGR mouse parameters with colon delimiters.
         // Coordinates are wire-format 1-based screen cells; the installed
@@ -14957,6 +14962,63 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn ctrl_e_after_agent_to_terminal_paste_requires_new_terminal_selection() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        let agent = PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf 'echo from-agent'; stty raw -echo; exec cat -v".to_string(),
+            ],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn agent pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::Agent;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 14 },
+            dragging: false,
+        });
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("paste agent selection to terminal");
+
+        assert_eq!(app.session_surface, SessionSurface::Terminal);
+        assert_eq!(
+            app.status.message(),
+            "Pasted selected agent output into companion terminal."
+        );
+
+        app.process_raw_input_bytes(&[0x05])
+            .expect("process second ctrl-e");
+
+        assert_eq!(app.session_surface, SessionSurface::Terminal);
+        assert_eq!(app.status.tone(), crate::statusline::StatusTone::Error);
+        assert_eq!(app.status.message(), "Select terminal text first.");
+
+        let provider = app.providers.values().next().expect("provider");
+        let rendered: String = provider
+            .snapshot()
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            !rendered.contains("echo from-agentecho from-agent"),
+            "second Ctrl-e must not paste stale agent selection back into agent; got: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn ctrl_e_pastes_terminal_selection_to_agent_without_enter() {
         let mut app = test_app(default_bindings());
         let session_id = app.sessions[0].id.clone();
@@ -14993,12 +15055,13 @@ cyan = "#00ffff"
         app.session_surface = SessionSurface::Terminal;
         app.input_target = InputTarget::Terminal;
         app.fullscreen_overlay = FullscreenOverlay::Terminal;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 9 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         assert_eq!(
             app.interactive_patterns
@@ -15070,12 +15133,13 @@ cyan = "#00ffff"
         app.session_surface = SessionSurface::Terminal;
         app.input_target = InputTarget::Terminal;
         app.fullscreen_overlay = FullscreenOverlay::Terminal;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 9 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         app.copy_terminal_selection();
         app.terminal_selection = None;
@@ -15140,12 +15204,13 @@ cyan = "#00ffff"
         );
         app.active_terminal_id = Some("term-test".to_string());
         app.session_surface = SessionSurface::Terminal;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(app.refresh_snapshot_buf());
         app.terminal_selection = Some(TerminalSelection {
             anchor: TermGridPos { row: 0, col: 0 },
             end: TermGridPos { row: 0, col: 9 },
             dragging: false,
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
         app.paste_selection_to_agent().expect("paste selection");
 
