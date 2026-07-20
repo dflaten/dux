@@ -54,6 +54,28 @@ pub(crate) fn macro_payload_bytes(text: &str) -> Vec<u8> {
     payload
 }
 
+fn build_diff_comments_prompt(comments: &[QueuedDiffComment]) -> String {
+    let mut out = String::from(
+        "Please address the following comments about selected lines from the current diff.\n",
+    );
+    for (index, comment) in comments.iter().enumerate() {
+        out.push_str(&format!(
+            "\nComment {}: {}\nFile: {}\nDiff lines: {}-{}\nSelected context:\n```diff\n",
+            index + 1,
+            comment.command,
+            comment.file_path,
+            comment.start_line + 1,
+            comment.end_line + 1
+        ));
+        for line in &comment.context {
+            out.push_str(&line.text);
+            out.push('\n');
+        }
+        out.push_str("```\n");
+    }
+    out
+}
+
 /// Append `bytes` to `buf`, keeping at most `max` trailing bytes. Used to
 /// bound `loading_input_buf` so it cannot grow without bound when the user
 /// pastes large content during the agent loading phase.
@@ -501,6 +523,9 @@ impl App {
                     };
                     self.set_info("Command palette opened.");
                 }
+                Action::RebaseCurrentBranch => {
+                    self.rebase_selected_session_onto_base();
+                }
                 Action::FocusNext => {
                     let has_staged = !self.staged_files.is_empty();
                     if self.focus == FocusPane::Left
@@ -755,8 +780,34 @@ impl App {
 
     fn handle_center_key(&mut self, key: KeyEvent) -> Result<()> {
         let in_diff = matches!(self.center_mode, CenterMode::Diff { .. });
+        if in_diff {
+            // Diff selection has vim-style line movement, but j/k are not
+            // center-pane bindings because agent output uses different scroll
+            // semantics. Handle them here only while a diff is open.
+            if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.move_diff_selection(true);
+                        return Ok(());
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.move_diff_selection(false);
+                        return Ok(());
+                    }
+                    KeyCode::Esc if self.diff_selection.is_some() => {
+                        self.diff_selection = None;
+                        self.set_info("Canceled diff line selection.");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(action) = self.bindings.lookup(&key, BindingScope::Center) {
             match action {
+                Action::StartDiffSelection if in_diff => self.start_diff_selection(),
+                Action::CaptureDiffComment if in_diff => self.open_diff_comment_prompt(),
+                Action::SendDiffComments if in_diff => self.send_queued_diff_comments(),
                 Action::FocusAgent if !in_diff => self.activate_center_agent()?,
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
@@ -806,6 +857,7 @@ impl App {
                 Action::ScrollLineUp => {
                     if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
                         *scroll = scroll.saturating_sub(1);
+                        self.sync_diff_cursor_to_scroll();
                     } else if self.last_pty_size.0 > 0 {
                         self.scroll_pty(ScrollDirection::Up, 1);
                     }
@@ -816,6 +868,7 @@ impl App {
                             .last_diff_visual_lines
                             .saturating_sub(self.last_diff_height.max(1));
                         *scroll = (*scroll + 1).min(max_scroll);
+                        self.sync_diff_cursor_to_scroll();
                     } else if self.last_pty_size.0 > 0 {
                         self.scroll_pty(ScrollDirection::Down, 1);
                     }
@@ -849,6 +902,223 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn sync_diff_cursor_to_scroll(&mut self) {
+        let Some(line_index) = self
+            .last_diff_visual_map
+            .get(self.current_diff_scroll() as usize)
+            .copied()
+        else {
+            return;
+        };
+        self.diff_cursor = line_index;
+    }
+
+    fn current_diff_scroll(&self) -> u16 {
+        match self.center_mode {
+            CenterMode::Diff { scroll, .. } => scroll,
+            CenterMode::Agent => 0,
+        }
+    }
+
+    fn diff_meta(&self) -> Option<Arc<Vec<crate::diff::DiffLineMeta>>> {
+        match &self.center_mode {
+            CenterMode::Diff { meta, .. } => Some(Arc::clone(meta)),
+            CenterMode::Agent => None,
+        }
+    }
+
+    fn clamp_diff_cursor(&mut self) {
+        let len = self.diff_meta().map(|meta| meta.len()).unwrap_or(0);
+        if len == 0 {
+            self.diff_cursor = 0;
+            self.diff_selection = None;
+            return;
+        }
+        self.diff_cursor = self.diff_cursor.min(len - 1);
+        if let Some(selection) = &mut self.diff_selection {
+            selection.anchor = selection.anchor.min(len - 1);
+            selection.cursor = selection.cursor.min(len - 1);
+        }
+    }
+
+    fn start_diff_selection(&mut self) {
+        self.clamp_diff_cursor();
+        let Some(meta) = self.diff_meta() else {
+            return;
+        };
+        if meta.is_empty() {
+            self.set_error("Open a text diff before selecting lines.");
+            return;
+        }
+        self.diff_selection = Some(DiffSelectionState {
+            anchor: self.diff_cursor,
+            cursor: self.diff_cursor,
+            dragging: false,
+        });
+        self.set_info("Selecting diff lines. Use j/k or drag with the mouse, then add a command.");
+    }
+
+    fn move_diff_selection(&mut self, down: bool) {
+        let Some(meta) = self.diff_meta() else {
+            return;
+        };
+        if meta.is_empty() {
+            return;
+        }
+        let max = meta.len() - 1;
+        if let Some(selection) = &mut self.diff_selection {
+            if down {
+                selection.cursor = (selection.cursor + 1).min(max);
+            } else {
+                selection.cursor = selection.cursor.saturating_sub(1);
+            }
+            self.diff_cursor = selection.cursor;
+        } else if down {
+            self.diff_cursor = (self.diff_cursor + 1).min(max);
+        } else {
+            self.diff_cursor = self.diff_cursor.saturating_sub(1);
+        }
+        self.ensure_diff_cursor_visible();
+    }
+
+    fn ensure_diff_cursor_visible(&mut self) {
+        let Some(first_visual) = self
+            .last_diff_visual_map
+            .iter()
+            .position(|&idx| idx == self.diff_cursor)
+        else {
+            return;
+        };
+        if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
+            let first_visual = first_visual as u16;
+            let height = self.last_diff_height.max(1);
+            if first_visual < *scroll {
+                *scroll = first_visual;
+            } else if first_visual >= scroll.saturating_add(height) {
+                *scroll = first_visual.saturating_sub(height.saturating_sub(1));
+            }
+        }
+    }
+
+    fn open_diff_comment_prompt(&mut self) {
+        let Some(meta) = self.diff_meta() else {
+            self.set_error("Open a diff before adding an agent comment.");
+            return;
+        };
+        let Some(selection) = self.diff_selection.clone() else {
+            self.set_error("Select diff lines before adding an agent comment.");
+            return;
+        };
+        let (start, end) = selection.ordered_range();
+        if start >= meta.len() || end >= meta.len() {
+            self.set_error("Selected diff lines are no longer available.");
+            self.diff_selection = None;
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            self.set_error("Select an agent session before adding an agent comment.");
+            return;
+        };
+        let file_path = match &self.center_mode {
+            CenterMode::Diff { rel_path, .. } => rel_path.clone(),
+            CenterMode::Agent => return,
+        };
+        self.prompt = PromptState::DiffCommentInput {
+            session_id: session.id.clone(),
+            file_path,
+            start_line: start,
+            end_line: end,
+            context: meta[start..=end].to_vec(),
+            input: TextInput::new().with_placeholder("Command for the agent"),
+        };
+        self.input_target = InputTarget::None;
+    }
+
+    fn save_diff_comment_prompt(&mut self) {
+        let prompt = std::mem::replace(&mut self.prompt, PromptState::None);
+        let PromptState::DiffCommentInput {
+            session_id,
+            file_path,
+            start_line,
+            end_line,
+            context,
+            input,
+        } = prompt
+        else {
+            return;
+        };
+        let command = input.text.trim().to_string();
+        if command.is_empty() {
+            self.prompt = PromptState::DiffCommentInput {
+                session_id,
+                file_path,
+                start_line,
+                end_line,
+                context,
+                input,
+            };
+            self.set_error("Enter a command before saving this diff comment.");
+            return;
+        }
+        self.queued_diff_comments.push(QueuedDiffComment {
+            session_id,
+            file_path,
+            start_line,
+            end_line,
+            command,
+            context,
+        });
+        self.diff_selection = None;
+        let send_key = self.bindings.label_for(Action::SendDiffComments);
+        self.set_info(format!(
+            "Queued agent comment. Press {send_key} when ready to send all queued comments."
+        ));
+    }
+
+    fn send_queued_diff_comments(&mut self) {
+        let Some(session) = self.selected_session() else {
+            self.set_error("Select an agent session before sending queued comments.");
+            return;
+        };
+        let session_id = session.id.clone();
+        let comments: Vec<_> = self
+            .queued_diff_comments
+            .iter()
+            .filter(|comment| comment.session_id == session_id)
+            .cloned()
+            .collect();
+        if comments.is_empty() {
+            self.set_error("No queued agent comments for the selected session.");
+            return;
+        }
+        let Some(provider) = self.providers.get(&session_id) else {
+            self.set_error(format!(
+                "Agent \"{}\" is not running. Reconnect it before sending queued comments.",
+                session.branch_name
+            ));
+            return;
+        };
+        let prompt = build_diff_comments_prompt(&comments);
+        let mut payload = Self::bracket_paste_payload(&prompt);
+        payload.push(b'\r');
+        match provider.write_bytes(&payload) {
+            Ok(()) => {
+                self.queued_diff_comments
+                    .retain(|comment| comment.session_id != session_id);
+                self.center_mode = CenterMode::Agent;
+                self.focus = FocusPane::Center;
+                self.session_surface = SessionSurface::Agent;
+                self.fullscreen_overlay = FullscreenOverlay::Agent;
+                self.input_target = InputTarget::Agent;
+                self.diff_selection = None;
+                self.set_info("Sent queued diff comments to the selected agent.");
+            }
+            Err(err) => {
+                self.set_error(format!("Failed to send queued comments to agent: {err}"));
+            }
+        }
     }
 
     fn scroll_pty(&mut self, direction: ScrollDirection, amount: usize) {
@@ -1083,6 +1353,9 @@ impl App {
                 Action::SearchNext if !self.advance_files_search_match() => {
                     self.set_info("No active file search matches.");
                 }
+                Action::SendDiffComments => {
+                    self.send_queued_diff_comments();
+                }
                 _ => {}
             }
         } else if key.code == KeyCode::Esc && self.has_files_search() {
@@ -1226,12 +1499,13 @@ impl App {
             RightSection::CommitInput => {}
         }
         self.reload_changed_files();
-        // If the section we were in is now empty, move to the other one.
-        if self.right_section == RightSection::Staged && self.staged_files.is_empty() {
+        // If the visible Changes list is now empty, keep focus on that list.
+        // Staged changes are no longer shown as a separate focusable section.
+        let reset_to_changes = (self.right_section == RightSection::Staged
+            && self.staged_files.is_empty())
+            || (self.right_section == RightSection::Unstaged && self.unstaged_files.is_empty());
+        if reset_to_changes {
             self.right_section = RightSection::Unstaged;
-            self.clamp_files_cursor();
-        } else if self.right_section == RightSection::Unstaged && self.unstaged_files.is_empty() {
-            self.right_section = RightSection::Staged;
             self.clamp_files_cursor();
         }
         Ok(())
@@ -1410,6 +1684,44 @@ impl App {
             "Pull already in progress for this worktree. Wait for the current pull to finish.",
         );
         Ok(())
+    }
+
+    pub(crate) fn rebase_selected_session_onto_base(&mut self) {
+        let Some(session) = self.selected_session() else {
+            self.set_error("Select an agent session before rebasing.");
+            return;
+        };
+        let session_id = session.id.clone();
+        let branch_name = session.branch_name.clone();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let base_ref = self.diff_base_ref_for_session(session);
+
+        if !self.base_branch_updates.contains_key(&session_id) {
+            self.set_info(format!(
+                "\"{branch_name}\" is not behind {base_ref}; there is nothing to rebase."
+            ));
+            return;
+        }
+
+        if !self.rebases_in_flight.insert(session_id.clone()) {
+            self.set_warning(format!(
+                "Rebase already in progress for \"{branch_name}\". Wait for it to finish."
+            ));
+            return;
+        }
+
+        let tx = self.worker_tx.clone();
+        self.set_busy(format!("Rebasing \"{branch_name}\" onto {base_ref}."));
+        thread::spawn(move || {
+            let result = git::rebase_onto_stashing_tracked_changes(&worktree, &base_ref)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(WorkerEvent::RebaseCompleted {
+                session_id,
+                branch_name,
+                base_ref,
+                result,
+            });
+        });
     }
 
     /// Read raw bytes from stdin, split into terminal sequences, and either
@@ -1978,6 +2290,19 @@ impl App {
         // action. This keeps the press visual from outliving its trigger
         // when the user reaches for the keyboard mid-click.
         self.pressed_button = None;
+        if let PromptState::DiffCommentInput { input, .. } = &mut self.prompt {
+            match key.code {
+                KeyCode::Esc => {
+                    self.prompt = PromptState::None;
+                    self.set_info("Canceled diff comment.");
+                }
+                KeyCode::Enter => self.save_diff_comment_prompt(),
+                _ => {
+                    input.handle_key(key);
+                }
+            }
+            return Ok(false);
+        }
         if let PromptState::ResourceMonitor {
             scroll_offset,
             selected_row,
@@ -5918,6 +6243,76 @@ impl App {
         );
     }
 
+    fn screen_to_diff_line(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.mouse_layout.agent_term?;
+        if !contains_point(area, column, row) {
+            return None;
+        }
+        let visual_row = row.saturating_sub(area.y);
+        let scroll = self.current_diff_scroll() as usize;
+        self.last_diff_visual_map
+            .get(scroll.saturating_add(visual_row as usize))
+            .copied()
+    }
+
+    fn screen_to_diff_line_clamped(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.mouse_layout.agent_term?;
+        let (_, clamped_row) = relative_point_clamped(area, column, row);
+        let scroll = self.current_diff_scroll() as usize;
+        self.last_diff_visual_map
+            .get(scroll.saturating_add(clamped_row as usize))
+            .copied()
+    }
+
+    fn begin_diff_mouse_selection(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(self.center_mode, CenterMode::Diff { .. }) {
+            return false;
+        }
+        let Some(line) = self.screen_to_diff_line(mouse.column, mouse.row) else {
+            return false;
+        };
+        self.focus = FocusPane::Center;
+        self.input_target = InputTarget::None;
+        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.diff_cursor = line;
+        self.diff_selection = Some(DiffSelectionState {
+            anchor: line,
+            cursor: line,
+            dragging: true,
+        });
+        true
+    }
+
+    fn update_diff_mouse_selection(&mut self, mouse: MouseEvent) -> bool {
+        let dragging = self
+            .diff_selection
+            .as_ref()
+            .is_some_and(|selection| selection.dragging);
+        if !dragging {
+            return false;
+        }
+        let Some(line) = self.screen_to_diff_line_clamped(mouse.column, mouse.row) else {
+            return false;
+        };
+        if let Some(selection) = &mut self.diff_selection {
+            selection.cursor = line;
+        }
+        self.diff_cursor = line;
+        true
+    }
+
+    fn finish_diff_mouse_selection(&mut self) -> bool {
+        let Some(selection) = &mut self.diff_selection else {
+            return false;
+        };
+        if !selection.dragging {
+            return false;
+        }
+        selection.dragging = false;
+        self.diff_cursor = selection.cursor;
+        true
+    }
+
     fn update_dragged_panes(&mut self, column: u16, row: u16) {
         let body = self.mouse_layout.body;
         if body.width == 0 {
@@ -6105,11 +6500,13 @@ impl App {
                         self.fullscreen_overlay = FullscreenOverlay::None;
                     }
                     Some(MouseTarget::Center) => {
-                        let double_click =
-                            self.register_mouse_click(MouseClickTarget::CenterPane, None);
-                        self.focus = FocusPane::Center;
-                        if double_click {
-                            self.activate_center_agent_from_mouse();
+                        if !self.begin_diff_mouse_selection(mouse) {
+                            let double_click =
+                                self.register_mouse_click(MouseClickTarget::CenterPane, None);
+                            self.focus = FocusPane::Center;
+                            if double_click {
+                                self.activate_center_agent_from_mouse();
+                            }
                         }
                     }
                     Some(MouseTarget::FilesPane) => {
@@ -6157,9 +6554,11 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) if self.mouse_drag.is_some() => {
                 self.update_dragged_panes(mouse.column, mouse.row);
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.update_diff_mouse_selection(mouse) => {}
             MouseEventKind::Up(MouseButton::Left) if self.mouse_drag.take().is_some() => {
                 self.persist_pane_widths();
             }
+            MouseEventKind::Up(MouseButton::Left) if self.finish_diff_mouse_selection() => {}
             MouseEventKind::ScrollDown => match self.mouse_target(mouse.column, mouse.row) {
                 Some(MouseTarget::LeftRow(_)) => {
                     self.handle_left_mouse_wheel(true, mouse.column, mouse.row)
@@ -6687,18 +7086,19 @@ mod tests {
 
     use super::DOUBLE_CLICK_THRESHOLD;
     use super::components::{ButtonPressedTarget, PressedButton};
+    use crate::app::input::build_diff_comments_prompt;
     use crate::app::{
-        AgentLaunchKind, App, BranchWarningKind, CenterMode, ConfigReloadFailedFocus,
-        ConfirmKillRunningPrompt, ConfirmNonDefaultBranchFocus, CreateAgentBranchInspection,
-        CreateAgentRequest, DeleteAgentFocus, FocusPane, FullscreenOverlay, InputTarget,
-        KillRunningAction, KillRunningFocus, KillRunningFooterAction, KillRunningPrompt,
-        KillableRuntime, KillableRuntimeKind, LeftItem, LeftSection, MacroBarState,
-        MouseClickTarget, MouseLayoutState, NameNewAgentFocus, NonDefaultBranchAction,
-        OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout, OverlayMouseLayoutState,
-        PickProjectWorktreePrompt, ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget,
-        ResolvedPullRequest, ResourceStats, RightSection, RuntimeTargetId, StartupCommandLogPrompt,
-        TermGridPos, TerminalSelection, TextInput, WatchedWorktree, WorkerEvent,
-        WorktreeCleanupCandidate,
+        AgentLaunchKind, App, BaseBranchUpdate, BranchWarningKind, CenterMode,
+        ConfigReloadFailedFocus, ConfirmKillRunningPrompt, ConfirmNonDefaultBranchFocus,
+        CreateAgentBranchInspection, CreateAgentRequest, DeleteAgentFocus, DiffSelectionState,
+        FocusPane, FullscreenOverlay, InputTarget, KillRunningAction, KillRunningFocus,
+        KillRunningFooterAction, KillRunningPrompt, KillableRuntime, KillableRuntimeKind, LeftItem,
+        LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
+        NonDefaultBranchAction, OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout,
+        OverlayMouseLayoutState, PickProjectWorktreePrompt, ProcessInfo, ProjectWorktreeEntry,
+        PromptState, PullTarget, QueuedDiffComment, ResolvedPullRequest, ResourceStats,
+        RightSection, RuntimeTargetId, StartupCommandLogPrompt, TermGridPos, TerminalSelection,
+        TextInput, WatchedWorktree, WorkerEvent, WorktreeCleanupCandidate,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -6921,6 +7321,7 @@ mod tests {
             create_agent_in_flight: false,
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
+            rebases_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),
@@ -6931,6 +7332,11 @@ mod tests {
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
+            last_diff_visual_map: Vec::new(),
+            diff_cursor: 0,
+            diff_selection: None,
+            queued_diff_comments: Vec::new(),
+            base_branch_updates: std::collections::HashMap::new(),
             theme: Theme::default_dark(),
             tick_count: 0,
             start_time: std::time::Instant::now(),
@@ -9132,8 +9538,8 @@ not_a_real_action = ["x"]
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.right_section, RightSection::Staged);
-        assert_eq!(app.files_index, 0);
+        assert_eq!(app.right_section, RightSection::Unstaged);
+        assert_eq!(app.files_index, 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
@@ -9565,6 +9971,26 @@ not_a_real_action = ["x"]
                 Line::from("two"),
                 Line::from("three"),
             ]),
+            meta: Arc::new(vec![
+                crate::diff::DiffLineMeta {
+                    kind: crate::diff::DiffLineKind::Info,
+                    old_line: None,
+                    new_line: None,
+                    text: "one".to_string(),
+                },
+                crate::diff::DiffLineMeta {
+                    kind: crate::diff::DiffLineKind::Info,
+                    old_line: None,
+                    new_line: None,
+                    text: "two".to_string(),
+                },
+                crate::diff::DiffLineMeta {
+                    kind: crate::diff::DiffLineKind::Info,
+                    old_line: None,
+                    new_line: None,
+                    text: "three".to_string(),
+                },
+            ]),
             scroll: 0,
             gutter_width: 0,
             worktree_path: String::new(),
@@ -9585,12 +10011,137 @@ not_a_real_action = ["x"]
     fn open_fake_diff(app: &mut App) {
         app.center_mode = CenterMode::Diff {
             lines: Arc::new(vec![Line::from("diff")]),
+            meta: Arc::new(vec![crate::diff::DiffLineMeta {
+                kind: crate::diff::DiffLineKind::Info,
+                old_line: None,
+                new_line: None,
+                text: "diff".to_string(),
+            }]),
             scroll: 0,
             gutter_width: 0,
             worktree_path: String::new(),
             rel_path: String::new(),
             base_ref: "main".to_string(),
         };
+    }
+
+    fn open_fake_diff_with_lines(app: &mut App, lines: &[&str]) {
+        app.center_mode = CenterMode::Diff {
+            lines: Arc::new(
+                lines
+                    .iter()
+                    .map(|line| Line::from((*line).to_string()))
+                    .collect(),
+            ),
+            meta: Arc::new(
+                lines
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| crate::diff::DiffLineMeta {
+                        kind: crate::diff::DiffLineKind::Info,
+                        old_line: None,
+                        new_line: Some(idx + 1),
+                        text: (*line).to_string(),
+                    })
+                    .collect(),
+            ),
+            scroll: 0,
+            gutter_width: 0,
+            worktree_path: String::new(),
+            rel_path: "src/example.rs".to_string(),
+            base_ref: "main".to_string(),
+        };
+    }
+
+    #[test]
+    fn shift_v_starts_diff_selection_and_jk_extend_it() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("start selection");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("extend down");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("extend up");
+
+        let selection = app.diff_selection.expect("selection");
+        assert_eq!(selection.anchor, 0);
+        assert_eq!(selection.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_c_opens_diff_comment_prompt_and_enter_queues_comment() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["+fn changed() {", "+}"]);
+        app.focus = FocusPane::Center;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .expect("open comment prompt");
+        match &mut app.prompt {
+            PromptState::DiffCommentInput { input, .. } => {
+                input.text = "Tell me where this is used".to_string();
+                input.cursor = input.text.len();
+            }
+            other => panic!("expected diff comment prompt, got {other:?}"),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("save prompt");
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.queued_diff_comments.len(), 1);
+        assert_eq!(
+            app.queued_diff_comments[0].command,
+            "Tell me where this is used"
+        );
+        assert_eq!(app.queued_diff_comments[0].context.len(), 2);
+    }
+
+    #[test]
+    fn mouse_drag_selects_diff_lines_using_visual_map() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.mouse_layout.center = Rect::new(10, 5, 40, 3);
+        app.mouse_layout.agent_term = Some(Rect::new(10, 5, 40, 3));
+        app.last_diff_visual_map = vec![0, 1, 2];
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, 7));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, 7));
+
+        let selection = app.diff_selection.expect("selection");
+        assert_eq!(selection.ordered_range(), (0, 2));
+        assert!(!selection.dragging);
+    }
+
+    #[test]
+    fn diff_comments_prompt_includes_commands_and_context() {
+        let comment = QueuedDiffComment {
+            session_id: "session-1".to_string(),
+            file_path: "src/example.rs".to_string(),
+            start_line: 3,
+            end_line: 4,
+            command: "Refactor this method".to_string(),
+            context: vec![crate::diff::DiffLineMeta {
+                kind: crate::diff::DiffLineKind::Added,
+                old_line: None,
+                new_line: Some(42),
+                text: "+fn changed() {}".to_string(),
+            }],
+        };
+
+        let prompt = build_diff_comments_prompt(&[comment]);
+
+        assert!(prompt.contains("Refactor this method"));
+        assert!(prompt.contains("src/example.rs"));
+        assert!(prompt.contains("+fn changed() {}"));
+        assert!(!prompt.contains("# new 42"));
     }
 
     #[test]
@@ -14430,10 +14981,12 @@ cyan = "#00ffff"
     fn changed_files_worker_ignores_stale_results() {
         let mut app = test_app(default_bindings());
         let current = WatchedWorktree {
+            session_id: "session-1".to_string(),
             path: app.paths.worktrees_root.join("current"),
             base_ref: "main".to_string(),
         };
         let stale = WatchedWorktree {
+            session_id: "session-1".to_string(),
             path: app.paths.worktrees_root.join("stale"),
             base_ref: "main".to_string(),
         };
@@ -14452,6 +15005,10 @@ cyan = "#00ffff"
                 watched: stale,
                 quiet: false,
                 staged: Vec::new(),
+                base_update: Some(BaseBranchUpdate {
+                    base_ref: "main".to_string(),
+                    commits: 2,
+                }),
                 unstaged: vec![ChangedFile {
                     path: "stale.txt".to_string(),
                     status: "M".to_string(),
@@ -14465,12 +15022,17 @@ cyan = "#00ffff"
         app.drain_events();
 
         assert_eq!(app.unstaged_files[0].path, "existing.txt");
+        assert!(app.base_branch_updates.is_empty());
 
         app.worker_tx
             .send(WorkerEvent::ChangedFilesReady {
                 watched: current,
                 quiet: false,
                 staged: Vec::new(),
+                base_update: Some(BaseBranchUpdate {
+                    base_ref: "main".to_string(),
+                    commits: 1,
+                }),
                 unstaged: vec![ChangedFile {
                     path: "current.txt".to_string(),
                     status: "M".to_string(),
@@ -14484,6 +15046,37 @@ cyan = "#00ffff"
         app.drain_events();
 
         assert_eq!(app.unstaged_files[0].path, "current.txt");
+        assert_eq!(app.base_branch_updates["session-1"].commits, 1);
+    }
+
+    #[test]
+    fn rebase_command_available_only_when_selected_session_is_behind_base() {
+        let mut app = test_app(default_bindings());
+
+        assert!(
+            app.filtered_palette_commands("rebase")
+                .iter()
+                .all(|binding| binding.action != Action::RebaseCurrentBranch)
+        );
+
+        app.rebase_selected_session_onto_base();
+
+        assert!(app.rebases_in_flight.is_empty());
+        assert!(app.status.text().contains("there is nothing to rebase"));
+
+        app.base_branch_updates.insert(
+            "session-1".to_string(),
+            BaseBranchUpdate {
+                base_ref: "main".to_string(),
+                commits: 1,
+            },
+        );
+
+        assert!(
+            app.filtered_palette_commands("rebase")
+                .iter()
+                .any(|binding| binding.action == Action::RebaseCurrentBranch)
+        );
     }
 
     #[test]

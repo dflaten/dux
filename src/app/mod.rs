@@ -104,6 +104,7 @@ pub struct App {
     pub(crate) create_agent_in_flight: bool,
     pub(crate) agent_launches_in_flight: HashSet<String>,
     pub(crate) pulls_in_flight: HashSet<String>,
+    pub(crate) rebases_in_flight: HashSet<String>,
     pub(crate) resource_stats_in_flight: bool,
     pub(crate) worktree_cleanup_pending: usize,
     pub(crate) worktree_cleanup_removed: Vec<WorktreeCleanupCandidate>,
@@ -117,6 +118,11 @@ pub struct App {
     pub(crate) show_diff_line_numbers: bool,
     pub(crate) last_diff_height: u16,
     pub(crate) last_diff_visual_lines: u16,
+    pub(crate) last_diff_visual_map: Vec<usize>,
+    pub(crate) diff_cursor: usize,
+    pub(crate) diff_selection: Option<DiffSelectionState>,
+    pub(crate) queued_diff_comments: Vec<QueuedDiffComment>,
+    pub(crate) base_branch_updates: HashMap<String, BaseBranchUpdate>,
     pub(crate) theme: Theme,
     pub(crate) tick_count: u64,
     /// Wall-clock reference for time-based animations (spinners). Using
@@ -268,22 +274,20 @@ pub(crate) enum RightSection {
 
 impl RightSection {
     /// Returns the next section, or `None` to exit the pane.
-    /// Order: Unstaged → Staged → CommitInput.
-    pub(crate) fn next(self, has_staged: bool) -> Option<Self> {
+    /// The visible right pane now contains only the Changes list; staged and
+    /// commit state remains for legacy actions but is not focusable.
+    pub(crate) fn next(self, _has_staged: bool) -> Option<Self> {
         match self {
-            Self::Unstaged if has_staged => Some(Self::Staged),
             Self::Unstaged => None,
-            Self::Staged => Some(Self::CommitInput),
-            Self::CommitInput => None,
+            Self::Staged | Self::CommitInput => None,
         }
     }
 
     /// Returns the previous section, or `None` to exit the pane.
     pub(crate) fn previous(self) -> Option<Self> {
         match self {
-            Self::CommitInput => Some(Self::Staged),
-            Self::Staged => Some(Self::Unstaged),
             Self::Unstaged => None,
+            Self::Staged | Self::CommitInput => Some(Self::Unstaged),
         }
     }
 
@@ -292,12 +296,8 @@ impl RightSection {
         Self::Unstaged
     }
 
-    pub(crate) fn last(has_staged: bool) -> Self {
-        if has_staged {
-            Self::CommitInput
-        } else {
-            Self::Unstaged
-        }
+    pub(crate) fn last(_has_staged: bool) -> Self {
+        Self::Unstaged
     }
 }
 
@@ -314,6 +314,7 @@ pub(crate) enum CenterMode {
     Agent,
     Diff {
         lines: Arc<Vec<Line<'static>>>,
+        meta: Arc<Vec<crate::diff::DiffLineMeta>>,
         scroll: u16,
         /// Display-column width of the gutter (0 when line numbers are off).
         gutter_width: usize,
@@ -324,10 +325,44 @@ pub(crate) enum CenterMode {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiffSelectionState {
+    pub(crate) anchor: usize,
+    pub(crate) cursor: usize,
+    pub(crate) dragging: bool,
+}
+
+impl DiffSelectionState {
+    pub(crate) fn ordered_range(&self) -> (usize, usize) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedDiffComment {
+    pub(crate) session_id: String,
+    pub(crate) file_path: String,
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) command: String,
+    pub(crate) context: Vec<crate::diff::DiffLineMeta>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WatchedWorktree {
+    pub(crate) session_id: String,
     pub(crate) path: PathBuf,
     pub(crate) base_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseBranchUpdate {
+    pub(crate) base_ref: String,
+    pub(crate) commits: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -676,6 +711,14 @@ pub(crate) enum PromptState {
     },
     ConfigureGlobalEnv {
         project_name: String,
+        input: TextInput,
+    },
+    DiffCommentInput {
+        session_id: String,
+        file_path: String,
+        start_line: usize,
+        end_line: usize,
+        context: Vec<crate::diff::DiffLineMeta>,
         input: TextInput,
     },
     #[allow(dead_code)]
@@ -1550,6 +1593,7 @@ pub(crate) enum WorkerEvent {
         quiet: bool,
         staged: Vec<ChangedFile>,
         unstaged: Vec<ChangedFile>,
+        base_update: Option<BaseBranchUpdate>,
     },
     ChangedFilesFailed {
         watched: WatchedWorktree,
@@ -1563,6 +1607,12 @@ pub(crate) enum WorkerEvent {
         repo_path: String,
         target: PullTarget,
         result: Result<Option<String>, String>,
+    },
+    RebaseCompleted {
+        session_id: String,
+        branch_name: String,
+        base_ref: String,
+        result: Result<(), String>,
     },
     BrowserEntriesReady {
         dir: PathBuf,
@@ -1812,6 +1862,7 @@ impl App {
             create_agent_in_flight: false,
             agent_launches_in_flight: HashSet::new(),
             pulls_in_flight: HashSet::new(),
+            rebases_in_flight: HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),
@@ -1822,6 +1873,11 @@ impl App {
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
+            last_diff_visual_map: Vec::new(),
+            diff_cursor: 0,
+            diff_selection: None,
+            queued_diff_comments: Vec::new(),
+            base_branch_updates: HashMap::new(),
             theme,
             tick_count: 0,
             start_time: Instant::now(),
@@ -2152,6 +2208,8 @@ impl App {
         }
         if matches!(self.center_mode, CenterMode::Diff { .. }) {
             self.center_mode = CenterMode::Agent;
+            self.diff_selection = None;
+            self.last_diff_visual_map.clear();
             self.focus = FocusPane::Files;
             self.set_info("Closed diff view, returned to agent output.");
             return true;
@@ -2167,6 +2225,8 @@ impl App {
     pub(crate) fn close_diff_view(&mut self) {
         if matches!(self.center_mode, CenterMode::Diff { .. }) {
             self.center_mode = CenterMode::Agent;
+            self.diff_selection = None;
+            self.last_diff_visual_map.clear();
         }
     }
 
@@ -2265,6 +2325,9 @@ impl App {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
             Action::PasteSelectionToTerminal => self.selected_session().is_some(),
             Action::PasteSelectionToAgent => self.active_terminal_id.is_some(),
+            Action::RebaseCurrentBranch => self
+                .selected_session()
+                .is_some_and(|session| self.base_branch_updates.contains_key(&session.id)),
             _ => true,
         }
     }
@@ -2369,6 +2432,10 @@ impl App {
             "rerun-startup-command-on-agent" => self.rerun_startup_command_on_agent(),
             "read-startup-command-logs" => self.open_startup_command_logs(),
             "pull-project" => self.refresh_selected_project(),
+            "rebase-current-branch" => {
+                self.rebase_selected_session_onto_base();
+                Ok(())
+            }
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
@@ -2853,14 +2920,16 @@ impl App {
         if let Ok(mut guard) = self.watched_worktree.lock() {
             *guard = selected
                 .as_ref()
-                .map(|(_, path, base_ref)| WatchedWorktree {
+                .map(|(session_id, path, base_ref)| WatchedWorktree {
+                    session_id: session_id.clone(),
                     path: path.clone(),
                     base_ref: base_ref.clone(),
                 });
         }
         match selected.as_ref() {
-            Some((_, path, base_ref)) => {
+            Some((session_id, path, base_ref)) => {
                 let watched = WatchedWorktree {
+                    session_id: session_id.clone(),
                     path: path.clone(),
                     base_ref: base_ref.clone(),
                 };
@@ -2875,12 +2944,24 @@ impl App {
                 std::thread::spawn(move || {
                     let event =
                         match git::changed_files_against_base(&watched.path, &watched.base_ref) {
-                            Ok((staged, unstaged)) => WorkerEvent::ChangedFilesReady {
-                                watched,
-                                quiet: !show_status,
-                                staged,
-                                unstaged,
-                            },
+                            Ok((staged, unstaged)) => {
+                                let base_update =
+                                    git::ahead_behind(&watched.path, "HEAD", &watched.base_ref)
+                                        .ok()
+                                        .and_then(|(_, behind)| {
+                                            (behind > 0).then(|| BaseBranchUpdate {
+                                                base_ref: watched.base_ref.clone(),
+                                                commits: behind,
+                                            })
+                                        });
+                                WorkerEvent::ChangedFilesReady {
+                                    watched,
+                                    quiet: !show_status,
+                                    staged,
+                                    unstaged,
+                                    base_update,
+                                }
+                            }
                             Err(err) => WorkerEvent::ChangedFilesFailed {
                                 watched,
                                 quiet: !show_status,
@@ -2994,13 +3075,6 @@ impl App {
                 .enumerate()
                 .filter(|(_, file)| file.path.to_lowercase().contains(&needle))
                 .map(|(index, _)| (RightSection::Unstaged, index)),
-        );
-        matches.extend(
-            self.staged_files
-                .iter()
-                .enumerate()
-                .filter(|(_, file)| file.path.to_lowercase().contains(&needle))
-                .map(|(index, _)| (RightSection::Staged, index)),
         );
         matches
     }

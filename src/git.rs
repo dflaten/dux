@@ -196,6 +196,100 @@ pub fn pull_branch(repo_path: &Path, branch: &str) -> Result<()> {
     pull_origin_branch(repo_path, branch)
 }
 
+pub fn rebase_onto(repo_path: &Path, base_ref: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rebase",
+            base_ref,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rebase {base_ref} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn rebase_onto_stashing_tracked_changes(repo_path: &Path, base_ref: &str) -> Result<()> {
+    let had_tracked_changes = has_tracked_changes(repo_path)?;
+    if had_tracked_changes {
+        let output = Command::new("git")
+            .args([
+                "-C",
+                repo_path.to_string_lossy().as_ref(),
+                "stash",
+                "push",
+                "-m",
+                "dux automatic stash before rebase",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git stash push before rebase failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    if let Err(err) = rebase_onto(repo_path, base_ref) {
+        if had_tracked_changes {
+            return Err(err.context(
+                "tracked changes were stashed before rebasing; run `git stash list` in the agent worktree to recover them",
+            ));
+        }
+        return Err(err);
+    }
+
+    if had_tracked_changes {
+        let output = Command::new("git")
+            .args(["-C", repo_path.to_string_lossy().as_ref(), "stash", "pop"])
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git stash pop after rebase failed: {}; tracked changes remain in the stash",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn ahead_behind(repo_path: &Path, left_ref: &str, right_ref: &str) -> Result<(usize, usize)> {
+    let range = format!("{left_ref}...{right_ref}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rev-list",
+            "--left-right",
+            "--count",
+            &range,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-list {range} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parts = stdout.split_whitespace();
+    let ahead = parts
+        .next()
+        .ok_or_else(|| anyhow!("git rev-list {range} did not report an ahead count"))?
+        .parse::<usize>()?;
+    let behind = parts
+        .next()
+        .ok_or_else(|| anyhow!("git rev-list {range} did not report a behind count"))?
+        .parse::<usize>()?;
+    Ok((ahead, behind))
+}
+
 pub fn switch_branch_if_needed(repo_path: &Path, branch: &str) -> Result<()> {
     let current = current_branch(repo_path)?;
     if current != branch {
@@ -1371,6 +1465,44 @@ mod tests {
     fn commit_all(cwd: &Path, message: &str) {
         run_git(cwd, &["add", "-A"]);
         run_git(cwd, &["commit", "-m", message]);
+    }
+
+    #[test]
+    fn ahead_behind_counts_base_commits_missing_from_branch() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "feature-behind");
+
+        fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+        commit_all(repo.path(), "main change");
+        fs::write(wt.join("feature.txt"), "feature\n").unwrap();
+        commit_all(&wt, "feature change");
+
+        let (ahead, behind) = ahead_behind(&wt, "HEAD", "main").unwrap();
+
+        assert_eq!(ahead, 1);
+        assert_eq!(behind, 1);
+    }
+
+    #[test]
+    fn rebase_onto_stashing_tracked_changes_restores_dirty_worktree() {
+        let repo = init_test_repo();
+        let wt = add_worktree(repo.path(), "feature-dirty");
+
+        fs::write(wt.join("feature.txt"), "clean\n").unwrap();
+        commit_all(&wt, "add feature file");
+        fs::write(repo.path().join("main.txt"), "main\n").unwrap();
+        commit_all(repo.path(), "main change");
+        fs::write(wt.join("feature.txt"), "dirty\n").unwrap();
+
+        rebase_onto_stashing_tracked_changes(&wt, "main").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(wt.join("feature.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(has_tracked_changes(&wt).unwrap());
+        let (_ahead, behind) = ahead_behind(&wt, "HEAD", "main").unwrap();
+        assert_eq!(behind, 0);
     }
 
     #[test]
