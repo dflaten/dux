@@ -26,9 +26,30 @@ impl SyntaxCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffLineKind {
+    FileHeader,
+    HunkHeader,
+    Context,
+    Added,
+    Removed,
+    Info,
+}
+
+/// Metadata for one logical diff line. Rendering may wrap one logical line
+/// into multiple visual rows, so mouse hit-testing maps visual rows back here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLineMeta {
+    pub kind: DiffLineKind,
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+    pub text: String,
+}
+
 /// Pre-rendered diff ready for display.
 pub struct DiffOutput {
     pub lines: Vec<Line<'static>>,
+    pub meta: Vec<DiffLineMeta>,
     /// Display-column width of the gutter (line numbers + separator + prefix).
     /// Zero when line numbers are disabled.
     pub gutter_width: usize,
@@ -75,6 +96,12 @@ pub fn diff_file_against_ref(
     if old_bytes == new_bytes {
         return Ok(DiffOutput {
             lines: vec![Line::from("No changes.")],
+            meta: vec![DiffLineMeta {
+                kind: DiffLineKind::Info,
+                old_line: None,
+                new_line: None,
+                text: "No changes.".to_string(),
+            }],
             gutter_width: 0,
         });
     }
@@ -105,6 +132,7 @@ pub fn diff_file_against_ref(
 
     let text_diff = TextDiff::from_lines(&old_text, &new_text);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut meta: Vec<DiffLineMeta> = Vec::new();
 
     // Compute gutter width from the maximum line number across all hunks.
     let ln_width = if show_line_numbers {
@@ -134,12 +162,24 @@ pub fn diff_file_against_ref(
             .fg(theme.diff_file_header)
             .add_modifier(Modifier::BOLD),
     )));
+    meta.push(DiffLineMeta {
+        kind: DiffLineKind::FileHeader,
+        old_line: None,
+        new_line: None,
+        text: format!("--- a/{rel_path}"),
+    });
     lines.push(Line::from(Span::styled(
         format!("+++ b/{rel_path}"),
         Style::default()
             .fg(theme.diff_file_header)
             .add_modifier(Modifier::BOLD),
     )));
+    meta.push(DiffLineMeta {
+        kind: DiffLineKind::FileHeader,
+        old_line: None,
+        new_line: None,
+        text: format!("+++ b/{rel_path}"),
+    });
 
     for hunk in text_diff.unified_diff().context_radius(3).iter_hunks() {
         // Hunk header (@@ ... @@).
@@ -155,6 +195,12 @@ pub fn diff_file_against_ref(
             Style::default().fg(theme.diff_hunk),
         ));
         lines.push(Line::from(hunk_spans));
+        meta.push(DiffLineMeta {
+            kind: DiffLineKind::HunkHeader,
+            old_line: None,
+            new_line: None,
+            text: hunk.header().to_string().trim_end().to_string(),
+        });
 
         // We maintain two separate highlighters so that removed lines are
         // highlighted in the context of the old file and added/context lines
@@ -236,12 +282,28 @@ pub fn diff_file_against_ref(
                 }
             };
             lines.push(Line::from(spans));
+            meta.push(DiffLineMeta {
+                kind: match tag {
+                    ChangeTag::Delete => DiffLineKind::Removed,
+                    ChangeTag::Insert => DiffLineKind::Added,
+                    ChangeTag::Equal => DiffLineKind::Context,
+                },
+                old_line: change.old_index().map(|idx| idx + 1),
+                new_line: change.new_index().map(|idx| idx + 1),
+                text: format!("{prefix}{content}"),
+            });
         }
     }
 
     if lines.len() <= 2 {
         // Only headers, no actual hunks (e.g. binary file or mode change).
         lines.push(Line::from("No text diff available."));
+        meta.push(DiffLineMeta {
+            kind: DiffLineKind::Info,
+            old_line: None,
+            new_line: None,
+            text: "No text diff available.".to_string(),
+        });
     }
 
     // Gutter width includes line numbers, separator, and the +/-/space prefix.
@@ -254,6 +316,7 @@ pub fn diff_file_against_ref(
 
     Ok(DiffOutput {
         lines,
+        meta,
         gutter_width,
     })
 }
@@ -268,25 +331,47 @@ fn binary_diff_output(
     new_size: usize,
     theme: &AppTheme,
 ) -> DiffOutput {
+    let text_lines = [
+        format!("--- a/{rel_path}"),
+        format!("+++ b/{rel_path}"),
+        "Binary file changed.".to_string(),
+        format!("Old size: {old_size} bytes"),
+        format!("New size: {new_size} bytes"),
+        "No text diff available for binary or non-UTF-8 content.".to_string(),
+    ];
     DiffOutput {
         lines: vec![
             Line::from(Span::styled(
-                format!("--- a/{rel_path}"),
+                text_lines[0].clone(),
                 Style::default()
                     .fg(theme.diff_file_header)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                format!("+++ b/{rel_path}"),
+                text_lines[1].clone(),
                 Style::default()
                     .fg(theme.diff_file_header)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from("Binary file changed."),
-            Line::from(format!("Old size: {old_size} bytes")),
-            Line::from(format!("New size: {new_size} bytes")),
-            Line::from("No text diff available for binary or non-UTF-8 content."),
+            Line::from(text_lines[2].clone()),
+            Line::from(text_lines[3].clone()),
+            Line::from(text_lines[4].clone()),
+            Line::from(text_lines[5].clone()),
         ],
+        meta: text_lines
+            .into_iter()
+            .enumerate()
+            .map(|(idx, text)| DiffLineMeta {
+                kind: if idx < 2 {
+                    DiffLineKind::FileHeader
+                } else {
+                    DiffLineKind::Info
+                },
+                old_line: None,
+                new_line: None,
+                text,
+            })
+            .collect(),
         gutter_width: 0,
     }
 }

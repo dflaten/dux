@@ -50,8 +50,12 @@ pub enum Action {
     EngageCommitInput,
     PushToRemote,
     PullFromRemote,
+    RebaseCurrentBranch,
     SearchFiles,
     SearchNext,
+    StartDiffSelection,
+    CaptureDiffComment,
+    SendDiffComments,
     // Commit message editor
     ExitCommitInput,
     // Global
@@ -245,8 +249,12 @@ impl Action {
             Action::EngageCommitInput => "engage_commit_input",
             Action::PushToRemote => "push_to_remote",
             Action::PullFromRemote => "pull_from_remote",
+            Action::RebaseCurrentBranch => "rebase_current_branch",
             Action::SearchFiles => "search_files",
             Action::SearchNext => "search_next",
+            Action::StartDiffSelection => "start_diff_selection",
+            Action::CaptureDiffComment => "capture_diff_comment",
+            Action::SendDiffComments => "send_diff_comments",
             Action::ExitCommitInput => "exit_commit_input",
             Action::FocusNext => "focus_next",
             Action::FocusPrev => "focus_prev",
@@ -366,8 +374,12 @@ impl Action {
             Action::EngageCommitInput => "Open the commit message editor.",
             Action::PushToRemote => "Push to remote.",
             Action::PullFromRemote => "Pull from remote.",
+            Action::RebaseCurrentBranch => "Rebase the selected agent branch onto its base branch.",
             Action::SearchFiles => "Start searching changed files in the files pane.",
             Action::SearchNext => "Jump to the next active search match in the files pane.",
+            Action::StartDiffSelection => "Start selecting lines in the open diff.",
+            Action::CaptureDiffComment => "Add a command for the selected diff lines.",
+            Action::SendDiffComments => "Send queued diff comments to the selected agent.",
             Action::ExitCommitInput => "Exit the commit message editor.",
             Action::FocusNext => "Focus the next pane.",
             Action::FocusPrev => "Focus the previous pane.",
@@ -484,7 +496,10 @@ impl Action {
             | Action::PushToRemote
             | Action::PullFromRemote
             | Action::SearchFiles
-            | Action::SearchNext => Some("Files pane"),
+            | Action::SearchNext
+            | Action::StartDiffSelection
+            | Action::CaptureDiffComment
+            | Action::SendDiffComments => Some("Files pane"),
             Action::ExitCommitInput => Some("Commit input"),
             Action::FocusNext
             | Action::FocusPrev
@@ -493,6 +508,7 @@ impl Action {
             | Action::ToggleSidebar
             | Action::ToggleGitPane
             | Action::RemoveGitPane
+            | Action::RebaseCurrentBranch
             | Action::ToggleHelp
             | Action::ForceRedraw
             | Action::Quit
@@ -1245,6 +1261,20 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: None,
     },
     BindingDef {
+        action: Action::RebaseCurrentBranch,
+        default_keys: &[key!(ctrl - r)],
+        scopes: &[BindingScope::Global],
+        help: Some(HelpEntry {
+            section: "Global",
+            description: "Rebase selected agent branch onto its base branch",
+        }),
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "rebase-current-branch",
+            description: "Rebase the selected agent branch onto its base branch",
+        }),
+    },
+    BindingDef {
         action: Action::SearchFiles,
         default_keys: &[KeyCombination::one_key(
             KeyCode::Char('/'),
@@ -1267,6 +1297,39 @@ pub const BINDING_DEFS: &[BindingDef] = &[
             description: "Jump to next search match",
         }),
         hint_contexts: &[(HintContext::Files, "Next match")],
+        palette: None,
+    },
+    BindingDef {
+        action: Action::StartDiffSelection,
+        default_keys: &[key!(shift - v)],
+        scopes: &[BindingScope::Center],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Start selecting lines in the open diff",
+        }),
+        hint_contexts: &[],
+        palette: None,
+    },
+    BindingDef {
+        action: Action::CaptureDiffComment,
+        default_keys: &[key!(ctrl - c)],
+        scopes: &[BindingScope::Center],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Add command for selected diff lines",
+        }),
+        hint_contexts: &[],
+        palette: None,
+    },
+    BindingDef {
+        action: Action::SendDiffComments,
+        default_keys: &[key!(ctrl - s)],
+        scopes: &[BindingScope::Center, BindingScope::Files],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Send queued diff comments to agent",
+        }),
+        hint_contexts: &[(HintContext::Files, "Send comments")],
         palette: None,
     },
     // ── Commit message editor ─────────────────────────────────────
@@ -1406,7 +1469,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     },
     BindingDef {
         action: Action::Quit,
-        default_keys: &[key!(q), key!(ctrl - c)],
+        default_keys: &[key!(q)],
         scopes: &[BindingScope::Global],
         help: Some(HelpEntry {
             section: "Global",
@@ -2413,6 +2476,16 @@ mod tests {
     }
 
     #[test]
+    fn global_scope_resolves_ctrl_r_to_rebase_current_branch() {
+        let bindings = default_bindings();
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(
+            bindings.lookup(&key, BindingScope::Global),
+            Some(Action::RebaseCurrentBranch)
+        );
+    }
+
+    #[test]
     fn lookup_ctrl_close_bracket_matches() {
         let bindings = default_bindings();
         // Crossterm delivers Ctrl+] as Char('5') + CONTROL (byte 0x1D maps
@@ -2446,7 +2519,7 @@ mod tests {
     fn labels_for_joins_multiple_keys() {
         let bindings = default_bindings();
         let labels = bindings.labels_for(Action::Quit);
-        assert_eq!(labels, "q/Ctrl-c");
+        assert_eq!(labels, "q");
     }
 
     #[test]

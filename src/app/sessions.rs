@@ -2367,12 +2367,15 @@ impl App {
         )?;
         self.center_mode = CenterMode::Diff {
             lines: Arc::new(output.lines),
+            meta: Arc::new(output.meta),
             scroll: 0,
             gutter_width: output.gutter_width,
             worktree_path,
             rel_path,
             base_ref,
         };
+        self.diff_cursor = 0;
+        self.diff_selection = None;
         self.focus = FocusPane::Center;
         Ok(())
     }
@@ -2405,6 +2408,7 @@ impl App {
         )?;
         self.center_mode = CenterMode::Diff {
             lines: Arc::new(output.lines),
+            meta: Arc::new(output.meta),
             scroll,
             gutter_width: output.gutter_width,
             worktree_path,
@@ -3063,6 +3067,7 @@ mod tests {
             create_agent_in_flight: false,
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
+            rebases_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),
@@ -3073,6 +3078,11 @@ mod tests {
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
+            last_diff_visual_map: Vec::new(),
+            diff_cursor: 0,
+            diff_selection: None,
+            queued_diff_comments: Vec::new(),
+            base_branch_updates: std::collections::HashMap::new(),
             theme: Theme::default_dark(),
             tick_count: 0,
             start_time: std::time::Instant::now(),

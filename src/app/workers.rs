@@ -7,7 +7,9 @@ impl App {
             .ok()
             .and_then(|guard| guard.clone())
             .is_some_and(|current| {
-                current.path == watched.path && current.base_ref == watched.base_ref
+                current.session_id == watched.session_id
+                    && current.path == watched.path
+                    && current.base_ref == watched.base_ref
             })
     }
 
@@ -30,10 +32,17 @@ impl App {
                     quiet,
                     staged,
                     unstaged,
+                    base_update,
                 } => {
                     if self.is_current_watched_worktree(&watched) {
                         self.staged_files = staged;
                         self.unstaged_files = unstaged;
+                        if let Some(update) = base_update {
+                            self.base_branch_updates
+                                .insert(watched.session_id.clone(), update);
+                        } else {
+                            self.base_branch_updates.remove(&watched.session_id);
+                        }
                         self.clamp_files_cursor();
                         if !quiet {
                             self.set_info(format!(
@@ -48,8 +57,11 @@ impl App {
                     quiet,
                     message,
                 } => {
-                    if self.is_current_watched_worktree(&watched) && !quiet {
-                        self.set_error(message);
+                    if self.is_current_watched_worktree(&watched) {
+                        self.base_branch_updates.remove(&watched.session_id);
+                        if !quiet {
+                            self.set_error(message);
+                        }
                     }
                 }
                 WorkerEvent::CommitMessageGenerated(msg) => {
@@ -132,6 +144,26 @@ impl App {
                             }
                             Err(e) => self.set_error(format!("Pull from remote failed: {e}")),
                         },
+                    }
+                }
+                WorkerEvent::RebaseCompleted {
+                    session_id,
+                    branch_name,
+                    base_ref,
+                    result,
+                } => {
+                    self.rebases_in_flight.remove(&session_id);
+                    match result {
+                        Ok(()) => {
+                            self.base_branch_updates.remove(&session_id);
+                            self.set_info(format!(
+                                "Rebased \"{branch_name}\" onto {base_ref}. Changes will refresh against the updated base."
+                            ));
+                            self.reload_changed_files();
+                        }
+                        Err(e) => self.set_error(format!(
+                            "Rebase failed for \"{branch_name}\" onto {base_ref}: {e}"
+                        )),
                     }
                 }
                 WorkerEvent::ClipboardCopyCompleted { label, result } => match result {
@@ -1650,6 +1682,18 @@ impl App {
                         Ok((staged, unstaged)) => {
                             if tx
                                 .send(WorkerEvent::ChangedFilesReady {
+                                    base_update: git::ahead_behind(
+                                        &watched_worktree.path,
+                                        "HEAD",
+                                        &watched_worktree.base_ref,
+                                    )
+                                    .ok()
+                                    .and_then(|(_, behind)| {
+                                        (behind > 0).then(|| BaseBranchUpdate {
+                                            base_ref: watched_worktree.base_ref.clone(),
+                                            commits: behind,
+                                        })
+                                    }),
                                     watched: watched_worktree,
                                     quiet: true,
                                     staged,

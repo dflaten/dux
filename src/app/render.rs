@@ -555,6 +555,24 @@ impl App {
                     Style::default().fg(self.theme.branch_fg).bg(bg),
                 ));
             }
+            if let Some(session) = self.selected_session()
+                && let Some(update) = self.base_branch_updates.get(&session.id)
+            {
+                let rebase_key = self.bindings.label_for(Action::RebaseCurrentBranch);
+                let commits = if update.commits == 1 {
+                    "1 new commit".to_string()
+                } else {
+                    format!("{} new commits", update.commits)
+                };
+                spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
+                spans.push(Span::styled(
+                    format!(
+                        "{} has {commits}; press {rebase_key} to rebase",
+                        update.base_ref
+                    ),
+                    Style::default().fg(self.theme.warning_fg).bg(bg),
+                ));
+            }
             let running_terminals = self.running_companion_terminal_count();
             if running_terminals > 0 {
                 spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
@@ -943,13 +961,14 @@ impl App {
     }
 
     fn render_diff(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        let (lines, scroll, gutter_width) = match &self.center_mode {
+        let (lines, meta, scroll, gutter_width) = match &self.center_mode {
             CenterMode::Diff {
                 lines,
+                meta,
                 scroll,
                 gutter_width,
                 ..
-            } => (Arc::clone(lines), *scroll, *gutter_width),
+            } => (Arc::clone(lines), Arc::clone(meta), *scroll, *gutter_width),
             _ => return,
         };
 
@@ -971,11 +990,45 @@ impl App {
         self.last_diff_height = content_area.height;
 
         let w = content_area.width.max(1) as usize;
+        let selected_range = self
+            .diff_selection
+            .as_ref()
+            .map(|selection| selection.ordered_range());
+        let selected_style = Style::default().bg(self.theme.selection_bg);
+        let display_lines = lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                if selected_range.is_some_and(|(start, end)| idx >= start && idx <= end) {
+                    Line::from(
+                        line.spans
+                            .iter()
+                            .map(|span| {
+                                let mut style = span.style;
+                                style = style.bg(self.theme.selection_bg);
+                                Span::styled(span.content.to_string(), style)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .style(selected_style)
+                } else {
+                    line.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        self.last_diff_visual_map.clear();
 
         if gutter_width > 0 {
             // Gutter-aware wrapping: continuation lines are indented to align
             // with the content column past the gutter.
-            let wrapped = crate::diff::wrap_diff_lines(&lines, w, gutter_width);
+            let mut wrapped = Vec::new();
+            for (logical_idx, line) in display_lines.iter().enumerate() {
+                let single = [line.clone()];
+                let mut visual = crate::diff::wrap_diff_lines(&single, w, gutter_width);
+                self.last_diff_visual_map
+                    .extend(std::iter::repeat_n(logical_idx, visual.len()));
+                wrapped.append(&mut visual);
+            }
             self.last_diff_visual_lines = wrapped.len() as u16;
 
             let max_scroll = self
@@ -988,11 +1041,15 @@ impl App {
                 .render(content_area, frame.buffer_mut());
         } else {
             // No gutter — fall back to ratatui's built-in wrapping.
-            self.last_diff_visual_lines = lines
+            self.last_diff_visual_lines = display_lines
                 .iter()
-                .map(|l| {
+                .enumerate()
+                .map(|(idx, l)| {
                     let lw = l.width();
-                    if lw <= w { 1u16 } else { lw.div_ceil(w) as u16 }
+                    let visual_count = if lw <= w { 1u16 } else { lw.div_ceil(w) as u16 };
+                    self.last_diff_visual_map
+                        .extend(std::iter::repeat_n(idx, visual_count as usize));
+                    visual_count
                 })
                 .sum();
 
@@ -1001,11 +1058,12 @@ impl App {
                 .saturating_sub(content_area.height);
             let scroll = scroll.min(max_scroll);
 
-            Paragraph::new((*lines).clone())
+            Paragraph::new(display_lines)
                 .wrap(Wrap { trim: false })
                 .scroll((scroll, 0))
                 .render(content_area, frame.buffer_mut());
         }
+        self.diff_cursor = self.diff_cursor.min(meta.len().saturating_sub(1));
 
         // Hint bar with top border (same style as agent terminal).
         if hint_area.height > 0 {
@@ -1014,13 +1072,11 @@ impl App {
             let scroll_up = self.bindings.labels_for(Action::ScrollPageUp);
             let scroll_line = self.bindings.label_for(Action::ScrollLineDown);
             let close = self.bindings.label_for(Action::CloseOverlay);
+            let select = self.bindings.label_for(Action::StartDiffSelection);
+            let comment = self.bindings.label_for(Action::CaptureDiffComment);
             let mut spans: Vec<Span> = Vec::new();
 
             if scroll > 0 {
-                spans.push(Span::styled(
-                    format!("Scrolled back {scroll} lines. "),
-                    Style::default().fg(self.theme.hint_key_fg),
-                ));
                 spans.extend(self.theme.dim_key_badge_default(&scroll_down));
                 spans.push(Span::styled(" down, ", desc_style));
                 spans.extend(self.theme.dim_key_badge_default(&scroll_up));
@@ -1037,6 +1093,11 @@ impl App {
             }
             spans.extend(self.theme.dim_key_badge_default(&close));
             spans.push(Span::styled(" close diff.", desc_style));
+            spans.push(Span::raw("  "));
+            spans.extend(self.theme.dim_key_badge_default(&select));
+            spans.push(Span::styled(" select. ", desc_style));
+            spans.extend(self.theme.dim_key_badge_default(&comment));
+            spans.push(Span::styled(" comment.", desc_style));
 
             Paragraph::new(Line::from(spans))
                 .block(
@@ -1503,10 +1564,6 @@ impl App {
             } else if scrollback_offset > 0 {
                 let desc_style = Style::default().fg(self.theme.hint_dim_desc_fg);
                 let mut spans: Vec<Span> = Vec::new();
-                spans.push(Span::styled(
-                    format!("Scrolled back {scrollback_offset} lines. "),
-                    Style::default().fg(self.theme.hint_key_fg),
-                ));
                 spans.extend(self.theme.dim_key_badge_default(&scroll_down));
                 spans.push(Span::styled(" down, ", desc_style));
                 spans.extend(self.theme.dim_key_badge_default(&scroll_up));
@@ -1610,29 +1667,33 @@ impl App {
             return;
         }
 
-        let has_staged = !self.staged_files.is_empty();
         let focused = self.focus == FocusPane::Files;
+        let session_id = self.selected_session().map(|session| session.id.as_str());
+        let queued_count = self
+            .queued_diff_comments
+            .iter()
+            .filter(|comment| Some(comment.session_id.as_str()) == session_id)
+            .count();
 
-        if has_staged {
-            let pct = self.staged_pane_height_pct.clamp(10, 80);
-            let unstaged_pct = 100u16.saturating_sub(pct).max(20);
-            let chunks = Layout::default()
+        if queued_count > 0 {
+            let comments_height = (queued_count as u16 + 2).clamp(4, area.height / 2).max(4);
+            let [files_area, comments_area] = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(unstaged_pct), // Changes (unstaged) — always on top
-                    Constraint::Percentage(pct),          // Staged Changes (with commit input)
-                ])
-                .split(area);
+                .constraints([Constraint::Min(1), Constraint::Length(comments_height)])
+                .areas(area);
             let list_rect = self.render_file_list(
                 frame,
-                chunks[0],
+                files_area,
                 "Changes",
                 &self.unstaged_files,
                 RightSection::Unstaged,
                 true,
             );
             self.mouse_layout.unstaged_list = Some(list_rect);
-            self.render_staged_with_commit(frame, chunks[1], focused);
+            self.mouse_layout.staged_list = None;
+            self.mouse_layout.commit_area = None;
+            self.mouse_layout.commit_text_area = None;
+            self.render_diff_comment_queue(frame, comments_area, focused);
         } else {
             let list_rect = self.render_file_list(
                 frame,
@@ -1643,11 +1704,80 @@ impl App {
                 true,
             );
             self.mouse_layout.unstaged_list = Some(list_rect);
+            self.mouse_layout.staged_list = None;
+            self.mouse_layout.commit_area = None;
+            self.mouse_layout.commit_text_area = None;
+        }
+    }
+
+    fn render_diff_comment_queue(&self, frame: &mut Frame, area: Rect, pane_focused: bool) {
+        let session_id = self.selected_session().map(|session| session.id.as_str());
+        let comments = self
+            .queued_diff_comments
+            .iter()
+            .filter(|comment| Some(comment.session_id.as_str()) == session_id)
+            .collect::<Vec<_>>();
+        let block = self.themed_block("Agent Comments", pane_focused);
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+
+        let send_key = self.bindings.label_for(Action::SendDiffComments);
+        let (list_area, hint_area) = if inner.height >= 3 {
+            let [list_area, hint_area] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .areas(inner);
+            (list_area, Some(hint_area))
+        } else {
+            (inner, None)
+        };
+
+        let width = list_area.width as usize;
+        let items = comments
+            .iter()
+            .map(|comment| {
+                let text = format!(
+                    "{}:{}-{} {}",
+                    comment.file_path,
+                    comment.start_line + 1,
+                    comment.end_line + 1,
+                    comment.command
+                );
+                let text = if text.chars().count() > width && width > 1 {
+                    format!(
+                        "{}…",
+                        text.chars()
+                            .take(width.saturating_sub(1))
+                            .collect::<String>()
+                    )
+                } else {
+                    text
+                };
+                ListItem::new(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(self.theme.hint_desc_fg),
+                )))
+            })
+            .collect::<Vec<_>>();
+        StatefulWidget::render(
+            List::new(items),
+            list_area,
+            frame.buffer_mut(),
+            &mut ListState::default(),
+        );
+
+        if let Some(hint_area) = hint_area {
+            let desc_style = Style::default().fg(self.theme.hint_dim_desc_fg);
+            let mut spans = Vec::new();
+            spans.extend(self.theme.dim_key_badge_default(&send_key));
+            spans.push(Span::styled(" Send all", desc_style));
+            Paragraph::new(Line::from(spans)).render(hint_area, frame.buffer_mut());
         }
     }
 
     /// Render the "Staged Changes" file list and the commit input as two
     /// separate bordered blocks (bubbles).
+    #[allow(dead_code)]
     fn render_staged_with_commit(&mut self, frame: &mut Frame, area: Rect, pane_focused: bool) {
         let commit_pct = self.commit_pane_height_pct.clamp(10, 80);
         let staged_pct = 100u16.saturating_sub(commit_pct).max(20);
@@ -1854,6 +1984,7 @@ impl App {
     }
 
     /// Render the commit input as its own bordered block.
+    #[allow(dead_code)]
     fn render_commit_input_inner(&mut self, frame: &mut Frame, area: Rect, pane_focused: bool) {
         self.mouse_layout.commit_area = Some(area);
         let is_active_section = pane_focused && self.right_section == RightSection::CommitInput;
@@ -2316,12 +2447,6 @@ impl App {
             let close = self.bindings.label_for(Action::CloseOverlay);
             let mut spans: Vec<Span> = Vec::new();
 
-            if scroll > 0 {
-                spans.push(Span::styled(
-                    format!("Scrolled back {scroll} lines. "),
-                    Style::default().fg(self.theme.hint_key_fg),
-                ));
-            }
             spans.extend(self.theme.dim_key_badge_default(&move_down));
             spans.push(Span::styled(" ", desc_style));
             spans.extend(self.theme.dim_key_badge_default(&move_up));
@@ -2450,6 +2575,67 @@ impl App {
                     items: commands.len(),
                     offset: state.offset(),
                 };
+            }
+            PromptState::DiffCommentInput {
+                file_path,
+                start_line,
+                end_line,
+                input,
+                ..
+            } => {
+                self.render_dim_overlay(frame);
+                let popup = centered_rect(70, 22, frame.area());
+                self.clear_overlay_area(frame, popup);
+                let block = self.themed_overlay_block("Agent Comment");
+                let inner = block.inner(popup);
+                block.render(popup, frame.buffer_mut());
+
+                let [label_area, input_area, hint_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(2),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
+                    .areas(inner);
+                let label = format!("{}:{}-{}", file_path, start_line + 1, end_line + 1);
+                Paragraph::new(label)
+                    .style(Style::default().fg(self.theme.hint_desc_fg))
+                    .render(label_area, frame.buffer_mut());
+
+                let input_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::default().fg(self.theme.border_normal));
+                let input_inner = input_block.inner(input_area);
+                input_block.render(input_area, frame.buffer_mut());
+                let text = if input.text.is_empty() {
+                    input.placeholder().unwrap_or("")
+                } else {
+                    input.text.as_str()
+                };
+                let style = if input.text.is_empty() {
+                    Style::default().fg(self.theme.hint_desc_fg)
+                } else {
+                    Style::default().fg(self.theme.text_fg)
+                };
+                Paragraph::new(text)
+                    .style(style)
+                    .render(input_inner, frame.buffer_mut());
+                let cursor_x = input_inner.x + input.cursor_display_position().1 as u16;
+                if cursor_x < input_inner.x + input_inner.width {
+                    frame.set_cursor_position((cursor_x, input_inner.y));
+                }
+
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let desc_style = Style::default().fg(self.theme.hint_dim_desc_fg);
+                let mut spans = Vec::new();
+                spans.extend(self.theme.dim_key_badge_default(&confirm_key));
+                spans.push(Span::styled(" Save  ", desc_style));
+                spans.extend(self.theme.dim_key_badge_default(&close_key));
+                spans.push(Span::styled(" Cancel", desc_style));
+                Paragraph::new(Line::from(spans)).render(hint_area, frame.buffer_mut());
             }
             PromptState::BrowseProjects {
                 current_dir,
