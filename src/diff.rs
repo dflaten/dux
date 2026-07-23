@@ -246,18 +246,19 @@ pub fn diff_file_against_ref(
                 spans.push(Span::styled("│", sep_style));
             }
 
-            match highlighter.highlight_line(&content, &cache.syntax_set) {
+            let highlight_content = format!("{content}\n");
+
+            match highlighter.highlight_line(&highlight_content, &cache.syntax_set) {
                 Ok(ranges) if tag == ChangeTag::Equal => {
                     // Context lines: full syntax colors, no background tint.
                     spans.push(Span::styled(
                         prefix.to_string(),
                         Style::default().fg(base_fg),
                     ));
-                    spans.extend(
-                        ranges
-                            .into_iter()
-                            .map(|(s, t)| Span::styled(t.to_string(), syntect_to_ratatui(s))),
-                    );
+                    spans.extend(ranges.into_iter().filter_map(|(s, t)| {
+                        highlighted_span_text(t)
+                            .map(|text| Span::styled(text, syntect_to_ratatui(s)))
+                    }));
                 }
                 Ok(ranges) => {
                     // Added/removed lines: syntax colors + tinted background.
@@ -265,12 +266,12 @@ pub fn diff_file_against_ref(
                         prefix.to_string(),
                         Style::default().fg(base_fg).bg(bg.unwrap_or(Color::Reset)),
                     ));
-                    spans.extend(ranges.into_iter().map(|(s, t)| {
+                    spans.extend(ranges.into_iter().filter_map(|(s, t)| {
                         let mut style = syntect_to_ratatui(s);
                         if let Some(bg_color) = bg {
                             style = style.bg(bg_color);
                         }
-                        Span::styled(t.to_string(), style)
+                        highlighted_span_text(t).map(|text| Span::styled(text, style))
                     }));
                 }
                 Err(_) => {
@@ -393,6 +394,15 @@ fn syntect_to_ratatui(style: SynStyle) -> Style {
         ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
     }
     ratatui_style
+}
+
+fn highlighted_span_text(text: &str) -> Option<String> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// Convert a syntect RGBA color to a ratatui `Color`, ignoring fully
@@ -799,6 +809,63 @@ mod tests {
         assert!(
             !insert_line.contains('\t'),
             "tab characters must not appear in rendered output"
+        );
+    }
+
+    #[test]
+    fn python_line_comment_does_not_style_following_line_as_comment() {
+        let dir = setup_text_repo(
+            "script.py",
+            "value = 1\n",
+            "value = 1\n# explain the output\nprint(value)\n",
+        );
+        let cache = SyntaxCache::new();
+        let output = diff_file(
+            dir.path(),
+            "script.py",
+            &AppTheme::default_dark(),
+            &cache,
+            false,
+            4,
+        )
+        .unwrap();
+
+        let comment_line = output
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("# explain"))
+            .expect("expected inserted Python comment line");
+        let print_line = output
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains("print(value)"))
+            .expect("expected inserted Python code after comment");
+
+        let comment_style = comment_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("explain"))
+            .expect("expected comment span")
+            .style;
+        let print_style = print_line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("print"))
+            .expect("expected print span")
+            .style;
+
+        for line in &output.lines {
+            for span in &line.spans {
+                assert!(
+                    !span.content.contains('\n'),
+                    "rendered diff spans must not contain synthetic newlines"
+                );
+            }
+        }
+
+        assert_ne!(
+            comment_style.fg, print_style.fg,
+            "Python code after a line comment must not inherit the comment foreground color"
         );
     }
 

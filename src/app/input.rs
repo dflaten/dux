@@ -432,16 +432,16 @@ impl App {
             ),
             "handle_key should not be called in interactive mode"
         );
-        if self.bindings.lookup(&key, BindingScope::Global) == Some(Action::CloseOverlay)
+        let is_close_overlay =
+            self.bindings.lookup(&key, BindingScope::Global) == Some(Action::CloseOverlay);
+        if is_close_overlay
+            && (self.help_scroll.is_some()
+                || matches!(
+                    self.fullscreen_overlay,
+                    FullscreenOverlay::Terminal | FullscreenOverlay::StartupLog
+                ))
             && self.close_top_overlay()
         {
-            return Ok(false);
-        }
-        if key.code == KeyCode::Esc
-            && self.focus == FocusPane::Files
-            && (self.files_search_active || self.has_files_search())
-        {
-            self.handle_files_key(key)?;
             return Ok(false);
         }
         if let Some(ref mut scroll) = self.help_scroll {
@@ -471,6 +471,27 @@ impl App {
                 // in other scopes).
                 *scroll = (*scroll + 1).min(max_help);
             }
+            return Ok(false);
+        }
+        if key.code == KeyCode::Esc
+            && self.focus == FocusPane::Files
+            && (self.files_search_active || self.has_files_search())
+        {
+            self.handle_files_key(key)?;
+            return Ok(false);
+        }
+        if is_close_overlay
+            && matches!(self.center_mode, CenterMode::Diff { .. })
+            && self.diff_selection.is_some()
+            && self.help_scroll.is_none()
+            && matches!(self.fullscreen_overlay, FullscreenOverlay::None)
+            && matches!(self.prompt, PromptState::None)
+        {
+            self.diff_selection = None;
+            self.set_info("Canceled diff line selection.");
+            return Ok(false);
+        }
+        if is_close_overlay && self.close_top_overlay() {
             return Ok(false);
         }
         // When typing a commit message, route all keys to the commit input
@@ -796,17 +817,28 @@ impl App {
             // semantics. Handle them here only while a diff is open.
             if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    KeyCode::Char('j') | KeyCode::Down if self.diff_selection.is_some() => {
                         self.move_diff_selection(true);
                         return Ok(());
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    KeyCode::Char('k') | KeyCode::Up if self.diff_selection.is_some() => {
                         self.move_diff_selection(false);
                         return Ok(());
                     }
-                    KeyCode::Esc if self.diff_selection.is_some() => {
-                        self.diff_selection = None;
-                        self.set_info("Canceled diff line selection.");
+                    KeyCode::Down => {
+                        self.move_diff_selection(true);
+                        return Ok(());
+                    }
+                    KeyCode::Up => {
+                        self.move_diff_selection(false);
+                        return Ok(());
+                    }
+                    KeyCode::Char('j') => {
+                        self.scroll_diff_lines(1);
+                        return Ok(());
+                    }
+                    KeyCode::Char('k') => {
+                        self.scroll_diff_lines(-1);
                         return Ok(());
                     }
                     _ => {}
@@ -854,11 +886,9 @@ impl App {
                     }
                 }
                 Action::ScrollPageDown => {
+                    let max_scroll = self.diff_max_scroll();
                     if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
                         let page = self.last_diff_height.max(1);
-                        let max_scroll = self
-                            .last_diff_visual_lines
-                            .saturating_sub(self.last_diff_height.max(1));
                         *scroll = (*scroll + page).min(max_scroll);
                     } else if self.last_pty_size.0 > 0 {
                         self.scroll_pty(ScrollDirection::Down, self.last_pty_size.0 as usize);
@@ -873,10 +903,8 @@ impl App {
                     }
                 }
                 Action::ScrollLineDown => {
+                    let max_scroll = self.diff_max_scroll();
                     if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
-                        let max_scroll = self
-                            .last_diff_visual_lines
-                            .saturating_sub(self.last_diff_height.max(1));
                         *scroll = (*scroll + 1).min(max_scroll);
                         self.sync_diff_cursor_to_scroll();
                     } else if self.last_pty_size.0 > 0 {
@@ -884,10 +912,8 @@ impl App {
                     }
                 }
                 Action::ScrollToBottom => {
+                    let max_scroll = self.diff_max_scroll();
                     if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
-                        let max_scroll = self
-                            .last_diff_visual_lines
-                            .saturating_sub(self.last_diff_height.max(1));
                         *scroll = max_scroll;
                     } else {
                         self.reset_pty_scrollback();
@@ -914,6 +940,18 @@ impl App {
         Ok(())
     }
 
+    fn scroll_diff_lines(&mut self, delta: i16) {
+        let max_scroll = self.diff_max_scroll();
+        if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
+            if delta.is_positive() {
+                *scroll = scroll.saturating_add(delta as u16).min(max_scroll);
+            } else {
+                *scroll = scroll.saturating_sub(delta.unsigned_abs());
+            }
+            self.sync_diff_cursor_to_scroll();
+        }
+    }
+
     fn sync_diff_cursor_to_scroll(&mut self) {
         let Some(line_index) = self
             .last_diff_visual_map
@@ -930,6 +968,19 @@ impl App {
             CenterMode::Diff { scroll, .. } => scroll,
             CenterMode::Agent => 0,
         }
+    }
+
+    fn diff_max_scroll(&self) -> u16 {
+        let visual_lines = if self.last_diff_visual_lines > 0 {
+            self.last_diff_visual_lines
+        } else {
+            match &self.center_mode {
+                CenterMode::Diff { lines, .. } => lines.len().min(u16::MAX as usize) as u16,
+                CenterMode::Agent => 0,
+            }
+        };
+
+        visual_lines.saturating_sub(self.last_diff_height.max(1))
     }
 
     fn diff_meta(&self) -> Option<Arc<Vec<crate::diff::DiffLineMeta>>> {
@@ -6221,12 +6272,10 @@ impl App {
 
     fn handle_center_mouse_wheel(&mut self, mouse: MouseEvent) {
         self.focus = FocusPane::Center;
+        let max_scroll = self.diff_max_scroll();
         if let CenterMode::Diff { ref mut scroll, .. } = self.center_mode {
             let delta = MOUSE_WHEEL_LINES as u16;
             if matches!(mouse.kind, MouseEventKind::ScrollDown) {
-                let max_scroll = self
-                    .last_diff_visual_lines
-                    .saturating_sub(self.last_diff_height.max(1));
                 *scroll = (*scroll + delta).min(max_scroll);
             } else if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                 *scroll = scroll.saturating_sub(delta);
@@ -9608,6 +9657,118 @@ not_a_real_action = ["x"]
     }
 
     #[test]
+    fn esc_clears_active_files_search_before_diff_selection() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Files;
+        app.right_section = RightSection::Unstaged;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+        app.unstaged_files = vec![ChangedFile {
+            path: "src/main.rs".into(),
+            status: "M".into(),
+            additions: 2,
+            deletions: 1,
+            binary: false,
+            branch_only: false,
+        }];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for ch in ['m', 'a', 'i', 'n'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!app.files_search_active);
+        assert!(app.files_search.is_empty());
+        assert!(app.diff_selection.is_some());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+    }
+
+    #[test]
+    fn esc_clears_inactive_files_search_before_diff_selection() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Files;
+        app.right_section = RightSection::Unstaged;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+        app.unstaged_files = vec![ChangedFile {
+            path: "src/main.rs".into(),
+            status: "M".into(),
+            additions: 2,
+            deletions: 1,
+            binary: false,
+            branch_only: false,
+        }];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for ch in ['m', 'a', 'i', 'n'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!app.files_search_active);
+        assert!(app.files_search.is_empty());
+        assert!(app.diff_selection.is_some());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+    }
+
+    #[test]
+    fn esc_closes_help_before_active_files_search_and_diff_selection() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Files;
+        app.right_section = RightSection::Unstaged;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+        app.unstaged_files = vec![ChangedFile {
+            path: "src/main.rs".into(),
+            status: "M".into(),
+            additions: 2,
+            deletions: 1,
+            binary: false,
+            branch_only: false,
+        }];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for ch in ['m', 'a', 'i', 'n'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.help_scroll = Some(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.help_scroll.is_none());
+        assert!(app.files_search_active);
+        assert_eq!(app.files_search.text, "main");
+        assert!(app.diff_selection.is_some());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+    }
+
+    #[test]
     fn enter_opens_selected_file_diff_from_files_pane() {
         let mut app = test_app(default_bindings());
         init_git_repo_with_modified_file(
@@ -10034,6 +10195,186 @@ not_a_real_action = ["x"]
             CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 3),
             _ => panic!("expected diff mode"),
         }
+    }
+
+    #[test]
+    fn keyboard_diff_scroll_uses_logical_lines_before_first_render() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .expect("scroll diff");
+
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 1),
+            _ => panic!("expected diff mode"),
+        }
+    }
+
+    #[test]
+    fn keyboard_diff_scroll_to_bottom_uses_logical_lines_before_first_render() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .expect("scroll diff to bottom");
+
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 2),
+            _ => panic!("expected diff mode"),
+        }
+    }
+
+    #[test]
+    fn render_clamps_pre_render_diff_scroll_back_to_stored_state() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .expect("scroll diff to bottom");
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 2),
+            _ => panic!("expected diff mode"),
+        }
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render diff");
+
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 0),
+            _ => panic!("expected diff mode"),
+        }
+    }
+
+    #[test]
+    fn jk_scroll_diff_when_no_selection_is_active() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three", "four", "five"]);
+        app.focus = FocusPane::Center;
+        app.last_diff_height = 2;
+        app.last_diff_visual_lines = 5;
+        app.last_diff_visual_map = vec![0, 1, 2, 3, 4];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .expect("scroll diff down");
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 1),
+            _ => panic!("expected diff mode"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .expect("scroll diff up");
+        match app.center_mode {
+            CenterMode::Diff { scroll, .. } => assert_eq!(scroll, 0),
+            _ => panic!("expected diff mode"),
+        }
+        assert!(app.diff_selection.is_none());
+    }
+
+    #[test]
+    fn arrows_move_diff_cursor_before_selection_starts() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+        app.last_diff_height = 2;
+        app.last_diff_visual_lines = 3;
+        app.last_diff_visual_map = vec![0, 1, 2];
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move cursor down");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("move cursor down again");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("move cursor up");
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .expect("start selection");
+
+        let selection = app.diff_selection.expect("selection");
+        assert_eq!(selection.anchor, 1);
+        assert_eq!(selection.cursor, 1);
+    }
+
+    #[test]
+    fn esc_cancels_active_diff_selection_without_closing_diff() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel diff selection");
+
+        assert!(app.diff_selection.is_none());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+    }
+
+    #[test]
+    fn esc_closes_diff_when_no_selection_is_active() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close diff");
+
+        assert!(app.diff_selection.is_none());
+        assert!(matches!(app.center_mode, CenterMode::Agent));
+    }
+
+    #[test]
+    fn esc_closes_help_before_canceling_diff_selection() {
+        let mut app = test_app(default_bindings());
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+        app.help_scroll = Some(0);
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close help overlay");
+
+        assert!(app.help_scroll.is_none());
+        assert!(app.diff_selection.is_some());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+    }
+
+    #[test]
+    fn diff_selection_cancel_uses_configured_close_overlay_key() {
+        let bindings = bindings_with_overrides(&[(Action::CloseOverlay, &["x"])]);
+        let mut app = test_app(bindings);
+        open_fake_diff_with_lines(&mut app, &["one", "two", "three"]);
+        app.focus = FocusPane::Center;
+        app.diff_selection = Some(DiffSelectionState {
+            anchor: 0,
+            cursor: 1,
+            dragging: false,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("unbound esc should not cancel diff selection");
+        assert!(app.diff_selection.is_some());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .expect("configured close key should cancel diff selection");
+        assert!(app.diff_selection.is_none());
+        assert!(matches!(app.center_mode, CenterMode::Diff { .. }));
     }
 
     fn open_fake_diff(app: &mut App) {

@@ -1035,6 +1035,13 @@ impl App {
                 .last_diff_visual_lines
                 .saturating_sub(content_area.height);
             let scroll = scroll.min(max_scroll);
+            if let CenterMode::Diff {
+                scroll: stored_scroll,
+                ..
+            } = &mut self.center_mode
+            {
+                *stored_scroll = scroll;
+            }
 
             Paragraph::new(wrapped)
                 .scroll((scroll, 0))
@@ -1057,6 +1064,13 @@ impl App {
                 .last_diff_visual_lines
                 .saturating_sub(content_area.height);
             let scroll = scroll.min(max_scroll);
+            if let CenterMode::Diff {
+                scroll: stored_scroll,
+                ..
+            } = &mut self.center_mode
+            {
+                *stored_scroll = scroll;
+            }
 
             Paragraph::new(display_lines)
                 .wrap(Wrap { trim: false })
