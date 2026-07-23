@@ -196,6 +196,47 @@ pub fn pull_branch(repo_path: &Path, branch: &str) -> Result<()> {
     pull_origin_branch(repo_path, branch)
 }
 
+pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "fetch",
+            "--quiet",
+            "origin",
+            branch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git fetch origin {branch} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub fn remote_tracking_ref_for_branch(repo_path: &Path, branch: &str) -> Option<String> {
+    let remote_ref = format!("origin/{branch}");
+    let verify_ref = format!("{remote_ref}^{{commit}}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &verify_ref,
+        ])
+        .output()
+        .ok()?;
+    output.status.success().then_some(remote_ref)
+}
+
+pub fn preferred_rebase_base_ref(repo_path: &Path, base_ref: &str) -> String {
+    remote_tracking_ref_for_branch(repo_path, base_ref).unwrap_or_else(|| base_ref.to_string())
+}
+
 pub fn rebase_onto(repo_path: &Path, base_ref: &str) -> Result<()> {
     let output = Command::new("git")
         .args([
@@ -2329,6 +2370,40 @@ mod tests {
         run(clone, &["clone", bare.to_str().unwrap(), "."]);
 
         assert_eq!(remote_default_branch(clone), Some("main".to_string()),);
+    }
+
+    #[test]
+    fn fetch_origin_branch_updates_remote_tracking_base_ref() {
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = bare_dir.path();
+        run_git(bare, &["init", "--bare", "-b", "main"]);
+
+        let staging_dir = tempfile::tempdir().unwrap();
+        let staging = staging_dir.path();
+        run_git(staging, &["clone", bare.to_str().unwrap(), "."]);
+        run_git(staging, &["config", "user.name", "test"]);
+        run_git(staging, &["config", "user.email", "t@t"]);
+        fs::write(staging.join("file.txt"), "one\n").unwrap();
+        commit_all(staging, "initial");
+        run_git(staging, &["push", "origin", "main"]);
+
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = clone_dir.path();
+        run_git(clone, &["clone", bare.to_str().unwrap(), "."]);
+
+        fs::write(staging.join("file.txt"), "two\n").unwrap();
+        commit_all(staging, "remote update");
+        run_git(staging, &["push", "origin", "main"]);
+
+        fetch_origin_branch(clone, "main").unwrap();
+
+        assert_eq!(
+            remote_tracking_ref_for_branch(clone, "main").as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(preferred_rebase_base_ref(clone, "main"), "origin/main");
+        let (_ahead, behind) = ahead_behind(clone, "HEAD", "origin/main").unwrap();
+        assert_eq!(behind, 1);
     }
 
     // ── switch_branch tests ──────────────────────────────────────

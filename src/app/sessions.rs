@@ -410,10 +410,13 @@ impl App {
         self.set_busy(busy_message);
         let paths = self.paths.clone();
         let config = self.config.clone();
+        let sessions = self.sessions.clone();
         let worker_tx = self.worker_tx.clone();
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
         thread::spawn(move || {
-            super::workers::run_create_agent_job(request, paths, config, worker_tx, term_size);
+            super::workers::run_create_agent_job(
+                request, paths, config, sessions, worker_tx, term_size,
+            );
         });
         Ok(())
     }

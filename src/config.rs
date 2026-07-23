@@ -213,6 +213,7 @@ pub struct UiConfig {
     pub commit_pane_height_pct: u16,
     pub agent_scrollback_lines: usize,
     pub branch_sync_interval: u16,
+    pub base_branch_fetch_interval: u16,
     pub show_diff_line_numbers: bool,
     pub diff_tab_width: u16,
     pub github_integration: bool,
@@ -243,6 +244,7 @@ impl Default for Config {
                 commit_pane_height_pct: 40,
                 agent_scrollback_lines: 10_000,
                 branch_sync_interval: 30,
+                base_branch_fetch_interval: 300,
                 show_diff_line_numbers: false,
                 diff_tab_width: 4,
                 github_integration: true,
@@ -381,6 +383,7 @@ impl Default for UiConfig {
             commit_pane_height_pct: 40,
             agent_scrollback_lines: 10_000,
             branch_sync_interval: 30,
+            base_branch_fetch_interval: 300,
             show_diff_line_numbers: false,
             diff_tab_width: 4,
             github_integration: true,
@@ -869,6 +872,13 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::U16(c.ui.branch_sync_interval),
         },
         ConfigEntry::Field {
+            key: "base_branch_fetch_interval",
+            comment: Some(CommentSource::Static(
+                "# Interval in seconds for fetching the selected agent's base branch from origin.\n# This keeps the rebase banner aware of remote main/default-branch commits.\n# Set to 0 to disable remote fetch polling.",
+            )),
+            value_fn: |c| FieldValue::U16(c.ui.base_branch_fetch_interval),
+        },
+        ConfigEntry::Field {
             key: "show_diff_line_numbers",
             comment: Some(CommentSource::Static(
                 "# Show old/new line numbers in the diff gutter.\n# Toggle at runtime from the command palette.",
@@ -1109,6 +1119,12 @@ pub fn save_config(
         "ui",
         "branch_sync_interval",
         config.ui.branch_sync_interval,
+    );
+    patch_table_u16(
+        &mut doc,
+        "ui",
+        "base_branch_fetch_interval",
+        config.ui.base_branch_fetch_interval,
     );
     patch_table_bool(
         &mut doc,
@@ -2214,6 +2230,7 @@ mod tests {
         assert!(rendered.contains("args = [\"-l\", \"-c\"]"));
         assert!(rendered.contains("[ui]"));
         assert!(rendered.contains("agent_scrollback_lines = 10000"));
+        assert!(rendered.contains("base_branch_fetch_interval = 300"));
         assert!(rendered.contains("empty_project_separator_min_projects = 5"));
         assert!(rendered.contains("auto_reopen_agents = false"));
         assert!(rendered.contains("staged_pane_height_pct = "));
@@ -2315,6 +2332,22 @@ enable_randomized_pet_name_by_default = false
     }
 
     #[test]
+    fn old_config_missing_base_branch_fetch_interval_defaults_to_five_minutes() {
+        let parsed: Config = toml::from_str(
+            r#"
+[defaults]
+provider = "claude"
+
+[ui]
+branch_sync_interval = 30
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(parsed.ui.base_branch_fetch_interval, 300);
+    }
+
+    #[test]
     fn old_config_missing_startup_command_terminal_uses_portable_default() {
         let parsed: Config = toml::from_str(
             r#"
@@ -2381,6 +2414,15 @@ name = "test"
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert_eq!(parsed.ui.agent_scrollback_lines, 12_345);
+    }
+
+    #[test]
+    fn default_config_round_trips_base_branch_fetch_interval() {
+        let mut config = Config::default();
+        config.ui.base_branch_fetch_interval = 0;
+        let rendered = render_config_default(&config);
+        let parsed: Config = toml::from_str(&rendered).expect("config should parse");
+        assert_eq!(parsed.ui.base_branch_fetch_interval, 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ impl App {
                 current.session_id == watched.session_id
                     && current.path == watched.path
                     && current.base_ref == watched.base_ref
+                    && current.fetch_branch == watched.fetch_branch
             })
     }
 
@@ -161,9 +162,21 @@ impl App {
                             ));
                             self.reload_changed_files();
                         }
-                        Err(e) => self.set_error(format!(
-                            "Rebase failed for \"{branch_name}\" onto {base_ref}: {e}"
-                        )),
+                        Err(e) => {
+                            let status = format!(
+                                "Rebase failed for \"{branch_name}\" onto {base_ref}: {e}"
+                            );
+                            let prompt =
+                                super::input::build_rebase_failed_prompt(&branch_name, &base_ref, &e);
+                            match self.send_prompt_to_agent(&session_id, &prompt, true) {
+                                Ok(()) => self.set_error(format!(
+                                    "{status}. Sent the error details to the agent to resolve."
+                                )),
+                                Err(send_err) => self.set_error(format!(
+                                    "{status}. Agent was not available for automatic resolution: {send_err}."
+                                )),
+                            }
+                        }
                     }
                 }
                 WorkerEvent::ClipboardCopyCompleted { label, result } => match result {
@@ -1682,18 +1695,10 @@ impl App {
                         Ok((staged, unstaged)) => {
                             if tx
                                 .send(WorkerEvent::ChangedFilesReady {
-                                    base_update: git::ahead_behind(
+                                    base_update: base_branch_update_for(
                                         &watched_worktree.path,
-                                        "HEAD",
                                         &watched_worktree.base_ref,
-                                    )
-                                    .ok()
-                                    .and_then(|(_, behind)| {
-                                        (behind > 0).then(|| BaseBranchUpdate {
-                                            base_ref: watched_worktree.base_ref.clone(),
-                                            commits: behind,
-                                        })
-                                    }),
+                                    ),
                                     watched: watched_worktree,
                                     quiet: true,
                                     staged,
@@ -1717,6 +1722,85 @@ impl App {
                             {
                                 break;
                             }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_base_branch_fetch_poller(&self) {
+        let interval_secs = self.config.ui.base_branch_fetch_interval;
+        if interval_secs == 0 {
+            return;
+        }
+        let tx = self.worker_tx.clone();
+        let watched = Arc::clone(&self.watched_worktree);
+        thread::spawn(move || {
+            let interval = Duration::from_secs(u64::from(interval_secs));
+            loop {
+                thread::sleep(interval);
+                let watched_worktree = watched.lock().ok().and_then(|guard| guard.clone());
+                let Some(watched_worktree) = watched_worktree else {
+                    continue;
+                };
+                if let Err(err) =
+                    git::fetch_origin_branch(&watched_worktree.path, &watched_worktree.fetch_branch)
+                {
+                    logger::warn(&format!(
+                        "base branch fetch failed for {} from origin/{}: {err:#}",
+                        watched_worktree.path.display(),
+                        watched_worktree.fetch_branch
+                    ));
+                    continue;
+                }
+                let mut refreshed_watch = watched_worktree.clone();
+                refreshed_watch.base_ref = git::preferred_rebase_base_ref(
+                    &refreshed_watch.path,
+                    &refreshed_watch.fetch_branch,
+                );
+                if let Ok(mut guard) = watched.lock()
+                    && guard.as_ref().is_some_and(|current| {
+                        current.session_id == refreshed_watch.session_id
+                            && current.path == refreshed_watch.path
+                            && current.fetch_branch == refreshed_watch.fetch_branch
+                    })
+                {
+                    *guard = Some(refreshed_watch.clone());
+                }
+                match git::changed_files_against_base(
+                    &refreshed_watch.path,
+                    &refreshed_watch.base_ref,
+                ) {
+                    Ok((staged, unstaged)) => {
+                        if tx
+                            .send(WorkerEvent::ChangedFilesReady {
+                                base_update: base_branch_update_for(
+                                    &refreshed_watch.path,
+                                    &refreshed_watch.base_ref,
+                                ),
+                                watched: refreshed_watch,
+                                quiet: true,
+                                staged,
+                                unstaged,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if tx
+                            .send(WorkerEvent::ChangedFilesFailed {
+                                watched: refreshed_watch,
+                                quiet: true,
+                                message: format!(
+                                    "Failed to refresh changes after fetching base branch: {err}"
+                                ),
+                            })
+                            .is_err()
+                        {
+                            break;
                         }
                     }
                 }
@@ -2043,10 +2127,164 @@ pub(crate) fn run_pull_request_lookup_job(
     let _ = worker_tx.send(WorkerEvent::PullRequestResolved { result });
 }
 
+type CreateAgentWorktreeResult = (String, String, String, PathBuf, bool, Option<String>, bool);
+
+fn existing_worktree_request_for_branch(
+    project: &Project,
+    paths: &DuxPaths,
+    sessions: &[AgentSession],
+    branch_name: &str,
+) -> Option<CreateAgentRequest> {
+    let worktrees = git::list_worktrees(Path::new(&project.path)).ok()?;
+    let entry = classify_project_worktrees(project, paths, sessions, worktrees)
+        .into_iter()
+        .find(|entry| entry.branch_name == branch_name && entry.is_selectable)?;
+    if entry.is_external {
+        Some(CreateAgentRequest::ForkExternalWorktree {
+            project: project.clone(),
+            source_worktree_path: entry.path.clone(),
+            source_label: entry.display_name(),
+            source_branch: entry.branch_name.clone(),
+            custom_name: Some(branch_name.to_string()),
+        })
+    } else {
+        let managed_root = paths.worktrees_root.join(&project.name);
+        let default_name = entry
+            .path
+            .strip_prefix(&managed_root)
+            .ok()
+            .map(|relative| relative.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| entry.display_name());
+        Some(CreateAgentRequest::ExistingManagedWorktree {
+            project: project.clone(),
+            worktree_path: entry.path.clone(),
+            branch_name: entry.branch_name,
+            custom_name: Some(default_name),
+        })
+    }
+}
+
+fn create_agent_worktree_from_existing_request(
+    request: CreateAgentRequest,
+    paths: &DuxPaths,
+    worker_tx: &Sender<WorkerEvent>,
+) -> Option<CreateAgentWorktreeResult> {
+    match request {
+        CreateAgentRequest::ExistingManagedWorktree {
+            project,
+            worktree_path,
+            branch_name,
+            custom_name,
+        } => {
+            let agent_name = custom_name.clone().unwrap_or_else(|| branch_name.clone());
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Launching {} in existing worktree \"{}\"...",
+                project.default_provider.as_str(),
+                worktree_path.display(),
+            )));
+            let status_message = format!(
+                "Imported {} agent \"{}\" from existing managed worktree for project \"{}\".",
+                project.default_provider.as_str(),
+                agent_name,
+                project.name
+            );
+            Some((
+                branch_name.clone(),
+                status_message,
+                branch_name,
+                worktree_path,
+                false,
+                custom_name,
+                true,
+            ))
+        }
+        CreateAgentRequest::ForkExternalWorktree {
+            project,
+            source_worktree_path,
+            source_label,
+            source_branch,
+            custom_name,
+        } => {
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Creating a managed worktree from external worktree \"{source_label}\"...",
+            )));
+            let source_head = match git::head_commit(&source_worktree_path) {
+                Ok(head) => head,
+                Err(err) => {
+                    logger::error(&format!(
+                        "failed to resolve HEAD for {}: {err}",
+                        source_worktree_path.display()
+                    ));
+                    let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                        "Failed to inspect external worktree \"{source_label}\": {err}",
+                    )));
+                    return None;
+                }
+            };
+            let repo_path = PathBuf::from(&project.path);
+            let (branch_name, worktree_path) = match git::create_worktree_from_start_point(
+                &repo_path,
+                &paths.worktrees_root,
+                &project.name,
+                Some(&source_head),
+                custom_name.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    logger::error(&format!(
+                        "external worktree fork creation failed for {}: {err}",
+                        project.path
+                    ));
+                    let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                        "Failed to create a managed worktree from external worktree \"{source_label}\": {err}",
+                    )));
+                    return None;
+                }
+            };
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Copying dirty and untracked files from external worktree \"{source_label}\"...",
+            )));
+            if let Err(err) = git::mirror_worktree_contents(&source_worktree_path, &worktree_path) {
+                logger::error(&format!(
+                    "failed to mirror external worktree {} into {}: {err}",
+                    source_worktree_path.display(),
+                    worktree_path.display()
+                ));
+                let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+                let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                    "Failed to copy external worktree contents from \"{source_label}\": {err}",
+                )));
+                return None;
+            }
+            let status_message = format!(
+                "Created {} agent \"{}\" from external worktree \"{}\" in project \"{}\". Dirty and untracked files were copied into the managed worktree.",
+                project.default_provider.as_str(),
+                branch_name,
+                source_label,
+                project.name
+            );
+            Some((
+                source_branch,
+                status_message,
+                branch_name,
+                worktree_path,
+                true,
+                None,
+                false,
+            ))
+        }
+        CreateAgentRequest::NewProject { .. }
+        | CreateAgentRequest::PullRequest { .. }
+        | CreateAgentRequest::ForkSession { .. } => None,
+    }
+}
+
 pub(crate) fn run_create_agent_job(
     request: CreateAgentRequest,
     paths: DuxPaths,
     config: Config,
+    sessions: Vec<AgentSession>,
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
 ) {
@@ -2134,14 +2372,49 @@ pub(crate) fn run_create_agent_job(
             };
             let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(progress));
 
-            let (branch_name, worktree_path) = if attach_existing {
+            let existing_worktree = attach_existing.then(|| {
+                existing_worktree_request_for_branch(&project, &paths, &sessions, &resolved_name)
+            });
+
+            let (
+                source_branch,
+                status_message,
+                branch_name,
+                worktree_path,
+                owns_worktree,
+                title,
+                launch_with_resume,
+            ) = if let Some(Some(existing_request)) = existing_worktree {
+                match create_agent_worktree_from_existing_request(
+                    existing_request,
+                    &paths,
+                    &worker_tx,
+                ) {
+                    Some(result) => result,
+                    None => return,
+                }
+            } else if attach_existing {
                 match git::create_worktree_existing_branch(
                     &repo_path,
                     &paths.worktrees_root,
                     &project.name,
                     &resolved_name,
                 ) {
-                    Ok(result) => result,
+                    Ok((branch_name, worktree_path)) => {
+                        let status_message = format!(
+                            "Attached to existing branch \"{}\" in project \"{}\". The worktree is ready in a fresh session.",
+                            branch_name, project.name
+                        );
+                        (
+                            project.current_branch.clone(),
+                            status_message,
+                            branch_name,
+                            worktree_path,
+                            true,
+                            None,
+                            false,
+                        )
+                    }
                     Err(err) => {
                         logger::error(&format!(
                             "worktree creation (existing branch) failed for {}: {err}",
@@ -2162,7 +2435,23 @@ pub(crate) fn run_create_agent_job(
                     Some(&leading_branch),
                     Some(&resolved_name),
                 ) {
-                    Ok(result) => result,
+                    Ok((branch_name, worktree_path)) => {
+                        let status_message = format!(
+                            "Created {} agent \"{}\" in project \"{}\". The new worktree is ready in a fresh session.",
+                            project.default_provider.as_str(),
+                            branch_name,
+                            project.name
+                        );
+                        (
+                            leading_branch,
+                            status_message,
+                            branch_name,
+                            worktree_path,
+                            true,
+                            None,
+                            false,
+                        )
+                    }
                     Err(err) => {
                         logger::error(&format!(
                             "worktree creation failed for {}: {err}",
@@ -2176,33 +2465,16 @@ pub(crate) fn run_create_agent_job(
                     }
                 }
             };
-            let status_message = if attach_existing {
-                format!(
-                    "Attached to existing branch \"{}\" in project \"{}\". The worktree is ready in a fresh session.",
-                    branch_name, project.name
-                )
-            } else {
-                format!(
-                    "Created {} agent \"{}\" in project \"{}\". The new worktree is ready in a fresh session.",
-                    project.default_provider.as_str(),
-                    branch_name,
-                    project.name
-                )
-            };
             (
                 project.clone(),
                 project.default_provider.clone(),
-                if attach_existing {
-                    project.current_branch.clone()
-                } else {
-                    leading_branch
-                },
+                source_branch,
                 status_message,
                 branch_name,
                 worktree_path,
-                true,
-                None,
-                false,
+                owns_worktree,
+                title,
+                launch_with_resume,
             )
         }
         CreateAgentRequest::PullRequest {
@@ -3082,6 +3354,142 @@ mod tests {
         }
     }
 
+    fn test_project(repo: &Path) -> Project {
+        Project {
+            id: "project-1".to_string(),
+            name: "demo".to_string(),
+            path: repo.to_string_lossy().to_string(),
+            explicit_default_provider: None,
+            default_provider: ProviderKind::from_str("codex"),
+            leading_branch: Some("main".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "main".to_string(),
+            branch_status: ProjectBranchStatus::Unknown,
+            path_missing: false,
+        }
+    }
+
+    fn test_paths(root: &Path) -> DuxPaths {
+        DuxPaths {
+            config_path: root.join("config.toml"),
+            sessions_db_path: root.join("sessions.sqlite3"),
+            worktrees_root: root.join("worktrees"),
+            lock_path: root.join("dux.lock"),
+            root: root.to_path_buf(),
+        }
+    }
+
+    fn init_repo_with_branch(repo: &Path, branch: &str) {
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.name", "test"]);
+        run_git(repo, &["config", "user.email", "t@t"]);
+        run_git(repo, &["commit", "--allow-empty", "-m", "init"]);
+        run_git(repo, &["branch", branch]);
+    }
+
+    #[test]
+    fn existing_branch_confirm_uses_selectable_managed_worktree() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "reuse-me");
+        let paths = test_paths(tmp.path());
+        let worktree_path = paths.worktrees_root.join("demo").join("reuse-me");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "reuse-me",
+            ],
+        );
+        let project = test_project(&repo);
+
+        let request = existing_worktree_request_for_branch(&project, &paths, &[], "reuse-me")
+            .expect("existing worktree request");
+
+        match request {
+            CreateAgentRequest::ExistingManagedWorktree {
+                worktree_path: selected_path,
+                branch_name,
+                custom_name,
+                ..
+            } => {
+                assert_eq!(selected_path, worktree_path.canonicalize().unwrap());
+                assert_eq!(branch_name, "reuse-me");
+                assert_eq!(custom_name.as_deref(), Some("reuse-me"));
+            }
+            other => panic!("expected managed worktree request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_branch_confirm_preserves_branch_name_for_external_worktree() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "feature");
+        let paths = test_paths(tmp.path());
+        let worktree_path = tmp.path().join("repo-copy");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "feature",
+            ],
+        );
+        let project = test_project(&repo);
+
+        let request = existing_worktree_request_for_branch(&project, &paths, &[], "feature")
+            .expect("existing worktree request");
+
+        match request {
+            CreateAgentRequest::ForkExternalWorktree {
+                source_worktree_path,
+                source_label,
+                source_branch,
+                custom_name,
+                ..
+            } => {
+                assert_eq!(source_worktree_path, worktree_path.canonicalize().unwrap());
+                assert_eq!(source_label, "repo-copy");
+                assert_eq!(source_branch, "feature");
+                assert_eq!(custom_name.as_deref(), Some("feature"));
+            }
+            other => panic!("expected external worktree request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn existing_branch_confirm_ignores_worktree_that_already_has_agent() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "reuse-me");
+        let paths = test_paths(tmp.path());
+        let worktree_path = paths.worktrees_root.join("demo").join("reuse-me");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "reuse-me",
+            ],
+        );
+        let project = test_project(&repo);
+        let sessions = vec![test_session(&worktree_path)];
+
+        assert!(
+            existing_worktree_request_for_branch(&project, &paths, &sessions, "reuse-me").is_none()
+        );
+    }
+
     #[test]
     fn launch_job_fails_before_pty_when_provider_command_is_missing() {
         let tmp = tempdir().expect("tempdir");
@@ -3184,12 +3592,13 @@ mod tests {
         run_create_agent_job(
             CreateAgentRequest::ForkSession {
                 project,
-                source_session: Box::new(source_session),
+                source_session: Box::new(source_session.clone()),
                 source_label: "agent-branch".to_string(),
                 custom_name: None,
             },
             paths,
             Config::default(),
+            vec![source_session],
             worker_tx,
             (80, 24),
         );
@@ -3238,6 +3647,7 @@ mod tests {
             },
             paths,
             Config::default(),
+            Vec::new(),
             worker_tx,
             (80, 24),
         );
@@ -3317,6 +3727,7 @@ mod tests {
             },
             paths,
             config,
+            Vec::new(),
             worker_tx,
             (80, 24),
         );
