@@ -15056,7 +15056,7 @@ cyan = "#00ffff"
 
         app.worker_tx
             .send(WorkerEvent::ChangedFilesReady {
-                watched: current,
+                watched: current.clone(),
                 quiet: false,
                 staged: Vec::new(),
                 base_update: Some(BaseBranchUpdate {
@@ -15076,6 +15076,38 @@ cyan = "#00ffff"
         app.drain_events();
 
         assert_eq!(app.unstaged_files[0].path, "current.txt");
+        assert_eq!(app.base_branch_updates["session-1"].commits, 1);
+
+        let upgraded = WatchedWorktree {
+            base_ref: "origin/main".to_string(),
+            ..current.clone()
+        };
+        *app.watched_worktree.lock().expect("watched lock") = Some(upgraded);
+        app.worker_tx
+            .send(WorkerEvent::ChangedFilesReady {
+                watched: current,
+                quiet: false,
+                staged: Vec::new(),
+                base_update: Some(BaseBranchUpdate {
+                    base_ref: "main".to_string(),
+                    commits: 3,
+                }),
+                unstaged: vec![ChangedFile {
+                    path: "old-base.txt".to_string(),
+                    status: "M".to_string(),
+                    additions: 5,
+                    deletions: 0,
+                    binary: false,
+                    branch_only: false,
+                }],
+            })
+            .expect("send old-base changed files");
+        app.drain_events();
+
+        assert_eq!(
+            app.unstaged_files[0].path, "current.txt",
+            "old base-ref results must not overwrite the current file list"
+        );
         assert_eq!(app.base_branch_updates["session-1"].commits, 1);
     }
 
