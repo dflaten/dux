@@ -9,7 +9,7 @@ impl App {
             .is_some_and(|current| {
                 current.session_id == watched.session_id
                     && current.path == watched.path
-                    && current.base_ref == watched.base_ref
+                    && current.fetch_branch == watched.fetch_branch
             })
     }
 
@@ -161,9 +161,21 @@ impl App {
                             ));
                             self.reload_changed_files();
                         }
-                        Err(e) => self.set_error(format!(
-                            "Rebase failed for \"{branch_name}\" onto {base_ref}: {e}"
-                        )),
+                        Err(e) => {
+                            let status = format!(
+                                "Rebase failed for \"{branch_name}\" onto {base_ref}: {e}"
+                            );
+                            let prompt =
+                                super::input::build_rebase_failed_prompt(&branch_name, &base_ref, &e);
+                            match self.send_prompt_to_agent(&session_id, &prompt, true) {
+                                Ok(()) => self.set_error(format!(
+                                    "{status}. Sent the error details to the agent to resolve."
+                                )),
+                                Err(send_err) => self.set_error(format!(
+                                    "{status}. Agent was not available for automatic resolution: {send_err}."
+                                )),
+                            }
+                        }
                     }
                 }
                 WorkerEvent::ClipboardCopyCompleted { label, result } => match result {
@@ -1682,18 +1694,10 @@ impl App {
                         Ok((staged, unstaged)) => {
                             if tx
                                 .send(WorkerEvent::ChangedFilesReady {
-                                    base_update: git::ahead_behind(
+                                    base_update: base_branch_update_for(
                                         &watched_worktree.path,
-                                        "HEAD",
                                         &watched_worktree.base_ref,
-                                    )
-                                    .ok()
-                                    .and_then(|(_, behind)| {
-                                        (behind > 0).then(|| BaseBranchUpdate {
-                                            base_ref: watched_worktree.base_ref.clone(),
-                                            commits: behind,
-                                        })
-                                    }),
+                                    ),
                                     watched: watched_worktree,
                                     quiet: true,
                                     staged,
@@ -1717,6 +1721,85 @@ impl App {
                             {
                                 break;
                             }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_base_branch_fetch_poller(&self) {
+        let interval_secs = self.config.ui.base_branch_fetch_interval;
+        if interval_secs == 0 {
+            return;
+        }
+        let tx = self.worker_tx.clone();
+        let watched = Arc::clone(&self.watched_worktree);
+        thread::spawn(move || {
+            let interval = Duration::from_secs(u64::from(interval_secs));
+            loop {
+                thread::sleep(interval);
+                let watched_worktree = watched.lock().ok().and_then(|guard| guard.clone());
+                let Some(watched_worktree) = watched_worktree else {
+                    continue;
+                };
+                if let Err(err) =
+                    git::fetch_origin_branch(&watched_worktree.path, &watched_worktree.fetch_branch)
+                {
+                    logger::warn(&format!(
+                        "base branch fetch failed for {} from origin/{}: {err:#}",
+                        watched_worktree.path.display(),
+                        watched_worktree.fetch_branch
+                    ));
+                    continue;
+                }
+                let mut refreshed_watch = watched_worktree.clone();
+                refreshed_watch.base_ref = git::preferred_rebase_base_ref(
+                    &refreshed_watch.path,
+                    &refreshed_watch.fetch_branch,
+                );
+                if let Ok(mut guard) = watched.lock()
+                    && guard.as_ref().is_some_and(|current| {
+                        current.session_id == refreshed_watch.session_id
+                            && current.path == refreshed_watch.path
+                            && current.fetch_branch == refreshed_watch.fetch_branch
+                    })
+                {
+                    *guard = Some(refreshed_watch.clone());
+                }
+                match git::changed_files_against_base(
+                    &refreshed_watch.path,
+                    &refreshed_watch.base_ref,
+                ) {
+                    Ok((staged, unstaged)) => {
+                        if tx
+                            .send(WorkerEvent::ChangedFilesReady {
+                                base_update: base_branch_update_for(
+                                    &refreshed_watch.path,
+                                    &refreshed_watch.base_ref,
+                                ),
+                                watched: refreshed_watch,
+                                quiet: true,
+                                staged,
+                                unstaged,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if tx
+                            .send(WorkerEvent::ChangedFilesFailed {
+                                watched: refreshed_watch,
+                                quiet: true,
+                                message: format!(
+                                    "Failed to refresh changes after fetching base branch: {err}"
+                                ),
+                            })
+                            .is_err()
+                        {
+                            break;
                         }
                     }
                 }

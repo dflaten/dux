@@ -76,6 +76,16 @@ fn build_diff_comments_prompt(comments: &[QueuedDiffComment]) -> String {
     out
 }
 
+pub(crate) fn build_rebase_failed_prompt(branch_name: &str, base_ref: &str, error: &str) -> String {
+    format!(
+        "The automatic rebase of branch \"{branch_name}\" onto {base_ref} failed.\n\
+         Please inspect this worktree, resolve any merge conflicts or git errors, and continue the rebase.\n\
+         Run `git status` first. If conflicts are present, fix them, stage the resolved files, and run `git rebase --continue`.\n\
+         If the rebase cannot be completed safely, explain the blocker before taking destructive action.\n\n\
+         Git reported:\n```text\n{error}\n```"
+    )
+}
+
 /// Append `bytes` to `buf`, keeping at most `max` trailing bytes. Used to
 /// bound `loading_input_buf` so it cannot grow without bound when the user
 /// pastes large content during the agent loading phase.
@@ -1093,7 +1103,7 @@ impl App {
             self.set_error("No queued agent comments for the selected session.");
             return;
         }
-        let Some(provider) = self.providers.get(&session_id) else {
+        if !self.providers.contains_key(&session_id) {
             self.set_error(format!(
                 "Agent \"{}\" is not running. Reconnect it before sending queued comments.",
                 session.branch_name
@@ -1101,17 +1111,10 @@ impl App {
             return;
         };
         let prompt = build_diff_comments_prompt(&comments);
-        let mut payload = Self::bracket_paste_payload(&prompt);
-        payload.push(b'\r');
-        match provider.write_bytes(&payload) {
+        match self.send_prompt_to_agent(&session_id, &prompt, true) {
             Ok(()) => {
                 self.queued_diff_comments
                     .retain(|comment| comment.session_id != session_id);
-                self.center_mode = CenterMode::Agent;
-                self.focus = FocusPane::Center;
-                self.session_surface = SessionSurface::Agent;
-                self.fullscreen_overlay = FullscreenOverlay::Agent;
-                self.input_target = InputTarget::Agent;
                 self.diff_selection = None;
                 self.set_info("Sent queued diff comments to the selected agent.");
             }
@@ -1694,14 +1697,15 @@ impl App {
         let session_id = session.id.clone();
         let branch_name = session.branch_name.clone();
         let worktree = PathBuf::from(&session.worktree_path);
-        let base_ref = self.diff_base_ref_for_session(session);
+        let configured_base_ref = self.diff_base_ref_for_session(session);
 
-        if !self.base_branch_updates.contains_key(&session_id) {
+        let Some(update) = self.base_branch_updates.get(&session_id) else {
             self.set_info(format!(
-                "\"{branch_name}\" is not behind {base_ref}; there is nothing to rebase."
+                "\"{branch_name}\" is not behind {configured_base_ref}; there is nothing to rebase."
             ));
             return;
-        }
+        };
+        let base_ref = update.base_ref.clone();
 
         if !self.rebases_in_flight.insert(session_id.clone()) {
             self.set_warning(format!(
@@ -6754,7 +6758,7 @@ impl App {
             })
     }
 
-    fn bracket_paste_payload(text: &str) -> Vec<u8> {
+    pub(crate) fn bracket_paste_payload(text: &str) -> Vec<u8> {
         let mut payload = Vec::with_capacity(
             crate::raw_input::BRACKET_PASTE_START.len()
                 + text.len()
@@ -6764,6 +6768,30 @@ impl App {
         payload.extend_from_slice(text.as_bytes());
         payload.extend_from_slice(crate::raw_input::BRACKET_PASTE_END);
         payload
+    }
+
+    pub(crate) fn send_prompt_to_agent(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        submit: bool,
+    ) -> std::result::Result<(), String> {
+        let Some(provider) = self.providers.get(session_id) else {
+            return Err("agent is not running".to_string());
+        };
+        let mut payload = Self::bracket_paste_payload(prompt);
+        if submit {
+            payload.push(b'\r');
+        }
+        provider
+            .write_bytes(&payload)
+            .map_err(|err| err.to_string())?;
+        self.center_mode = CenterMode::Agent;
+        self.focus = FocusPane::Center;
+        self.session_surface = SessionSurface::Agent;
+        self.fullscreen_overlay = FullscreenOverlay::Agent;
+        self.input_target = InputTarget::Agent;
+        Ok(())
     }
 
     pub(crate) fn paste_selection_to_terminal(&mut self) -> Result<()> {
@@ -7086,7 +7114,7 @@ mod tests {
 
     use super::DOUBLE_CLICK_THRESHOLD;
     use super::components::{ButtonPressedTarget, PressedButton};
-    use crate::app::input::build_diff_comments_prompt;
+    use crate::app::input::{build_diff_comments_prompt, build_rebase_failed_prompt};
     use crate::app::{
         AgentLaunchKind, App, BaseBranchUpdate, BranchWarningKind, CenterMode,
         ConfigReloadFailedFocus, ConfirmKillRunningPrompt, ConfirmNonDefaultBranchFocus,
@@ -14984,11 +15012,13 @@ cyan = "#00ffff"
             session_id: "session-1".to_string(),
             path: app.paths.worktrees_root.join("current"),
             base_ref: "main".to_string(),
+            fetch_branch: "main".to_string(),
         };
         let stale = WatchedWorktree {
             session_id: "session-1".to_string(),
             path: app.paths.worktrees_root.join("stale"),
             base_ref: "main".to_string(),
+            fetch_branch: "main".to_string(),
         };
         *app.watched_worktree.lock().expect("watched lock") = Some(current.clone());
         app.unstaged_files = vec![ChangedFile {
@@ -15050,6 +15080,23 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn diff_base_ref_prefers_remote_tracking_ref_when_available() {
+        let mut app = test_app(default_bindings());
+        let repo_path = PathBuf::from(&app.projects[0].path);
+        set_remote_default(&repo_path, "main");
+        app.sessions[0].worktree_path = repo_path.to_string_lossy().to_string();
+
+        assert_eq!(
+            app.configured_base_ref_for_session(&app.sessions[0]),
+            "main"
+        );
+        assert_eq!(
+            app.diff_base_ref_for_session(&app.sessions[0]),
+            "origin/main"
+        );
+    }
+
+    #[test]
     fn rebase_command_available_only_when_selected_session_is_behind_base() {
         let mut app = test_app(default_bindings());
 
@@ -15076,6 +15123,58 @@ cyan = "#00ffff"
             app.filtered_palette_commands("rebase")
                 .iter()
                 .any(|binding| binding.action == Action::RebaseCurrentBranch)
+        );
+    }
+
+    #[test]
+    fn rebase_failure_prompt_includes_resolution_steps_and_git_error() {
+        let prompt = build_rebase_failed_prompt(
+            "agent-branch",
+            "origin/main",
+            "CONFLICT (content): Merge conflict in src/main.rs",
+        );
+
+        assert!(prompt.contains("agent-branch"));
+        assert!(prompt.contains("origin/main"));
+        assert!(prompt.contains("git status"));
+        assert!(prompt.contains("git rebase --continue"));
+        assert!(prompt.contains("Merge conflict in src/main.rs"));
+    }
+
+    #[test]
+    fn rebase_failure_is_sent_to_running_agent() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "cat; sleep 0.5".to_string()],
+            std::path::Path::new("."),
+            10,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id.clone(), client);
+        app.rebases_in_flight.insert(session_id.clone());
+
+        app.worker_tx
+            .send(WorkerEvent::RebaseCompleted {
+                session_id,
+                branch_name: "agent-branch".to_string(),
+                base_ref: "origin/main".to_string(),
+                result: Err("CONFLICT (content): Merge conflict in src/main.rs".to_string()),
+            })
+            .expect("send rebase failure");
+        app.drain_events();
+
+        assert!(app.rebases_in_flight.is_empty());
+        assert_eq!(app.focus, FocusPane::Center);
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert_eq!(app.fullscreen_overlay, FullscreenOverlay::Agent);
+        assert!(
+            app.status
+                .message()
+                .contains("Sent the error details to the agent")
         );
     }
 

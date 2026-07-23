@@ -357,12 +357,25 @@ pub(crate) struct WatchedWorktree {
     pub(crate) session_id: String,
     pub(crate) path: PathBuf,
     pub(crate) base_ref: String,
+    pub(crate) fetch_branch: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BaseBranchUpdate {
     pub(crate) base_ref: String,
     pub(crate) commits: usize,
+}
+
+pub(crate) fn base_branch_update_for(path: &Path, base_ref: &str) -> Option<BaseBranchUpdate> {
+    let preferred_ref = git::preferred_rebase_base_ref(path, base_ref);
+    git::ahead_behind(path, "HEAD", &preferred_ref)
+        .ok()
+        .and_then(|(_, behind)| {
+            (behind > 0).then_some(BaseBranchUpdate {
+                base_ref: preferred_ref,
+                commits: behind,
+            })
+        })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1937,6 +1950,7 @@ impl App {
 
     pub fn run(&mut self) -> Result<()> {
         self.spawn_changed_files_poller();
+        self.spawn_base_branch_fetch_poller();
         self.spawn_branch_sync_worker();
         self.spawn_project_branch_status_checks();
         self.spawn_gh_status_check();
@@ -2881,12 +2895,17 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    pub(crate) fn diff_base_ref_for_session(&self, session: &AgentSession) -> String {
+    pub(crate) fn configured_base_ref_for_session(&self, session: &AgentSession) -> String {
         self.projects
             .iter()
             .find(|p| p.id == session.project_id)
             .and_then(|p| p.leading_branch.clone())
             .unwrap_or_else(|| session.source_branch.clone())
+    }
+
+    pub(crate) fn diff_base_ref_for_session(&self, session: &AgentSession) -> String {
+        let configured_base = self.configured_base_ref_for_session(session);
+        git::preferred_rebase_base_ref(Path::new(&session.worktree_path), &configured_base)
     }
 
     /// Provider currently driving the session's live PTY, if any. After an
@@ -2910,28 +2929,34 @@ impl App {
 
     fn reload_changed_files_with_status(&mut self, show_status: bool) {
         let selected = self.selected_session().map(|s| {
+            let configured_base_ref = self.configured_base_ref_for_session(s);
             (
                 s.id.clone(),
                 PathBuf::from(&s.worktree_path),
                 self.diff_base_ref_for_session(s),
+                configured_base_ref,
             )
         });
         // Keep the background poller in sync with the currently selected session.
         if let Ok(mut guard) = self.watched_worktree.lock() {
             *guard = selected
                 .as_ref()
-                .map(|(session_id, path, base_ref)| WatchedWorktree {
-                    session_id: session_id.clone(),
-                    path: path.clone(),
-                    base_ref: base_ref.clone(),
-                });
+                .map(
+                    |(session_id, path, base_ref, fetch_branch)| WatchedWorktree {
+                        session_id: session_id.clone(),
+                        path: path.clone(),
+                        base_ref: base_ref.clone(),
+                        fetch_branch: fetch_branch.clone(),
+                    },
+                );
         }
         match selected.as_ref() {
-            Some((session_id, path, base_ref)) => {
+            Some((session_id, path, base_ref, fetch_branch)) => {
                 let watched = WatchedWorktree {
                     session_id: session_id.clone(),
                     path: path.clone(),
                     base_ref: base_ref.clone(),
+                    fetch_branch: fetch_branch.clone(),
                 };
                 let tx = self.worker_tx.clone();
                 if show_status {
@@ -2946,14 +2971,7 @@ impl App {
                         match git::changed_files_against_base(&watched.path, &watched.base_ref) {
                             Ok((staged, unstaged)) => {
                                 let base_update =
-                                    git::ahead_behind(&watched.path, "HEAD", &watched.base_ref)
-                                        .ok()
-                                        .and_then(|(_, behind)| {
-                                            (behind > 0).then(|| BaseBranchUpdate {
-                                                base_ref: watched.base_ref.clone(),
-                                                commits: behind,
-                                            })
-                                        });
+                                    base_branch_update_for(&watched.path, &watched.base_ref);
                                 WorkerEvent::ChangedFilesReady {
                                     watched,
                                     quiet: !show_status,
@@ -2978,7 +2996,7 @@ impl App {
             }
         }
         // Opportunistically check PR status for the newly-selected session.
-        if let Some((sid, _, _)) = selected {
+        if let Some((sid, _, _, _)) = selected {
             self.spawn_pr_check_for_session(&sid);
         }
     }
