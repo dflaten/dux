@@ -642,7 +642,7 @@ pub(crate) struct WorktreeCleanupCandidate {
     pub(crate) project_name: String,
     pub(crate) branch_name: String,
     pub(crate) worktree_path: String,
-    pub(crate) updated_at: chrono::DateTime<Utc>,
+    pub(crate) last_commit_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
