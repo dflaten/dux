@@ -808,7 +808,7 @@ impl App {
         };
         if count == 0 {
             self.set_info(
-                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity.",
+                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
             );
         } else {
             let confirm_key = self.bindings.label_for(Action::Confirm);
@@ -2919,10 +2919,13 @@ fn build_worktree_cleanup_candidates(
     let cutoff = now - chrono::Duration::weeks(2);
     let mut by_worktree: std::collections::BTreeMap<String, Vec<&AgentSession>> =
         std::collections::BTreeMap::new();
+    let mut known_worktree_paths = std::collections::HashSet::new();
     for session in sessions {
-        if !git::is_under(worktrees_root, std::path::Path::new(&session.worktree_path)) {
+        let worktree_path = std::path::Path::new(&session.worktree_path);
+        if !git::is_under(worktrees_root, worktree_path) {
             continue;
         }
+        known_worktree_paths.insert(canonical_or_original(worktree_path));
         by_worktree
             .entry(session.worktree_path.clone())
             .or_default()
@@ -2931,16 +2934,15 @@ fn build_worktree_cleanup_candidates(
 
     let mut candidates = Vec::new();
     for (worktree_path, sessions) in by_worktree {
-        if sessions
-            .iter()
-            .any(|session| active_session_ids.contains(&session.id))
-        {
+        if sessions.iter().any(|session| {
+            active_session_ids.contains(&session.id) || session.status == SessionStatus::Active
+        }) {
             continue;
         }
-        let Some(updated_at) = sessions.iter().map(|session| session.updated_at).max() else {
+        let Ok(last_commit_at) = git::head_commit_time(std::path::Path::new(&worktree_path)) else {
             continue;
         };
-        if updated_at > cutoff {
+        if last_commit_at > cutoff {
             continue;
         }
         let Some(first_session) = sessions.first() else {
@@ -2961,17 +2963,56 @@ fn build_worktree_cleanup_candidates(
             project_name: project.name.clone(),
             branch_name: first_session.branch_name.clone(),
             worktree_path,
-            updated_at,
+            last_commit_at,
         });
+    }
+
+    let mut orphan_worktree_paths = std::collections::HashSet::new();
+    for project in projects {
+        let Ok(worktrees) = git::list_worktrees(std::path::Path::new(&project.path)) else {
+            continue;
+        };
+        for worktree in worktrees {
+            if !git::is_under(worktrees_root, &worktree.path) {
+                continue;
+            }
+            let canonical_path = canonical_or_original(&worktree.path);
+            if known_worktree_paths.contains(&canonical_path)
+                || !orphan_worktree_paths.insert(canonical_path)
+            {
+                continue;
+            }
+            let Some(branch_name) = worktree.branch_name else {
+                continue;
+            };
+            let Ok(last_commit_at) = git::head_commit_time(&worktree.path) else {
+                continue;
+            };
+            if last_commit_at > cutoff {
+                continue;
+            }
+            candidates.push(WorktreeCleanupCandidate {
+                session_ids: Vec::new(),
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                branch_name,
+                worktree_path: worktree.path.to_string_lossy().to_string(),
+                last_commit_at,
+            });
+        }
     }
 
     candidates.sort_by(|a, b| {
         a.project_name
             .cmp(&b.project_name)
-            .then(a.updated_at.cmp(&b.updated_at))
+            .then(a.last_commit_at.cmp(&b.last_commit_at))
             .then(a.worktree_path.cmp(&b.worktree_path))
     });
     candidates
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -2983,6 +3024,7 @@ mod tests {
     use crate::storage::SessionStore;
     use crate::theme::Theme;
     use chrono::Utc;
+    use std::process::Command;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, mpsc};
     use tempfile::tempdir;
@@ -3176,6 +3218,40 @@ mod tests {
         }
     }
 
+    fn run_git(repo_path: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn make_git_project(path: &std::path::Path) {
+        std::fs::create_dir_all(path).expect("repo dir");
+        run_git(path, &["init"]);
+        std::fs::write(path.join("README.md"), "demo\n").expect("readme");
+        run_git(path, &["add", "README.md"]);
+        run_git(
+            path,
+            &[
+                "-c",
+                "user.name=Dux Tests",
+                "-c",
+                "user.email=dux-tests@example.invalid",
+                "commit",
+                "-m",
+                "Initial commit",
+            ],
+        );
+    }
+
     /// Inserts a dummy PtyClient placeholder into `app.providers` so that the
     /// session appears "active" without actually spawning a process.
     fn mark_active(app: &mut App, session_id: &str) {
@@ -3193,6 +3269,52 @@ mod tests {
             .find(|session| session.id == session_id)
             .expect("session");
         session.worktree_path = path.to_string_lossy().to_string();
+    }
+
+    fn set_git_project_path(app: &mut App, project_id: &str) -> std::path::PathBuf {
+        let repo = app.paths.root.join(format!("repo-{project_id}"));
+        make_git_project(&repo);
+        let project = app
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+            .expect("project");
+        project.path = repo.to_string_lossy().to_string();
+        repo
+    }
+
+    fn add_git_worktree(
+        repo_path: &std::path::Path,
+        worktree_path: &std::path::Path,
+        branch_name: &str,
+    ) {
+        run_git(
+            repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch_name,
+                worktree_path.to_string_lossy().as_ref(),
+            ],
+        );
+    }
+
+    fn attach_session_git_worktree(
+        app: &mut App,
+        repo_path: &std::path::Path,
+        session_id: &str,
+        worktree_path: std::path::PathBuf,
+    ) {
+        let branch_name = app
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("session")
+            .branch_name
+            .clone();
+        add_git_worktree(repo_path, &worktree_path, &branch_name);
+        set_session_worktree(app, session_id, worktree_path);
     }
 
     fn set_session_updated_at(app: &mut App, session_id: &str, updated_at: chrono::DateTime<Utc>) {
@@ -3228,11 +3350,11 @@ mod tests {
             vec![make_session("old", "codex", "/tmp/placeholder")],
             vec![project],
         );
+        let repo = set_git_project_path(&mut app, "project-1");
         let worktree = app.paths.worktrees_root.join("old");
-        set_session_worktree(&mut app, "old", worktree);
-        set_session_updated_at(&mut app, "old", Utc::now() - chrono::Duration::days(15));
+        attach_session_git_worktree(&mut app, &repo, "old", worktree);
 
-        let candidates = app.worktree_cleanup_candidates(Utc::now());
+        let candidates = app.worktree_cleanup_candidates(Utc::now() + chrono::Duration::days(15));
         app.show_worktree_cleanup_candidates(candidates);
 
         let PromptState::ConfirmWorktreeCleanup {
@@ -3257,8 +3379,9 @@ mod tests {
             vec![make_session("recent", "codex", "/tmp/placeholder")],
             vec![project],
         );
+        let repo = set_git_project_path(&mut app, "project-1");
         let worktree = app.paths.worktrees_root.join("recent");
-        set_session_worktree(&mut app, "recent", worktree);
+        attach_session_git_worktree(&mut app, &repo, "recent", worktree);
 
         let candidates = app.worktree_cleanup_candidates(Utc::now());
         app.show_worktree_cleanup_candidates(candidates);
@@ -3275,7 +3398,7 @@ mod tests {
         assert!(selected.is_empty());
         assert_eq!(
             app.status.message(),
-            "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible after two weeks without session activity."
+            "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible when their latest commit is at least two weeks old and no agent is open."
         );
     }
 
@@ -3294,7 +3417,7 @@ mod tests {
                 .join("old")
                 .to_string_lossy()
                 .to_string(),
-            updated_at: Utc::now() - chrono::Duration::days(15),
+            last_commit_at: Utc::now() - chrono::Duration::days(15),
         };
         app.prompt = PromptState::WorktreeCleanupStart;
 
@@ -3358,7 +3481,7 @@ mod tests {
                 .join("old")
                 .to_string_lossy()
                 .to_string(),
-            updated_at: Utc::now() - chrono::Duration::days(15),
+            last_commit_at: Utc::now() - chrono::Duration::days(15),
         };
 
         app.begin_worktree_cleanup(vec![candidate]);
@@ -3394,7 +3517,7 @@ mod tests {
                 .join("old")
                 .to_string_lossy()
                 .to_string(),
-            updated_at: Utc::now() - chrono::Duration::days(15),
+            last_commit_at: Utc::now() - chrono::Duration::days(15),
         };
         app.worktree_cleanup_pending = 1;
         app.worktree_cleanup_removed.push(candidate);
@@ -3422,15 +3545,47 @@ mod tests {
             vec![make_session("old", "codex", "/tmp/placeholder")],
             vec![project],
         );
+        let repo = set_git_project_path(&mut app, "project-1");
         let worktree = app.paths.worktrees_root.join("old");
-        set_session_worktree(&mut app, "old", worktree.clone());
-        let now = Utc::now();
-        set_session_updated_at(&mut app, "old", now - chrono::Duration::days(15));
+        attach_session_git_worktree(&mut app, &repo, "old", worktree.clone());
+        let now = Utc::now() + chrono::Duration::days(15);
 
         let candidates = app.worktree_cleanup_candidates(now);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_ids, vec!["old".to_string()]);
+        assert_eq!(
+            candidates[0].worktree_path,
+            worktree.to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn worktree_cleanup_candidates_include_old_registered_worktrees_without_sessions() {
+        let repo = tempdir().expect("repo tempdir");
+        make_git_project(repo.path());
+        let mut project = make_project("project-1", "codex");
+        project.path = repo.path().to_string_lossy().to_string();
+        let app = test_app_with_sessions(Vec::new(), vec![project]);
+        let worktree = app.paths.worktrees_root.join("demo").join("orphan");
+        run_git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "orphan",
+                worktree.to_string_lossy().as_ref(),
+            ],
+        );
+
+        let candidates = app.worktree_cleanup_candidates(Utc::now() + chrono::Duration::days(15));
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].session_ids.is_empty());
+        assert_eq!(candidates[0].project_id, "project-1");
+        assert_eq!(candidates[0].project_name, "demo");
+        assert_eq!(candidates[0].branch_name, "orphan");
         assert_eq!(
             candidates[0].worktree_path,
             worktree.to_string_lossy().to_string()
@@ -3448,15 +3603,20 @@ mod tests {
             ],
             vec![project],
         );
-        let now = Utc::now();
+        let repo = set_git_project_path(&mut app, "project-1");
+        let now = Utc::now() + chrono::Duration::days(15);
         let recent_worktree = app.paths.worktrees_root.join("recent");
         let active_worktree = app.paths.worktrees_root.join("active");
-        set_session_worktree(&mut app, "recent", recent_worktree);
-        set_session_worktree(&mut app, "active", active_worktree);
-        set_session_updated_at(&mut app, "recent", now - chrono::Duration::days(13));
-        set_session_updated_at(&mut app, "active", now - chrono::Duration::days(30));
+        attach_session_git_worktree(&mut app, &repo, "recent", recent_worktree);
+        attach_session_git_worktree(&mut app, &repo, "active", active_worktree);
         set_session_updated_at(&mut app, "external", now - chrono::Duration::days(30));
         mark_active(&mut app, "active");
+        let recent_session = app
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == "recent")
+            .expect("recent session");
+        recent_session.status = SessionStatus::Active;
 
         let candidates = app.worktree_cleanup_candidates(now);
 
@@ -3471,21 +3631,31 @@ mod tests {
         let mut second = make_session("second", "codex", "/tmp/placeholder");
         second.branch_name = "shared-branch".to_string();
         let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        let repo = set_git_project_path(&mut app, "project-1");
         let worktree = app.paths.worktrees_root.join("shared");
-        set_session_worktree(&mut app, "first", worktree.clone());
+        attach_session_git_worktree(&mut app, &repo, "first", worktree.clone());
+        run_git(&worktree, &["branch", "-m", "shared-branch"]);
+        app.sessions
+            .iter_mut()
+            .find(|session| session.id == "first")
+            .expect("first session")
+            .branch_name = "shared-branch".to_string();
         set_session_worktree(&mut app, "second", worktree);
         let now = Utc::now();
         set_session_updated_at(&mut app, "first", now - chrono::Duration::days(30));
         set_session_updated_at(&mut app, "second", now - chrono::Duration::days(16));
+        let commit_time =
+            git::head_commit_time(std::path::Path::new(&app.sessions[0].worktree_path))
+                .expect("commit time");
 
-        let candidates = app.worktree_cleanup_candidates(now);
+        let candidates = app.worktree_cleanup_candidates(now + chrono::Duration::days(15));
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(
             candidates[0].session_ids,
             vec!["first".to_string(), "second".to_string()]
         );
-        assert_eq!(candidates[0].updated_at, now - chrono::Duration::days(16));
+        assert_eq!(candidates[0].last_commit_at, commit_time);
     }
 
     #[test]

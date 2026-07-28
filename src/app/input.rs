@@ -15274,7 +15274,7 @@ cyan = "#00ffff"
                     .join("old")
                     .to_string_lossy()
                     .to_string(),
-                updated_at: Utc::now() - chrono::Duration::days(15),
+                last_commit_at: Utc::now() - chrono::Duration::days(15),
             }],
             selected: vec![true],
             cursor: 0,
@@ -15323,7 +15323,7 @@ cyan = "#00ffff"
                         .join(format!("old-{index}"))
                         .to_string_lossy()
                         .to_string(),
-                    updated_at: Utc::now() - chrono::Duration::days(15),
+                    last_commit_at: Utc::now() - chrono::Duration::days(15),
                 })
                 .collect(),
             selected: vec![true, true, true],

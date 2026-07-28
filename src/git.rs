@@ -561,6 +561,43 @@ pub fn head_commit(repo_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+pub fn head_commit_time(repo_path: &Path) -> Result<chrono::DateTime<chrono::Utc>> {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "log.showSignature=false",
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "show",
+            "-s",
+            "--format=%cI",
+            "HEAD",
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect HEAD commit time for {}",
+                repo_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git show HEAD failed for {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw.trim()).with_context(|| {
+        format!(
+            "failed to parse HEAD commit time for {}: {}",
+            repo_path.display(),
+            raw.trim()
+        )
+    })?;
+    Ok(parsed.with_timezone(&chrono::Utc))
+}
+
 pub fn mirror_worktree_contents(source: &Path, destination: &Path) -> Result<()> {
     let source = source
         .canonicalize()

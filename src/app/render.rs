@@ -5035,7 +5035,7 @@ impl App {
                     Line::from(" Worktree cleanup removes inactive dux-managed worktrees."),
                     Line::from(""),
                     Line::from(Span::styled(
-                        " Worktrees are eligible after two weeks without session activity and no active agents.",
+                        " Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
                         Style::default().fg(self.theme.warning_fg),
                     )),
                     Line::from(""),
@@ -5085,7 +5085,7 @@ impl App {
                         Line::from(" No inactive dux-managed worktrees meet the cleanup criteria."),
                         Line::from(""),
                         Line::from(Span::styled(
-                            " Worktrees are eligible after two weeks without session activity and no active agents.",
+                            " Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
                             Style::default().fg(self.theme.warning_fg),
                         )),
                     ]
@@ -5114,7 +5114,9 @@ impl App {
                 let mut rows: Vec<Line<'static>> = Vec::new();
                 for (index, candidate) in candidates.iter().enumerate() {
                     let session_count = candidate.session_ids.len();
-                    let session_label = if session_count == 1 {
+                    let session_label = if session_count == 0 {
+                        "no database session".to_string()
+                    } else if session_count == 1 {
                         "1 session".to_string()
                     } else {
                         format!("{session_count} sessions")
@@ -5138,8 +5140,8 @@ impl App {
                         ),
                         Span::styled(
                             format!(
-                                " - {session_label}, last active {}",
-                                candidate.updated_at.format("%Y-%m-%d")
+                                " - {session_label}, last commit {}",
+                                candidate.last_commit_at.format("%Y-%m-%d")
                             ),
                             style,
                         ),
