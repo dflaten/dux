@@ -329,22 +329,55 @@ fn clamp_right_width_pct(right_width_pct: u16, left_width_pct: u16) -> u16 {
 }
 
 fn keep_worktree_cleanup_cursor_visible(
+    candidates: &[WorktreeCleanupCandidate],
     cursor: usize,
     scroll_offset: &mut u16,
-    visible_candidates: usize,
+    visible_rows: usize,
 ) {
-    let visible_candidates = visible_candidates.max(1);
+    let visible_rows = visible_rows.max(1);
     let top = usize::from(*scroll_offset);
     if cursor < top {
         *scroll_offset = u16::try_from(cursor).unwrap_or(u16::MAX);
         return;
     }
 
-    let bottom = top.saturating_add(visible_candidates.saturating_sub(1));
-    if cursor > bottom {
-        let new_top = cursor.saturating_sub(visible_candidates - 1);
+    while !worktree_cleanup_cursor_fits(
+        candidates,
+        cursor,
+        usize::from(*scroll_offset),
+        visible_rows,
+    ) && usize::from(*scroll_offset) < cursor
+    {
+        let new_top = usize::from(*scroll_offset).saturating_add(1);
         *scroll_offset = u16::try_from(new_top).unwrap_or(u16::MAX);
     }
+}
+
+fn worktree_cleanup_cursor_fits(
+    candidates: &[WorktreeCleanupCandidate],
+    cursor: usize,
+    scroll_offset: usize,
+    visible_rows: usize,
+) -> bool {
+    let visible_rows = visible_rows.max(1);
+    let mut rows = 0usize;
+    let mut last_project: Option<&str> = None;
+
+    for (index, candidate) in candidates.iter().enumerate().skip(scroll_offset) {
+        let needs_header = last_project != Some(candidate.project_name.as_str());
+        let header_rows = usize::from(needs_header) + usize::from(needs_header && rows > 0);
+        let candidate_rows = header_rows + 2;
+        if rows > 0 && rows + candidate_rows > visible_rows {
+            return false;
+        }
+        rows = rows.saturating_add(candidate_rows);
+        if index == cursor {
+            return true;
+        }
+        last_project = Some(candidate.project_name.as_str());
+    }
+
+    false
 }
 
 const MIN_TERMINAL_PANE_HEIGHT_PCT: u16 = 10;
@@ -3493,6 +3526,7 @@ impl App {
                 Some(Action::ScrollLineDown | Action::MoveDown) => {
                     *cursor = cursor.saturating_add(1).min(max_index);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -3501,6 +3535,7 @@ impl App {
                 _ if key.code == KeyCode::Down => {
                     *cursor = cursor.saturating_add(1).min(max_index);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -3509,6 +3544,7 @@ impl App {
                 Some(Action::ScrollLineUp | Action::MoveUp) => {
                     *cursor = cursor.saturating_sub(1);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -3517,6 +3553,7 @@ impl App {
                 _ if key.code == KeyCode::Up => {
                     *cursor = cursor.saturating_sub(1);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -3525,6 +3562,7 @@ impl App {
                 Some(Action::ScrollPageDown) => {
                     *cursor = cursor.saturating_add(8).min(max_index);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -3533,6 +3571,7 @@ impl App {
                 Some(Action::ScrollPageUp) => {
                     *cursor = cursor.saturating_sub(8);
                     keep_worktree_cleanup_cursor_visible(
+                        candidates,
                         *cursor,
                         scroll_offset,
                         visible_candidates,
@@ -15343,6 +15382,50 @@ cyan = "#00ffff"
             panic!("expected cleanup review prompt");
         };
         assert_eq!(*cursor, 1);
+        assert_eq!(*scroll_offset, 1);
+    }
+
+    #[test]
+    fn worktree_cleanup_scroll_accounts_for_project_headers() {
+        let mut app = test_app(default_bindings());
+        app.worktree_cleanup_visible_candidates = 18;
+        let candidates = (0..8)
+            .map(|index| {
+                let project_name = if index < 7 { "alpha" } else { "beta" };
+                WorktreeCleanupCandidate {
+                    session_ids: vec![format!("old-{index}")],
+                    project_id: format!("project-{project_name}"),
+                    project_name: project_name.to_string(),
+                    branch_name: format!("branch-old-{index}"),
+                    worktree_path: app
+                        .paths
+                        .worktrees_root
+                        .join(format!("old-{index}"))
+                        .to_string_lossy()
+                        .to_string(),
+                    last_commit_at: Utc::now() - chrono::Duration::days(15),
+                }
+            })
+            .collect::<Vec<_>>();
+        app.prompt = PromptState::ConfirmWorktreeCleanup {
+            candidates,
+            selected: vec![true; 8],
+            cursor: 6,
+            scroll_offset: 0,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("handle down");
+
+        let PromptState::ConfirmWorktreeCleanup {
+            cursor,
+            scroll_offset,
+            ..
+        } = &app.prompt
+        else {
+            panic!("expected cleanup review prompt");
+        };
+        assert_eq!(*cursor, 7);
         assert_eq!(*scroll_offset, 1);
     }
 

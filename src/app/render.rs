@@ -5055,9 +5055,7 @@ impl App {
                 scroll_offset,
             } => {
                 self.render_dim_overlay(frame);
-                let dialog_width = 76.min(frame.area().width.max(1));
-                let dialog_height = 24.min(frame.area().height.max(1));
-                let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
+                let area = centered_rect(92, 82, frame.area());
                 self.clear_overlay_area(frame, area);
                 let outer = self.themed_overlay_block("Cleanup Worktrees");
                 let inner = outer.inner(area);
@@ -5071,8 +5069,7 @@ impl App {
                         Constraint::Length(2),
                     ])
                     .areas(inner);
-                self.worktree_cleanup_visible_candidates =
-                    (usize::from(list_area.height) / 2).max(1);
+                self.worktree_cleanup_visible_candidates = usize::from(list_area.height).max(1);
 
                 let selected_count = selected.iter().filter(|is_selected| **is_selected).count();
                 let move_up = self.bindings.labels_for(Action::MoveUp);
@@ -5112,7 +5109,28 @@ impl App {
                     .render(intro_area, frame.buffer_mut());
 
                 let mut rows: Vec<Line<'static>> = Vec::new();
-                for (index, candidate) in candidates.iter().enumerate() {
+                let height = usize::from(list_area.height);
+                let start_candidate = usize::from(*scroll_offset).min(candidates.len());
+                let mut last_project: Option<&str> = None;
+                for (index, candidate) in candidates.iter().enumerate().skip(start_candidate) {
+                    let needs_header = last_project != Some(candidate.project_name.as_str());
+                    let header_rows =
+                        usize::from(needs_header) + usize::from(needs_header && !rows.is_empty());
+                    if !rows.is_empty() && rows.len() + header_rows + 2 > height {
+                        break;
+                    }
+                    if needs_header {
+                        if !rows.is_empty() {
+                            rows.push(Line::from(""));
+                        }
+                        rows.push(Line::from(Span::styled(
+                            format!(" {}", candidate.project_name),
+                            Style::default()
+                                .fg(self.theme.header_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        last_project = Some(candidate.project_name.as_str());
+                    }
                     let session_count = candidate.session_ids.len();
                     let session_label = if session_count == 0 {
                         "no database session".to_string()
@@ -5135,7 +5153,7 @@ impl App {
                     rows.push(Line::from(vec![
                         Span::styled(format!(" {marker} "), style),
                         Span::styled(
-                            format!("{} / {}", candidate.project_name, candidate.branch_name),
+                            candidate.branch_name.clone(),
                             style.add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
@@ -5152,12 +5170,7 @@ impl App {
                     )));
                 }
 
-                let start = usize::from(*scroll_offset)
-                    .saturating_mul(2)
-                    .min(rows.len().saturating_sub(1));
-                let height = usize::from(list_area.height);
-                let visible_rows: Vec<Line<'static>> =
-                    rows.into_iter().skip(start).take(height).collect();
+                let visible_rows: Vec<Line<'static>> = rows.into_iter().take(height).collect();
                 Paragraph::new(visible_rows)
                     .wrap(Wrap { trim: false })
                     .render(list_area, frame.buffer_mut());
@@ -5184,9 +5197,7 @@ impl App {
                 scroll_offset,
             } => {
                 self.render_dim_overlay(frame);
-                let dialog_width = 76.min(frame.area().width.max(1));
-                let dialog_height = 24.min(frame.area().height.max(1));
-                let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
+                let area = centered_rect(92, 82, frame.area());
                 self.clear_overlay_area(frame, area);
                 let outer = self.themed_overlay_block("Cleanup Complete");
                 let inner = outer.inner(area);
@@ -5213,11 +5224,24 @@ impl App {
                 Paragraph::new(intro).render(intro_area, frame.buffer_mut());
 
                 let mut rows: Vec<Line<'static>> = Vec::new();
+                let mut last_project: Option<&str> = None;
                 for candidate in removed {
+                    if last_project != Some(candidate.project_name.as_str()) {
+                        if !rows.is_empty() {
+                            rows.push(Line::from(""));
+                        }
+                        rows.push(Line::from(Span::styled(
+                            format!(" {}", candidate.project_name),
+                            Style::default()
+                                .fg(self.theme.header_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        last_project = Some(candidate.project_name.as_str());
+                    }
                     rows.push(Line::from(vec![
                         Span::styled(" removed ", Style::default().fg(self.theme.session_active)),
                         Span::styled(
-                            format!("{} / {}", candidate.project_name, candidate.branch_name),
+                            candidate.branch_name.clone(),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
                     ]));
@@ -5227,13 +5251,22 @@ impl App {
                     )));
                 }
                 for failure in failed {
+                    if last_project != Some(failure.candidate.project_name.as_str()) {
+                        if !rows.is_empty() {
+                            rows.push(Line::from(""));
+                        }
+                        rows.push(Line::from(Span::styled(
+                            format!(" {}", failure.candidate.project_name),
+                            Style::default()
+                                .fg(self.theme.header_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                        last_project = Some(failure.candidate.project_name.as_str());
+                    }
                     rows.push(Line::from(vec![
                         Span::styled(" failed  ", Style::default().fg(self.theme.status_error_fg)),
                         Span::styled(
-                            format!(
-                                "{} / {}",
-                                failure.candidate.project_name, failure.candidate.branch_name
-                            ),
+                            failure.candidate.branch_name.clone(),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
                     ]));

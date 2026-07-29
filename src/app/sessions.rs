@@ -765,6 +765,12 @@ impl App {
     }
 
     pub(crate) fn open_worktree_cleanup(&mut self) -> Result<()> {
+        if self.worktree_cleanup_pending > 0 {
+            self.set_warning(
+                "Worktree cleanup is already running. Wait for the current cleanup to finish before starting another scan.",
+            );
+            return Ok(());
+        }
         self.prompt = PromptState::WorktreeCleanupStart;
         let confirm_key = self.bindings.label_for(Action::Confirm);
         self.set_info(format!(
@@ -834,6 +840,12 @@ impl App {
     }
 
     pub(crate) fn begin_worktree_cleanup(&mut self, candidates: Vec<WorktreeCleanupCandidate>) {
+        if self.worktree_cleanup_pending > 0 {
+            self.set_warning(
+                "Worktree cleanup is already running. Wait for the current cleanup to finish before starting another cleanup.",
+            );
+            return;
+        }
         self.worktree_cleanup_pending = 0;
         self.worktree_cleanup_removed.clear();
         self.worktree_cleanup_failed.clear();
@@ -848,7 +860,7 @@ impl App {
             return;
         }
 
-        let mut started = 0usize;
+        let mut cleanup_jobs = Vec::new();
         for candidate in candidates {
             if candidate
                 .session_ids
@@ -873,22 +885,10 @@ impl App {
             for session_id in &candidate.session_ids {
                 self.pending_deletions.insert(session_id.clone());
             }
-            let tx = self.worker_tx.clone();
-            let worktree_path = candidate.worktree_path.clone();
-            let branch_name = candidate.branch_name.clone();
-            std::thread::spawn(move || {
-                let result = git::remove_worktree(
-                    std::path::Path::new(&project.path),
-                    std::path::Path::new(&worktree_path),
-                    &branch_name,
-                )
-                .map(|r| r.branch_already_deleted)
-                .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(WorkerEvent::WorktreeCleanupRemoveCompleted { candidate, result });
-            });
-            started += 1;
+            cleanup_jobs.push((candidate, project.path));
         }
 
+        let started = cleanup_jobs.len();
         self.worktree_cleanup_pending = started;
         if started == 0 {
             let failed = self.worktree_cleanup_failed.clone();
@@ -910,6 +910,22 @@ impl App {
         } else {
             self.prompt = PromptState::None;
             self.set_busy(format!("Removing {started} inactive worktree(s)…"));
+            let tx = self.worker_tx.clone();
+            std::thread::spawn(move || {
+                for (candidate, project_path) in cleanup_jobs {
+                    let worktree_path = candidate.worktree_path.clone();
+                    let branch_name = candidate.branch_name.clone();
+                    let result = git::remove_worktree(
+                        std::path::Path::new(&project_path),
+                        std::path::Path::new(&worktree_path),
+                        &branch_name,
+                    )
+                    .map(|r| r.branch_already_deleted)
+                    .map_err(|e| format!("{e:#}"));
+                    let _ =
+                        tx.send(WorkerEvent::WorktreeCleanupRemoveCompleted { candidate, result });
+                }
+            });
         }
     }
 
@@ -943,10 +959,6 @@ impl App {
 
         self.sessions
             .retain(|session| !session_ids.contains(&session.id));
-        self.update_branch_sync_sessions();
-        self.rebuild_left_items();
-        self.ensure_selectable_left_item();
-        self.reload_changed_files_quiet();
 
         if branch_already_deleted {
             self.set_info(format!(
@@ -984,6 +996,10 @@ impl App {
             failed,
             scroll_offset: 0,
         };
+        self.update_branch_sync_sessions();
+        self.rebuild_left_items();
+        self.ensure_selectable_left_item();
+        self.reload_changed_files_quiet();
         if failed_count == 0 {
             self.set_info(format!(
                 "Worktree cleanup complete. Removed {removed_count} worktree(s)."
@@ -3503,6 +3519,21 @@ mod tests {
     }
 
     #[test]
+    fn open_worktree_cleanup_refuses_while_cleanup_is_running() {
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        app.worktree_cleanup_pending = 1;
+
+        app.open_worktree_cleanup().expect("open cleanup");
+
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup is already running. Wait for the current cleanup to finish before starting another scan."
+        );
+    }
+
+    #[test]
     fn finish_worktree_cleanup_job_if_done_opens_summary() {
         let project = make_project("project-1", "codex");
         let mut app = test_app_with_sessions(Vec::new(), vec![project]);
@@ -3535,6 +3566,58 @@ mod tests {
         assert_eq!(
             app.status.message(),
             "Worktree cleanup complete. Removed 1 worktree(s)."
+        );
+    }
+
+    #[test]
+    fn begin_worktree_cleanup_removes_large_batches_from_same_repo() {
+        let project = make_project("project-1", "codex");
+        let sessions = (0..45)
+            .map(|index| make_session(&format!("old-{index}"), "codex", "/tmp/placeholder"))
+            .collect::<Vec<_>>();
+        let mut app = test_app_with_sessions(sessions, vec![project]);
+        let repo = set_git_project_path(&mut app, "project-1");
+        let worktrees = (0..45)
+            .map(|index| {
+                let session_id = format!("old-{index}");
+                let worktree = app.paths.worktrees_root.join(&session_id);
+                attach_session_git_worktree(&mut app, &repo, &session_id, worktree.clone());
+                worktree
+            })
+            .collect::<Vec<_>>();
+        let candidates = app.worktree_cleanup_candidates(Utc::now() + chrono::Duration::days(15));
+
+        assert_eq!(candidates.len(), 45);
+
+        app.begin_worktree_cleanup(candidates);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.worktree_cleanup_pending > 0 && std::time::Instant::now() < deadline {
+            app.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.drain_events();
+
+        assert_eq!(app.worktree_cleanup_pending, 0);
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.len() == 45 && failed.is_empty()
+        ));
+        assert!(app.sessions.is_empty());
+        for worktree in worktrees {
+            assert!(
+                !worktree.exists(),
+                "cleanup should remove {}",
+                worktree.display()
+            );
+        }
+        assert_eq!(
+            app.status.message(),
+            "Worktree cleanup complete. Removed 45 worktree(s)."
         );
     }
 
