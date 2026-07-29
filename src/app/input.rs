@@ -11478,6 +11478,10 @@ cyan = "#00ffff"
             app.status
                 .text()
                 .contains("Added project \"second-project\" to workspace")
+                && app
+                    .selected_project()
+                    .map(|project| project.name == "second-project")
+                    .unwrap_or(false)
         });
 
         let selected = app.selected_project().expect("selected project");
