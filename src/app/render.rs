@@ -4,6 +4,7 @@ use super::components::{
 };
 use super::*;
 use std::path::Path;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// ASCII art logo displayed in the agent pane when no content is active.
 const ASCII_LOGO: &[&str] = &[
@@ -471,6 +472,7 @@ impl App {
         self.render_files(frame, right);
         self.render_footer(frame, footer);
         self.render_overlay(frame);
+        keep_box_drawing_cells_fresh(frame.buffer_mut());
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1438,24 +1440,19 @@ impl App {
                     {
                         continue;
                     }
-                    let x = term_area.x + cell.col;
-                    let y = term_area.y + cell.row;
                     let (fg, bg) = pty_cell_colors(cell.fg, cell.bg, is_input, &self.theme);
                     let mut style = Style::default().fg(fg).add_modifier(cell.modifier);
                     if let Some(bg) = bg {
                         style = style.bg(bg);
                     }
-                    let ratatui_cell = &mut buf[(x, y)];
-                    ratatui_cell.set_symbol(&cell.symbol);
-                    ratatui_cell.set_style(style);
-
                     // Overlay selection highlight if this cell is selected.
                     if let Some(sel) = &self.terminal_selection
                         && sel.anchor != sel.end
                         && sel.contains(cell.row, cell.col)
                     {
-                        ratatui_cell.set_style(self.theme.selection_style());
+                        style = self.theme.selection_style();
                     }
+                    draw_terminal_snapshot_cell(buf, term_area, cell, style);
                 }
 
                 // Render cursor if in input mode.
@@ -1757,13 +1754,8 @@ impl App {
                     comment.end_line + 1,
                     comment.command
                 );
-                let text = if text.chars().count() > width && width > 1 {
-                    format!(
-                        "{}…",
-                        text.chars()
-                            .take(width.saturating_sub(1))
-                            .collect::<String>()
-                    )
+                let text = if display_width(&text) > width {
+                    truncate_to_width(&text, width)
                 } else {
                     text
                 };
@@ -1912,13 +1904,9 @@ impl App {
                     .saturating_sub(stats_width)
                     .saturating_sub(1);
 
-                let path = if is_selected {
-                    file.path.clone()
-                } else {
-                    git::ellipsize_middle(&file.path, path_budget.max(10))
-                };
+                let path = ellipsize_middle_display(&file.path, path_budget);
 
-                let path_display_width = path.chars().count();
+                let path_display_width = display_width(&path);
                 let padding = inner_width
                     .saturating_sub(prefix_width)
                     .saturating_sub(path_display_width)
@@ -2496,7 +2484,7 @@ impl App {
                 } else {
                     let name_col = commands
                         .iter()
-                        .map(|b| b.palette_name.unwrap().len())
+                        .map(|b| display_width(b.palette_name.unwrap()))
                         .max()
                         .unwrap_or(0);
                     let inner_w = popup.width as usize - 3;
@@ -2505,7 +2493,10 @@ impl App {
                         .iter()
                         .map(|binding| {
                             let name = binding.palette_name.unwrap();
-                            let name_padded = format!("{name:name_col$}");
+                            let name_padded = format!(
+                                "{name}{}",
+                                " ".repeat(name_col.saturating_sub(display_width(name)))
+                            );
                             let mut spans = vec![Span::styled(
                                 name_padded,
                                 Style::default()
@@ -2514,13 +2505,14 @@ impl App {
                             )];
                             let desc_avail = inner_w.saturating_sub(name_col + gap);
                             let desc = binding.palette_description.unwrap_or("");
-                            let desc_display =
-                                if desc.chars().count() > desc_avail && desc_avail > 1 {
-                                    let end: String = desc.chars().take(desc_avail - 1).collect();
-                                    format!("  {end}\u{2026}")
-                                } else {
-                                    format!("  {desc:desc_avail$}")
-                                };
+                            let desc_display = if display_width(desc) > desc_avail {
+                                format!("  {}", truncate_to_width(desc, desc_avail))
+                            } else {
+                                format!(
+                                    "  {desc}{}",
+                                    " ".repeat(desc_avail.saturating_sub(display_width(desc)))
+                                )
+                            };
                             spans.push(Span::styled(
                                 desc_display,
                                 Style::default().fg(self.theme.hint_desc_fg),
@@ -3926,9 +3918,12 @@ impl App {
                     .enumerate()
                 {
                     let y = body_inner.y + display_row as u16;
-                    for (display_col, ch) in
-                        line.chars().take(body_inner.width as usize).enumerate()
-                    {
+                    let mut display_col = 0usize;
+                    for ch in line.chars() {
+                        let ch_width = ch.width().unwrap_or(0);
+                        if display_col + ch_width > body_inner.width as usize {
+                            break;
+                        }
                         let x = body_inner.x + display_col as u16;
                         let selected =
                             self.startup_log_selection
@@ -3946,6 +3941,7 @@ impl App {
                             Style::default().fg(self.theme.text_fg)
                         };
                         frame.buffer_mut().set_string(x, y, ch.to_string(), style);
+                        display_col += ch_width;
                     }
                 }
 
@@ -6519,10 +6515,11 @@ impl App {
                         ];
                         let text_preview = text.replace('\n', "↵");
                         // " " + name + " (label)" + " — "
-                        let prefix_len = 1 + name.len() + surface_label.len() + 3;
+                        let prefix_len =
+                            1 + display_width(name) + display_width(&surface_label) + 3;
                         let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
-                        let truncated = if text_preview.len() > max_len {
-                            format!("{}…", &text_preview[..max_len.saturating_sub(1)])
+                        let truncated = if display_width(&text_preview) > max_len {
+                            truncate_to_width(&text_preview, max_len)
                         } else {
                             text_preview
                         };
@@ -6841,7 +6838,12 @@ impl App {
                 Style::default().fg(self.theme.text_fg)
             };
             let y = term_area.y + row as u16;
-            for (col, ch) in line.chars().take(term_area.width as usize).enumerate() {
+            let mut col = 0usize;
+            for ch in line.chars() {
+                let ch_width = ch.width().unwrap_or(0);
+                if col + ch_width > term_area.width as usize {
+                    break;
+                }
                 let selected = self.terminal_selection.as_ref().is_some_and(|selection| {
                     selection.anchor != selection.end
                         && selection.contains(viewer.scroll_offset + row as u16, col as u16)
@@ -6854,6 +6856,7 @@ impl App {
                 frame
                     .buffer_mut()
                     .set_string(term_area.x + col as u16, y, ch.to_string(), style);
+                col += ch_width;
             }
         }
 
@@ -7032,7 +7035,7 @@ impl App {
         // ── List block (bottom, connected borders) ──
         let name_col = filtered
             .iter()
-            .map(|&(name, _)| name.chars().count())
+            .map(|&(name, _)| display_width(name))
             .max()
             .unwrap_or(0);
         let inner_w = list_area.width.saturating_sub(3) as usize; // borders + padding
@@ -7048,7 +7051,10 @@ impl App {
             filtered
                 .iter()
                 .map(|&(name, text)| {
-                    let name_padded = format!("{name:name_col$}");
+                    let name_padded = format!(
+                        "{name}{}",
+                        " ".repeat(name_col.saturating_sub(display_width(name)))
+                    );
                     let mut spans = vec![Span::styled(
                         name_padded,
                         Style::default()
@@ -7057,17 +7063,14 @@ impl App {
                     )];
                     let text_preview = text.replace('\n', "↵");
                     let desc_avail = inner_w.saturating_sub(name_col + gap);
-                    let desc_display =
-                        if text_preview.chars().count() > desc_avail && desc_avail > 1 {
-                            let end = text_preview
-                                .char_indices()
-                                .nth(desc_avail - 1)
-                                .map(|(i, _)| i)
-                                .unwrap_or(text_preview.len());
-                            format!("  {}\u{2026}", &text_preview[..end])
-                        } else {
-                            format!("  {text_preview:desc_avail$}")
-                        };
+                    let desc_display = if display_width(&text_preview) > desc_avail {
+                        format!("  {}", truncate_to_width(&text_preview, desc_avail))
+                    } else {
+                        format!(
+                            "  {text_preview}{}",
+                            " ".repeat(desc_avail.saturating_sub(display_width(&text_preview)))
+                        )
+                    };
                     spans.push(Span::styled(
                         desc_display,
                         Style::default().fg(self.theme.hint_desc_fg),
@@ -7717,82 +7720,69 @@ impl App {
             return;
         }
 
-        let prefix_w = prefix.chars().count();
+        let prefix_w = display_width(&prefix);
         let buf = frame.buffer_mut();
         let y = area.y;
         let sx = area.x;
-        let mut x = sx;
+        let content_x = sx.saturating_add(1);
+        let right_cap_x = sx + area.width.saturating_sub(1);
 
         // Left cap.
-        set_cell(buf, x, y, left_cap, cap_style);
-        x += 1;
+        set_cell(buf, sx, y, left_cap, cap_style);
 
+        let mut used = 0usize;
         if !has_title || inner_w <= prefix_w + 4 {
             // No title or not enough room — render just the prefix, padded.
             // " ⎇ owner/repo#1234 "
-            let content = format!("{prefix} ");
-            for ch in content.chars() {
-                if (x - sx) as usize > inner_w {
-                    break;
-                }
-                set_cell(buf, x, y, &ch.to_string(), text_style);
-                x += 1;
-            }
-            // Fill remaining space.
-            while (x - sx) as usize <= inner_w {
-                set_cell(buf, x, y, " ", fill_style);
-                x += 1;
-            }
+            let content = truncate_to_width(&format!("{prefix} "), inner_w);
+            used = draw_text_cells(buf, content_x, y, inner_w, &content, text_style);
         } else {
             // Render prefix + arrow + title.
             // " ⎇ owner/repo#1234 ▸ PR title here "
             let arrow = " \u{2192} "; // " ▸ "
-            let arrow_w = arrow.chars().count();
+            let arrow_w = display_width(arrow);
 
             // Write prefix.
-            for ch in prefix.chars() {
-                set_cell(buf, x, y, &ch.to_string(), text_style);
-                x += 1;
-            }
+            used += draw_text_cells(buf, content_x, y, inner_w, &prefix, text_style);
 
             // Write arrow separator.
-            for ch in arrow.chars() {
-                set_cell(buf, x, y, &ch.to_string(), fill_style);
-                x += 1;
-            }
+            used += draw_text_cells(
+                buf,
+                content_x.saturating_add(used as u16),
+                y,
+                inner_w.saturating_sub(used),
+                arrow,
+                fill_style,
+            );
 
             // Remaining space for the title + trailing space.
-            let used = prefix_w + arrow_w;
-            let title_budget = inner_w.saturating_sub(used + 1); // +1 for trailing space
+            let title_budget = inner_w.saturating_sub((prefix_w + arrow_w) + 1);
 
             // Write title, ellipsized if needed.
-            let title_w = title_trimmed.chars().count();
-            if title_w > title_budget {
-                for (i, ch) in title_trimmed.chars().enumerate() {
-                    if i + 1 >= title_budget {
-                        set_cell(buf, x, y, "…", title_style);
-                        x += 1;
-                        break;
-                    }
-                    set_cell(buf, x, y, &ch.to_string(), title_style);
-                    x += 1;
-                }
-            } else {
-                for ch in title_trimmed.chars() {
-                    set_cell(buf, x, y, &ch.to_string(), title_style);
-                    x += 1;
-                }
-            }
+            let title = truncate_to_width(title_trimmed, title_budget);
+            used += draw_text_cells(
+                buf,
+                content_x.saturating_add(used as u16),
+                y,
+                inner_w.saturating_sub(used),
+                &title,
+                title_style,
+            );
+        }
 
-            // Fill remaining space to the right cap.
-            while (x - sx) as usize <= inner_w {
-                set_cell(buf, x, y, " ", fill_style);
-                x += 1;
-            }
+        while used < inner_w {
+            set_cell(
+                buf,
+                content_x.saturating_add(used as u16),
+                y,
+                " ",
+                fill_style,
+            );
+            used += 1;
         }
 
         // Right cap.
-        set_cell(buf, x, y, right_cap, cap_style);
+        set_cell(buf, right_cap_x, y, right_cap, cap_style);
     }
 }
 
@@ -7803,6 +7793,141 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, symbol: &str, sty
         return;
     }
     buf[(x, y)].set_symbol(symbol).set_style(style);
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    match max_width {
+        0 => String::new(),
+        1 => "…".to_string(),
+        _ => {
+            let mut out = String::new();
+            let mut width = 0usize;
+            let content_width = max_width - 1;
+            for ch in text.chars() {
+                let ch_width = ch.width().unwrap_or(0);
+                if width + ch_width > content_width {
+                    break;
+                }
+                out.push(ch);
+                width += ch_width;
+            }
+            out.push('…');
+            out
+        }
+    }
+}
+
+fn ellipsize_middle_display(input: &str, max_width: usize) -> String {
+    if display_width(input) <= max_width {
+        return input.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let left_target = (max_width - 3) / 2;
+    let right_target = max_width - 3 - left_target;
+    let mut left = String::new();
+    let mut left_width = 0usize;
+    for ch in input.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if left_width + ch_width > left_target {
+            break;
+        }
+        left.push(ch);
+        left_width += ch_width;
+    }
+
+    let mut right_chars = Vec::new();
+    let mut right_width = 0usize;
+    for ch in input.chars().rev() {
+        let ch_width = ch.width().unwrap_or(0);
+        if right_width + ch_width > right_target {
+            break;
+        }
+        right_chars.push(ch);
+        right_width += ch_width;
+    }
+    let right = right_chars.into_iter().rev().collect::<String>();
+    format!("{left}...{right}")
+}
+
+fn draw_text_cells(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    max_width: usize,
+    text: &str,
+    style: Style,
+) -> usize {
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if used + ch_width > max_width {
+            break;
+        }
+        set_cell(
+            buf,
+            x.saturating_add(used as u16),
+            y,
+            &ch.to_string(),
+            style,
+        );
+        used += ch_width;
+    }
+    used
+}
+
+fn draw_terminal_snapshot_cell(
+    buf: &mut ratatui::buffer::Buffer,
+    term_area: Rect,
+    cell: &crate::pty::SnapshotCell,
+    style: Style,
+) {
+    if cell.row >= term_area.height || cell.col >= term_area.width {
+        return;
+    }
+
+    let x = term_area.x + cell.col;
+    let y = term_area.y + cell.row;
+    let symbol_width = display_width(&cell.symbol).max(1);
+    let remaining_width = usize::from(term_area.width - cell.col);
+    if symbol_width > remaining_width {
+        buf[(x, y)].set_symbol(" ").set_style(style);
+        return;
+    }
+
+    buf[(x, y)].set_symbol(&cell.symbol).set_style(style);
+    for offset in 1..symbol_width {
+        let spacer_x = x.saturating_add(offset as u16);
+        if spacer_x < term_area.x + term_area.width {
+            buf[(spacer_x, y)].set_symbol(" ").set_style(style);
+        }
+    }
+}
+
+fn keep_box_drawing_cells_fresh(buf: &mut ratatui::buffer::Buffer) {
+    let area = *buf.area();
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell = &mut buf[(x, y)];
+            if cell.symbol().chars().any(is_box_drawing_char) {
+                cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
+}
+
+fn is_box_drawing_char(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{257f}')
 }
 
 /// Truncate `text` to at most `available` **characters**, appending `…` when
@@ -8221,5 +8346,118 @@ mod tests {
         assert_eq!(status_footer_lines("short", 40), 1);
         assert_eq!(status_footer_lines("this message is too wide", 10), 2);
         assert_eq!(status_footer_lines("anything", 0), 1);
+    }
+
+    #[test]
+    fn truncate_to_width_respects_wide_characters() {
+        let result = truncate_to_width("ab界cd", 4);
+
+        assert_eq!(result, "ab…");
+        assert!(display_width(&result) <= 4);
+    }
+
+    #[test]
+    fn ellipsize_middle_display_respects_wide_characters() {
+        let result = ellipsize_middle_display("src/界界界/file.rs", 10);
+
+        assert!(display_width(&result) <= 10);
+        assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn draw_text_cells_stops_before_wide_character_would_overflow() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 4, 1));
+        let used = draw_text_cells(
+            &mut buffer,
+            0,
+            0,
+            3,
+            "ab界",
+            Style::default().fg(Color::White),
+        );
+
+        assert_eq!(used, 2);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), "b");
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn draw_terminal_snapshot_cell_clears_wide_character_spacer() {
+        let mut buffer = ratatui::buffer::Buffer::with_lines(["abcd"]);
+        let cell = crate::pty::SnapshotCell {
+            row: 0,
+            col: 1,
+            symbol: "界".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::empty(),
+        };
+
+        draw_terminal_snapshot_cell(
+            &mut buffer,
+            Rect::new(0, 0, 4, 1),
+            &cell,
+            Style::default().fg(Color::White),
+        );
+
+        assert_eq!(buffer[(1, 0)].symbol(), "界");
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+    }
+
+    #[test]
+    fn draw_terminal_snapshot_cell_does_not_draw_wide_character_past_right_edge() {
+        let mut buffer = ratatui::buffer::Buffer::with_lines(["abc│"]);
+        let cell = crate::pty::SnapshotCell {
+            row: 0,
+            col: 2,
+            symbol: "界".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::empty(),
+        };
+
+        draw_terminal_snapshot_cell(
+            &mut buffer,
+            Rect::new(0, 0, 3, 1),
+            &cell,
+            Style::default().fg(Color::White),
+        );
+
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+        assert_eq!(buffer[(3, 0)].symbol(), "│");
+    }
+
+    #[test]
+    fn keep_box_drawing_cells_fresh_marks_borders_for_repaint() {
+        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
+        keep_box_drawing_cells_fresh(&mut next);
+
+        for y in 0..3 {
+            for x in 0..3 {
+                let cell = &next[(x, y)];
+                let expected = if x == 1 && y == 1 {
+                    ratatui::buffer::CellDiffOption::None
+                } else {
+                    ratatui::buffer::CellDiffOption::AlwaysUpdate
+                };
+                assert_eq!(cell.diff_option, expected, "cell ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn keep_box_drawing_cells_fresh_forces_unchanged_border_diff() {
+        let prev = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
+        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
+
+        keep_box_drawing_cells_fresh(&mut next);
+
+        let diff = prev.diff(&next);
+        assert!(
+            diff.iter()
+                .any(|(x, y, cell)| *x == 2 && *y == 1 && cell.symbol() == "│"),
+            "unchanged right border must be emitted so terminals repaint cells cleared by wide glyphs"
+        );
     }
 }
