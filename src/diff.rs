@@ -8,6 +8,7 @@ use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, FontStyle, Style as SynStyle, ThemeSet};
 use syntect::parsing::SyntaxSet;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme as AppTheme;
 
@@ -443,8 +444,9 @@ fn expand_tabs(line: &str, tab_width: u16) -> String {
 ///
 /// Returns `(left, right)` where `left` contains the first `col` display
 /// columns and `right` contains the remainder. Spans are split mid-span if
-/// the boundary falls inside one. Uses character iteration rather than byte
-/// slicing to handle multi-byte UTF-8 safely.
+/// the boundary falls inside one. A wide character that would cross the
+/// boundary is kept entirely on the right so the left side never exceeds
+/// `col` terminal columns.
 fn split_spans_at(spans: &[Span<'static>], col: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let mut left: Vec<Span<'static>> = Vec::new();
     let mut right: Vec<Span<'static>> = Vec::new();
@@ -457,7 +459,7 @@ fn split_spans_at(spans: &[Span<'static>], col: usize) -> (Vec<Span<'static>>, V
             continue;
         }
 
-        let span_width = span.content.chars().count();
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
         if consumed + span_width <= col {
             // Entire span fits in the left side.
             left.push(span.clone());
@@ -467,17 +469,24 @@ fn split_spans_at(spans: &[Span<'static>], col: usize) -> (Vec<Span<'static>>, V
             }
         } else {
             // Split within this span.
-            let take = col - consumed;
-            let left_text: String = span.content.chars().take(take).collect();
-            let right_text: String = span.content.chars().skip(take).collect();
+            let mut left_text = String::new();
+            let mut right_text = String::new();
+            for ch in span.content.chars() {
+                let width = ch.width().unwrap_or(0);
+                if !past_split && consumed + width <= col {
+                    left_text.push(ch);
+                    consumed += width;
+                } else {
+                    right_text.push(ch);
+                    past_split = true;
+                }
+            }
             if !left_text.is_empty() {
                 left.push(Span::styled(left_text, span.style));
             }
             if !right_text.is_empty() {
                 right.push(Span::styled(right_text, span.style));
             }
-            past_split = true;
-            consumed = col;
         }
     }
 
@@ -492,21 +501,46 @@ fn blank_gutter_keeping_separator(gutter_spans: &[Span<'static>]) -> Vec<Span<'s
     for span in gutter_spans {
         if span.content.contains('│') {
             // Rebuild the span: spaces for every character except │.
-            let text: String = span
-                .content
-                .chars()
-                .map(|c| if c == '│' { '│' } else { ' ' })
-                .collect();
+            let mut text = String::new();
+            for c in span.content.chars() {
+                if c == '│' {
+                    text.push('│');
+                } else {
+                    text.push_str(&" ".repeat(c.width().unwrap_or(0)));
+                }
+            }
             out.push(Span::styled(text, span.style));
         } else {
-            let blanked: String = " ".repeat(span.content.chars().count());
+            let blanked: String = " ".repeat(UnicodeWidthStr::width(span.content.as_ref()));
             out.push(Span::styled(blanked, span.style));
         }
     }
     out
 }
 
-/// Find the best soft-break position within the first `max_col` characters of
+fn consume_leading_char_as_placeholder(
+    spans: Vec<Span<'static>>,
+) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let mut iter = spans.into_iter();
+    let Some(first_span) = iter.next() else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let style = first_span.style;
+    let mut chars = first_span.content.chars();
+    let _ = chars.next();
+    let remainder = chars.collect::<String>();
+
+    let chunk = vec![Span::styled("…", style)];
+    let mut rest = Vec::new();
+    if !remainder.is_empty() {
+        rest.push(Span::styled(remainder, style));
+    }
+    rest.extend(iter);
+    (chunk, rest)
+}
+
+/// Find the best soft-break position within the first `max_col` display columns of
 /// `spans`. Returns the column *after* the last space found, so the space stays
 /// on the current visual line and the next line starts with the following word.
 /// Returns `None` if no space exists within the window.
@@ -518,10 +552,14 @@ fn find_soft_break(spans: &[Span<'static>], max_col: usize) -> Option<usize> {
             if col >= max_col {
                 return last_space_end;
             }
-            if ch == ' ' {
-                last_space_end = Some(col + 1);
+            let width = ch.width().unwrap_or(0);
+            if col + width > max_col {
+                return last_space_end;
             }
-            col += 1;
+            if ch == ' ' {
+                last_space_end = Some(col + width);
+            }
+            col += width;
         }
     }
     last_space_end
@@ -562,7 +600,10 @@ pub fn wrap_diff_lines(
         let mut remaining = content_spans;
         let mut first = true;
         loop {
-            let remaining_width: usize = remaining.iter().map(|s| s.content.chars().count()).sum();
+            let remaining_width: usize = remaining
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
             if remaining_width == 0 {
                 break;
             }
@@ -573,7 +614,10 @@ pub fn wrap_diff_lines(
             } else {
                 remaining_width
             };
-            let (chunk, rest) = split_spans_at(&remaining, take);
+            let (mut chunk, mut rest) = split_spans_at(&remaining, take);
+            if chunk.is_empty() && !rest.is_empty() {
+                (chunk, rest) = consume_leading_char_as_placeholder(rest);
+            }
 
             let mut row_spans: Vec<Span<'static>> = if first {
                 gutter_spans.clone()
@@ -975,6 +1019,19 @@ mod tests {
     }
 
     #[test]
+    fn split_spans_keeps_wide_char_on_right_when_it_crosses_boundary() {
+        let spans = vec![Span::raw("a界b")];
+
+        let (left, right) = split_spans_at(&spans, 2);
+        let left_text: String = left.iter().map(|s| s.content.as_ref()).collect();
+        let right_text: String = right.iter().map(|s| s.content.as_ref()).collect();
+
+        assert_eq!(left_text, "a");
+        assert_eq!(right_text, "界b");
+        assert!(left_text.width() <= 2);
+    }
+
+    #[test]
     fn wrap_diff_lines_no_wrap_needed() {
         let lines = vec![Line::from(vec![
             Span::raw("123 "),
@@ -1077,6 +1134,28 @@ mod tests {
         assert_eq!(wrapped[0].to_string(), "Gabcd");
         assert_eq!(wrapped[1].to_string(), " efgh");
         assert_eq!(wrapped[2].to_string(), " ijkl");
+    }
+
+    #[test]
+    fn wrap_diff_lines_hard_breaks_by_display_width() {
+        let lines = vec![Line::from(vec![Span::raw("G"), Span::raw("界界界")])];
+        let wrapped = wrap_diff_lines(&lines, 5, 1);
+
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].to_string(), "G界界");
+        assert_eq!(wrapped[1].to_string(), " 界");
+        assert!(wrapped.iter().all(|line| line.width() <= 5));
+    }
+
+    #[test]
+    fn wrap_diff_lines_consumes_too_wide_char_for_narrow_content_width() {
+        let lines = vec![Line::from(vec![Span::raw("GUT "), Span::raw("界界")])];
+        let wrapped = wrap_diff_lines(&lines, 5, 4);
+
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].to_string(), "GUT …");
+        assert_eq!(wrapped[1].to_string(), "    …");
+        assert!(wrapped.iter().all(|line| line.width() <= 5));
     }
 
     #[test]

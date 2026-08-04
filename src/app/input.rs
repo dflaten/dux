@@ -1,6 +1,7 @@
 use super::components::{ButtonPressedTarget, PressedButton};
 use super::*;
 use chrono::Local;
+use unicode_width::UnicodeWidthChar;
 const MOUSE_WHEEL_LINES: usize = 3;
 const MIN_LEFT_WIDTH_PCT: u16 = 14;
 const MAX_LEFT_WIDTH_PCT: u16 = 38;
@@ -402,13 +403,31 @@ pub(crate) fn startup_command_log_visual_lines(content: &str, width: u16) -> Vec
     let width = usize::from(width);
     let mut lines = Vec::new();
     for line in content.split('\n') {
-        let chars = line.chars().collect::<Vec<_>>();
-        if chars.is_empty() {
+        if line.is_empty() {
             lines.push(String::new());
             continue;
         }
-        for chunk in chars.chunks(width) {
-            lines.push(chunk.iter().collect());
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if ch_width > width {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                lines.push("…".to_string());
+                continue;
+            }
+            if current_width + ch_width > width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        if !current.is_empty() {
+            lines.push(current);
         }
     }
     lines
@@ -7202,7 +7221,9 @@ mod tests {
 
     use super::DOUBLE_CLICK_THRESHOLD;
     use super::components::{ButtonPressedTarget, PressedButton};
-    use crate::app::input::{build_diff_comments_prompt, build_rebase_failed_prompt};
+    use crate::app::input::{
+        build_diff_comments_prompt, build_rebase_failed_prompt, startup_command_log_visual_lines,
+    };
     use crate::app::{
         AgentLaunchKind, App, BaseBranchUpdate, BranchWarningKind, CenterMode,
         ConfigReloadFailedFocus, ConfirmKillRunningPrompt, ConfirmNonDefaultBranchFocus,
@@ -7235,6 +7256,7 @@ mod tests {
     use ratatui::text::Line;
     use std::process::Command;
     use tempfile::tempdir;
+    use unicode_width::UnicodeWidthStr;
 
     fn default_bindings() -> RuntimeBindings {
         RuntimeBindings::new(
@@ -7268,6 +7290,14 @@ mod tests {
             },
             true,
         )
+    }
+
+    #[test]
+    fn startup_command_log_visual_lines_wraps_by_display_width() {
+        let lines = startup_command_log_visual_lines("ab界cd", 4);
+
+        assert_eq!(lines, vec!["ab界", "cd"]);
+        assert!(lines.iter().all(|line| line.width() <= 4));
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
