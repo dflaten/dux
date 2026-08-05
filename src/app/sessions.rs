@@ -3136,8 +3136,6 @@ mod tests {
             worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: std::collections::HashMap::new(),
-            last_local_pty_input_at: None,
-            pty_cursor_tracker: None,
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
