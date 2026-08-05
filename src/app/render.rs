@@ -50,10 +50,6 @@ const TIP_MAX_WIDTH: u16 = 47;
 const TIP_GAP: u16 = 2;
 /// Maximum number of wrapped lines a tip may occupy.
 const TIP_MAX_LINES: u16 = 3;
-/// How long after a local keystroke the host cursor should track a PTY cursor.
-const PTY_HARDWARE_CURSOR_VISIBLE_AFTER_INPUT: Duration = Duration::from_millis(900);
-/// How long the child cursor must stay put before exposing it without input.
-const PTY_HARDWARE_CURSOR_STABLE_DELAY: Duration = Duration::from_millis(250);
 
 /// Welcome-screen tips shown beneath the ASCII logo. Wrap text in backticks
 /// to highlight it in an accent color (the backticks themselves are not
@@ -1308,10 +1304,6 @@ impl App {
 
         // Get the selected session's PTY screen.
         let session_id = self.selected_session().map(|s| s.id.clone());
-        let cursor_client_id = match active_surface {
-            SessionSurface::Agent => session_id.clone(),
-            SessionSurface::Terminal => self.active_terminal_id.clone(),
-        };
         let session_provider_name = match active_surface {
             SessionSurface::Agent => self
                 .selected_session()
@@ -1462,34 +1454,6 @@ impl App {
                         style = self.theme.selection_style();
                     }
                     draw_terminal_snapshot_cell(buf, term_area, cell, style);
-                }
-
-                // Position the hardware cursor if in input mode.
-                if is_input
-                    && let Some(cursor) = self.snapshot_buf.cursor
-                    && self.should_show_pty_hardware_cursor(cursor_client_id.as_deref(), cursor)
-                    && cursor.row < self.snapshot_buf.rows
-                    && cursor.col < self.snapshot_buf.cols
-                {
-                    let cx = term_area.x + cursor.col;
-                    let cy = term_area.y + cursor.row;
-                    if cx < term_area.x + term_area.width && cy < term_area.y + term_area.height {
-                        // Move the real terminal cursor onto the embedded PTY
-                        // cursor cell. IME composition popups (e.g. a Korean
-                        // IME) are drawn by the terminal/OS at the hardware
-                        // cursor; without this the composing character appears
-                        // at the terminal origin instead of the agent prompt
-                        // (issue #258). Do not also paint a cursor-colored
-                        // buffer cell here: when a later overlay/input places
-                        // the hardware cursor elsewhere, the painted cell looks
-                        // like a second blinking cursor inside the agent pane.
-                        //
-                        // This must stay the last use of `buf` in this block:
-                        // `set_cursor_position` reborrows `frame`, which is only
-                        // valid because the `buf = frame.buffer_mut()` borrow
-                        // above has ended. Do not add `buf[...]` accesses below.
-                        frame.set_cursor_position((cx, cy));
-                    }
                 }
 
                 // Suppress the scrollback indicator when the child is using
@@ -6790,43 +6754,6 @@ impl App {
         self.session_surface = saved;
     }
 
-    fn should_show_pty_hardware_cursor(
-        &mut self,
-        client_id: Option<&str>,
-        cursor: crate::pty::SnapshotCursor,
-    ) -> bool {
-        if self
-            .last_local_pty_input_at
-            .is_some_and(|last| last.elapsed() <= PTY_HARDWARE_CURSOR_VISIBLE_AFTER_INPUT)
-        {
-            return true;
-        }
-
-        let Some(client_id) = client_id else {
-            self.pty_cursor_tracker = None;
-            return false;
-        };
-        let now = Instant::now();
-        match &mut self.pty_cursor_tracker {
-            Some(tracker)
-                if tracker.client_id == client_id
-                    && tracker.row == cursor.row
-                    && tracker.col == cursor.col =>
-            {
-                tracker.stable_since.elapsed() >= PTY_HARDWARE_CURSOR_STABLE_DELAY
-            }
-            _ => {
-                self.pty_cursor_tracker = Some(PtyCursorTracker {
-                    client_id: client_id.to_string(),
-                    row: cursor.row,
-                    col: cursor.col,
-                    stable_since: now,
-                });
-                false
-            }
-        }
-    }
-
     fn render_fullscreen_startup_log(&mut self, frame: &mut Frame) {
         self.render_dim_overlay(frame);
         let area = centered_rect(96, 94, frame.area());
@@ -7471,13 +7398,17 @@ fn terminal_snapshot_cell_style(
 ) -> Style {
     let (fg, bg) = pty_cell_colors(cell.fg, cell.bg, is_input, theme);
     let mut modifier = cell.modifier;
-    if cursor.is_some_and(|cursor| cursor.row == cell.row && cursor.col == cell.col) {
+    let is_cursor = cursor.is_some_and(|cursor| cursor.row == cell.row && cursor.col == cell.col);
+    if is_cursor {
         modifier.remove(Modifier::REVERSED);
     }
 
     let mut style = Style::default().fg(fg).add_modifier(modifier);
     if let Some(bg) = bg {
         style = style.bg(bg);
+    }
+    if is_input && is_cursor {
+        style = style.fg(theme.input_cursor_fg).bg(theme.input_cursor_bg);
     }
     style
 }
@@ -8292,6 +8223,8 @@ mod tests {
             style.add_modifier.contains(Modifier::BOLD),
             "non-cursor styling on the cursor cell should be preserved"
         );
+        assert_eq!(style.fg, Some(theme.input_cursor_fg));
+        assert_eq!(style.bg, Some(theme.input_cursor_bg));
     }
 
     #[test]

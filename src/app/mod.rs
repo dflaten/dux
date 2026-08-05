@@ -114,13 +114,6 @@ pub struct App {
     /// Tracks when each agent last received PTY data, for the streaming
     /// activity spinner in the left pane.
     pub(crate) last_pty_activity: HashMap<String, Instant>,
-    /// Last time local user input was forwarded to an interactive PTY.
-    /// The renderer uses this to expose the host terminal cursor only while
-    /// it is useful for local text entry; provider-side redraws can move the
-    /// child cursor around the grid and should not drag a blinking host cursor
-    /// with them indefinitely.
-    pub(crate) last_local_pty_input_at: Option<Instant>,
-    pub(crate) pty_cursor_tracker: Option<PtyCursorTracker>,
     pub(crate) prev_scrollback_offset: usize,
     pub(crate) show_diff_line_numbers: bool,
     pub(crate) last_diff_height: u16,
@@ -230,14 +223,6 @@ pub(crate) struct BranchSyncEntry {
     pub(crate) session_id: String,
     pub(crate) worktree_path: String,
     pub(crate) branch_name: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PtyCursorTracker {
-    pub(crate) client_id: String,
-    pub(crate) row: u16,
-    pub(crate) col: u16,
-    pub(crate) stable_since: Instant,
 }
 
 /// Snapshot of session data shared with the PR-sync background worker.
@@ -1898,8 +1883,6 @@ impl App {
             worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: HashMap::new(),
-            last_local_pty_input_at: None,
-            pty_cursor_tracker: None,
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
