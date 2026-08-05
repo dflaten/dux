@@ -2302,9 +2302,21 @@ impl App {
                                 .selected_session()
                                 .map(|s| provider_config(&self.config, &s.provider).forward_scroll)
                                 .unwrap_or(false);
-                        if forward {
-                            if let Some(provider) = self.selected_terminal_surface_client() {
-                                let _ = provider.write_bytes(&raw);
+                        let child_handles_alt_screen_scroll = self
+                            .selected_terminal_surface_client()
+                            .is_some_and(|provider| {
+                                provider.is_alt_screen() && provider.has_mouse_mode()
+                            });
+                        if forward || child_handles_alt_screen_scroll {
+                            if let Some(provider) = self.selected_terminal_surface_client()
+                                && let Some(term_area) = self.mouse_layout.agent_term
+                                && let Some(translated) = crate::raw_input::translate_sgr_mouse(
+                                    &raw,
+                                    term_area.x,
+                                    term_area.y,
+                                )
+                            {
+                                let _ = provider.write_bytes(&translated);
                             }
                         } else if self.handle_mouse(mouse_ev) {
                             return Ok(true);
@@ -14041,6 +14053,58 @@ cyan = "#00ffff"
         terminal.backend_mut().assert_cursor_position(expected);
     }
 
+    /// The embedded PTY cursor should be represented by the real terminal
+    /// cursor only. Painting an additional cursor-colored cell leaves a stale
+    /// cursor-looking block behind when another input overlay places the real
+    /// cursor elsewhere.
+    #[test]
+    fn interactive_agent_does_not_paint_cursor_block_cell() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let args = vec![
+            "-c".to_string(),
+            "printf '\\033[5;9HX'; sleep 30".to_string(),
+        ];
+        let client = PtyClient::spawn("/bin/sh", &args, std::path::Path::new("."), 24, 80, 100)
+            .expect("spawn pty");
+        app.providers.insert(session_id, client);
+
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.center_mode = CenterMode::Agent;
+        app.focus = FocusPane::Center;
+
+        wait_for_agent_cursor(&mut app, 4, 9);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        let term_area = app
+            .mouse_layout
+            .agent_term
+            .expect("agent terminal area should be recorded after render");
+        let cursor_cell = terminal
+            .backend()
+            .buffer()
+            .cell((term_area.x + 9, term_area.y + 4))
+            .expect("cursor cell should be inside the rendered buffer");
+
+        assert_ne!(
+            cursor_cell.bg, app.theme.prompt_cursor,
+            "agent render must not paint a cursor-colored buffer cell"
+        );
+        terminal
+            .backend_mut()
+            .assert_cursor_position((term_area.x + 9, term_area.y + 4));
+    }
+
     /// The hardware cursor must only track the PTY in interactive (input) mode.
     /// In a non-interactive agent view there is no IME input, so the cursor
     /// must not be repositioned — otherwise it leaves a stray blinking cursor
@@ -14330,6 +14394,65 @@ cyan = "#00ffff"
                 .scrollback_offset(),
             0,
             "End should scroll to bottom when scrolled back"
+        );
+    }
+
+    #[test]
+    fn alt_screen_mouse_mode_scroll_forwards_even_without_provider_forward_scroll() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+        app.sessions[0].provider = ProviderKind::from_str("claude");
+
+        let agent = PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1049h\\033[?1000h'; stty raw -echo; exec cat -v".to_string(),
+            ],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn mouse-aware alt-screen pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+
+        for _ in 0..100 {
+            if app
+                .selected_terminal_surface_client()
+                .is_some_and(|provider| provider.is_alt_screen() && provider.has_mouse_mode())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.selected_terminal_surface_client()
+                .is_some_and(|provider| provider.is_alt_screen() && provider.has_mouse_mode()),
+            "test setup should enable alt screen mouse reporting"
+        );
+        assert!(
+            !crate::app::provider_config(&app.config, &ProviderKind::from_str("claude"))
+                .forward_scroll,
+            "test setup should use Claude's host-scrollback default"
+        );
+
+        app.process_raw_input_bytes(b"\x1b[<64;31;6M")
+            .expect("process scroll-up event");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let rendered = app
+            .selected_terminal_surface_client()
+            .expect("agent provider")
+            .visible_text_excerpt(5);
+        assert!(
+            rendered.contains("[<64;10;5M"),
+            "mouse-aware alt-screen child should receive translated scroll event, got: {rendered:?}"
         );
     }
 

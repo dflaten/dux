@@ -1455,7 +1455,7 @@ impl App {
                     draw_terminal_snapshot_cell(buf, term_area, cell, style);
                 }
 
-                // Render cursor if in input mode.
+                // Position the hardware cursor if in input mode.
                 if is_input
                     && let Some(cursor) = self.snapshot_buf.cursor
                     && cursor.row < self.snapshot_buf.rows
@@ -1464,19 +1464,15 @@ impl App {
                     let cx = term_area.x + cursor.col;
                     let cy = term_area.y + cursor.row;
                     if cx < term_area.x + term_area.width && cy < term_area.y + term_area.height {
-                        let cursor_cell = &mut buf[(cx, cy)];
-                        cursor_cell.set_style(
-                            Style::default()
-                                .fg(self.theme.input_cursor_fg)
-                                .bg(self.theme.prompt_cursor),
-                        );
                         // Move the real terminal cursor onto the embedded PTY
                         // cursor cell. IME composition popups (e.g. a Korean
                         // IME) are drawn by the terminal/OS at the hardware
                         // cursor; without this the composing character appears
                         // at the terminal origin instead of the agent prompt
-                        // (issue #258). The styled cell above keeps the block
-                        // cursor look; this aligns the hardware cursor with it.
+                        // (issue #258). Do not also paint a cursor-colored
+                        // buffer cell here: when a later overlay/input places
+                        // the hardware cursor elsewhere, the painted cell looks
+                        // like a second blinking cursor inside the agent pane.
                         //
                         // This must stay the last use of `buf` in this block:
                         // `set_cursor_position` reborrows `frame`, which is only
