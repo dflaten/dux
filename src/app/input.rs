@@ -2390,6 +2390,9 @@ impl App {
         if needs_selection_clear {
             self.terminal_selection = None;
         }
+        if needs_selection_clear && !is_scrolled_back {
+            self.last_local_pty_input_at = Some(std::time::Instant::now());
+        }
 
         Ok(false)
     }
@@ -7487,6 +7490,8 @@ mod tests {
             worktree_cleanup_visible_candidates: 1,
             last_pty_size: (0, 0),
             last_pty_activity: std::collections::HashMap::new(),
+            last_local_pty_input_at: None,
+            pty_cursor_tracker: None,
             prev_scrollback_offset: 0,
             last_diff_height: 0,
             last_diff_visual_lines: 0,
@@ -13948,6 +13953,10 @@ cyan = "#00ffff"
         );
     }
 
+    fn mark_recent_local_pty_input(app: &mut App) {
+        app.last_local_pty_input_at = Some(std::time::Instant::now());
+    }
+
     /// Regression test for issue #258: while the interactive agent terminal is
     /// rendered, the real (hardware) terminal cursor must be moved onto the
     /// embedded PTY cursor cell. IME composition popups (e.g. a Korean IME) are
@@ -13980,6 +13989,7 @@ cyan = "#00ffff"
 
         // Wait until the child's cursor escape has been parsed (no fixed sleep).
         wait_for_agent_cursor(&mut app, 4, 9);
+        mark_recent_local_pty_input(&mut app);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -14033,6 +14043,7 @@ cyan = "#00ffff"
         app.focus = FocusPane::Center;
 
         wait_for_agent_cursor(&mut app, 4, 9);
+        mark_recent_local_pty_input(&mut app);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -14053,12 +14064,8 @@ cyan = "#00ffff"
         terminal.backend_mut().assert_cursor_position(expected);
     }
 
-    /// The embedded PTY cursor should be represented by the real terminal
-    /// cursor only. Painting an additional cursor-colored cell leaves a stale
-    /// cursor-looking block behind when another input overlay places the real
-    /// cursor elsewhere.
     #[test]
-    fn interactive_agent_does_not_paint_cursor_block_cell() {
+    fn interactive_agent_hides_hardware_cursor_without_recent_local_input() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -14090,6 +14097,52 @@ cyan = "#00ffff"
             .mouse_layout
             .agent_term
             .expect("agent terminal area should be recorded after render");
+        assert!(
+            term_area.x > 0 || term_area.y > 0,
+            "test setup: agent terminal should be offset from the origin"
+        );
+
+        terminal.backend_mut().assert_cursor_position((0u16, 0u16));
+    }
+
+    /// The embedded PTY cursor should be represented by the real terminal
+    /// cursor only. Painting an additional cursor-colored cell leaves a stale
+    /// cursor-looking block behind when another input overlay places the real
+    /// cursor elsewhere.
+    #[test]
+    fn interactive_agent_does_not_paint_cursor_block_cell() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let args = vec![
+            "-c".to_string(),
+            "printf '\\033[5;9HX'; sleep 30".to_string(),
+        ];
+        let client = PtyClient::spawn("/bin/sh", &args, std::path::Path::new("."), 24, 80, 100)
+            .expect("spawn pty");
+        app.providers.insert(session_id, client);
+
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.center_mode = CenterMode::Agent;
+        app.focus = FocusPane::Center;
+
+        wait_for_agent_cursor(&mut app, 4, 9);
+        mark_recent_local_pty_input(&mut app);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        let term_area = app
+            .mouse_layout
+            .agent_term
+            .expect("agent terminal area should be recorded after render");
         let cursor_cell = terminal
             .backend()
             .buffer()
@@ -14103,6 +14156,57 @@ cyan = "#00ffff"
         terminal
             .backend_mut()
             .assert_cursor_position((term_area.x + 9, term_area.y + 4));
+    }
+
+    #[test]
+    fn interactive_agent_strips_reverse_video_from_pty_cursor_cell() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let args = vec![
+            "-c".to_string(),
+            "printf '\\033[5;9H\\033[7mX\\033[5;9H'; sleep 30".to_string(),
+        ];
+        let client = PtyClient::spawn("/bin/sh", &args, std::path::Path::new("."), 24, 80, 100)
+            .expect("spawn pty");
+        app.providers.insert(session_id, client);
+
+        app.input_target = InputTarget::Agent;
+        app.session_surface = SessionSurface::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::None;
+        app.center_mode = CenterMode::Agent;
+        app.focus = FocusPane::Center;
+
+        wait_for_agent_cursor(&mut app, 4, 8);
+        mark_recent_local_pty_input(&mut app);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+
+        let term_area = app
+            .mouse_layout
+            .agent_term
+            .expect("agent terminal area should be recorded after render");
+        let cursor_cell = terminal
+            .backend()
+            .buffer()
+            .cell((term_area.x + 8, term_area.y + 4))
+            .expect("cursor cell should be inside the rendered buffer");
+
+        assert_eq!(cursor_cell.symbol(), "X");
+        assert!(
+            !cursor_cell.modifier.contains(Modifier::REVERSED),
+            "agent render must not paint reverse-video cursor styling under the hardware cursor"
+        );
+        terminal
+            .backend_mut()
+            .assert_cursor_position((term_area.x + 8, term_area.y + 4));
     }
 
     /// The hardware cursor must only track the PTY in interactive (input) mode.
