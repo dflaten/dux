@@ -50,6 +50,10 @@ const TIP_MAX_WIDTH: u16 = 47;
 const TIP_GAP: u16 = 2;
 /// Maximum number of wrapped lines a tip may occupy.
 const TIP_MAX_LINES: u16 = 3;
+/// How long after a local keystroke the host cursor should track a PTY cursor.
+const PTY_HARDWARE_CURSOR_VISIBLE_AFTER_INPUT: Duration = Duration::from_millis(900);
+/// How long the child cursor must stay put before exposing it without input.
+const PTY_HARDWARE_CURSOR_STABLE_DELAY: Duration = Duration::from_millis(250);
 
 /// Welcome-screen tips shown beneath the ASCII logo. Wrap text in backticks
 /// to highlight it in an accent color (the backticks themselves are not
@@ -1304,6 +1308,10 @@ impl App {
 
         // Get the selected session's PTY screen.
         let session_id = self.selected_session().map(|s| s.id.clone());
+        let cursor_client_id = match active_surface {
+            SessionSurface::Agent => session_id.clone(),
+            SessionSurface::Terminal => self.active_terminal_id.clone(),
+        };
         let session_provider_name = match active_surface {
             SessionSurface::Agent => self
                 .selected_session()
@@ -1440,11 +1448,12 @@ impl App {
                     {
                         continue;
                     }
-                    let (fg, bg) = pty_cell_colors(cell.fg, cell.bg, is_input, &self.theme);
-                    let mut style = Style::default().fg(fg).add_modifier(cell.modifier);
-                    if let Some(bg) = bg {
-                        style = style.bg(bg);
-                    }
+                    let mut style = terminal_snapshot_cell_style(
+                        cell,
+                        self.snapshot_buf.cursor,
+                        is_input,
+                        &self.theme,
+                    );
                     // Overlay selection highlight if this cell is selected.
                     if let Some(sel) = &self.terminal_selection
                         && sel.anchor != sel.end
@@ -1458,6 +1467,7 @@ impl App {
                 // Position the hardware cursor if in input mode.
                 if is_input
                     && let Some(cursor) = self.snapshot_buf.cursor
+                    && self.should_show_pty_hardware_cursor(cursor_client_id.as_deref(), cursor)
                     && cursor.row < self.snapshot_buf.rows
                     && cursor.col < self.snapshot_buf.cols
                 {
@@ -6780,6 +6790,43 @@ impl App {
         self.session_surface = saved;
     }
 
+    fn should_show_pty_hardware_cursor(
+        &mut self,
+        client_id: Option<&str>,
+        cursor: crate::pty::SnapshotCursor,
+    ) -> bool {
+        if self
+            .last_local_pty_input_at
+            .is_some_and(|last| last.elapsed() <= PTY_HARDWARE_CURSOR_VISIBLE_AFTER_INPUT)
+        {
+            return true;
+        }
+
+        let Some(client_id) = client_id else {
+            self.pty_cursor_tracker = None;
+            return false;
+        };
+        let now = Instant::now();
+        match &mut self.pty_cursor_tracker {
+            Some(tracker)
+                if tracker.client_id == client_id
+                    && tracker.row == cursor.row
+                    && tracker.col == cursor.col =>
+            {
+                tracker.stable_since.elapsed() >= PTY_HARDWARE_CURSOR_STABLE_DELAY
+            }
+            _ => {
+                self.pty_cursor_tracker = Some(PtyCursorTracker {
+                    client_id: client_id.to_string(),
+                    row: cursor.row,
+                    col: cursor.col,
+                    stable_since: now,
+                });
+                false
+            }
+        }
+    }
+
     fn render_fullscreen_startup_log(&mut self, frame: &mut Frame) {
         self.render_dim_overlay(frame);
         let area = centered_rect(96, 94, frame.area());
@@ -7414,6 +7461,25 @@ fn pty_cell_colors(fg: Color, bg: Color, is_input: bool, theme: &Theme) -> (Colo
     } else {
         (theme.overlay_dim_fg, Some(to_grayscale(bg)))
     }
+}
+
+fn terminal_snapshot_cell_style(
+    cell: &crate::pty::SnapshotCell,
+    cursor: Option<crate::pty::SnapshotCursor>,
+    is_input: bool,
+    theme: &Theme,
+) -> Style {
+    let (fg, bg) = pty_cell_colors(cell.fg, cell.bg, is_input, theme);
+    let mut modifier = cell.modifier;
+    if cursor.is_some_and(|cursor| cursor.row == cell.row && cursor.col == cell.col) {
+        modifier.remove(Modifier::REVERSED);
+    }
+
+    let mut style = Style::default().fg(fg).add_modifier(modifier);
+    if let Some(bg) = bg {
+        style = style.bg(bg);
+    }
+    style
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -8196,6 +8262,60 @@ mod tests {
         assert_eq!(
             pty_cell_colors(fg, Color::Reset, false, &theme),
             (theme.overlay_dim_fg, None)
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_cell_style_strips_reverse_from_cursor_cell() {
+        let theme = Theme::default_dark();
+        let cell = crate::pty::SnapshotCell {
+            row: 2,
+            col: 4,
+            symbol: "X".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::REVERSED | Modifier::BOLD,
+        };
+
+        let style = terminal_snapshot_cell_style(
+            &cell,
+            Some(crate::pty::SnapshotCursor { row: 2, col: 4 }),
+            true,
+            &theme,
+        );
+
+        assert!(
+            !style.add_modifier.contains(Modifier::REVERSED),
+            "the PTY cursor cell must not paint a second cursor-looking block"
+        );
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "non-cursor styling on the cursor cell should be preserved"
+        );
+    }
+
+    #[test]
+    fn terminal_snapshot_cell_style_preserves_reverse_away_from_cursor() {
+        let theme = Theme::default_dark();
+        let cell = crate::pty::SnapshotCell {
+            row: 2,
+            col: 4,
+            symbol: "X".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::REVERSED,
+        };
+
+        let style = terminal_snapshot_cell_style(
+            &cell,
+            Some(crate::pty::SnapshotCursor { row: 2, col: 5 }),
+            true,
+            &theme,
+        );
+
+        assert!(
+            style.add_modifier.contains(Modifier::REVERSED),
+            "reverse-video content away from the active cursor should still render"
         );
     }
 
