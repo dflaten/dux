@@ -1538,6 +1538,7 @@ pub(crate) enum AgentLaunchKind {
 pub(crate) struct AgentLaunchRequest {
     pub(crate) session: AgentSession,
     pub(crate) provider_config: ProviderCommandConfig,
+    pub(crate) provider_session_id: Option<String>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) resume: bool,
     pub(crate) pty_size: (u16, u16),
@@ -1548,6 +1549,7 @@ pub(crate) struct AgentLaunchRequest {
 pub(crate) struct AgentLaunchReadyData {
     pub(crate) request: AgentLaunchRequest,
     pub(crate) client: PtyClient,
+    pub(crate) previous_provider_session_ids: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1601,6 +1603,11 @@ pub(crate) enum WorkerEvent {
     CreateAgentFailed(String),
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
+    ProviderSessionIdDiscovered {
+        session_id: String,
+        provider: ProviderKind,
+        provider_session_id: String,
+    },
     ChangedFilesReady {
         watched: WatchedWorktree,
         quiet: bool,
@@ -2138,8 +2145,7 @@ impl App {
                 continue;
             }
 
-            let cfg = provider_config(&self.config, &session.provider);
-            if !cfg.supports_session_resume() {
+            if !self.should_resume_session(&session) {
                 continue;
             }
 
@@ -3840,6 +3846,7 @@ mod tests {
             worktree_path: format!("/tmp/worktrees/{id}"),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
@@ -4427,6 +4434,7 @@ leading_branch = "main"
             worktree_path: existing.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,

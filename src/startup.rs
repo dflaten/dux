@@ -393,6 +393,7 @@ mod tests {
             worktree_path: worktree.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,

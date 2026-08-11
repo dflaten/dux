@@ -7559,6 +7559,7 @@ mod tests {
             worktree_path: paths.worktrees_root.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
@@ -8731,6 +8732,7 @@ not_a_real_action = ["x"]
             worktree_path: app.paths.worktrees_root.join("other").display().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
@@ -9415,6 +9417,7 @@ not_a_real_action = ["x"]
             worktree_path: worktree.to_string_lossy().to_string(),
             title: Some("imported".to_string()),
             started_providers: vec!["codex".to_string()],
+            provider_session_ids: Default::default(),
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
@@ -9437,7 +9440,11 @@ not_a_real_action = ["x"]
         );
         app.worker_tx
             .send(WorkerEvent::AgentLaunchReady(Box::new(
-                crate::app::AgentLaunchReadyData { request, client },
+                crate::app::AgentLaunchReadyData {
+                    request,
+                    client,
+                    previous_provider_session_ids: Default::default(),
+                },
             )))
             .unwrap();
         app.drain_events();
@@ -10806,6 +10813,7 @@ not_a_real_action = ["x"]
             worktree_path: app.paths.worktrees_root.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
@@ -12539,6 +12547,95 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn opencode_resume_requires_discovered_provider_session_id() {
+        let mut app = test_app(default_bindings());
+        app.sessions[0].provider = ProviderKind::from_str("opencode");
+        app.sessions[0].started_providers = vec!["opencode".to_string()];
+        let session = app.sessions[0].clone();
+
+        assert!(
+            !app.should_resume_session(&session),
+            "opencode resume args need a provider session id"
+        );
+
+        app.sessions[0]
+            .provider_session_ids
+            .insert("opencode".to_string(), "ses_opencode_123".to_string());
+        let session = app.sessions[0].clone();
+
+        assert!(
+            app.should_resume_session(&session),
+            "opencode can resume once dux has captured its session id"
+        );
+        let cfg = crate::app::provider_config(&app.config, &session.provider);
+        assert_eq!(
+            cfg.resume_args_for(session.provider_session_id(&session.provider)),
+            Some(vec![
+                "--session".to_string(),
+                "ses_opencode_123".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn opencode_provider_picker_resume_requires_discovered_provider_session_id() {
+        let mut app = test_app(default_bindings());
+        app.sessions[0].provider = ProviderKind::from_str("codex");
+        app.sessions[0].status = SessionStatus::Detached;
+        app.sessions[0].started_providers = vec!["opencode".to_string()];
+
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(index) if *index == 0))
+            .expect("select the seeded session");
+
+        app.open_change_agent_provider_prompt()
+            .expect("open provider picker without discovered id");
+        match &app.prompt {
+            PromptState::ChangeAgentProvider(prompt) => {
+                let opencode = prompt
+                    .options
+                    .iter()
+                    .find(|option| option.provider.as_str() == "opencode")
+                    .expect("opencode option present");
+                assert!(
+                    opencode.supports_resume,
+                    "opencode supports resume through provider session ids"
+                );
+                assert!(
+                    !opencode.resume_available,
+                    "opencode should not advertise resume until dux captures a session id"
+                );
+            }
+            other => panic!("expected change-agent-provider prompt, got {other:?}"),
+        }
+
+        app.prompt = PromptState::None;
+        app.sessions[0]
+            .provider_session_ids
+            .insert("opencode".to_string(), "ses_opencode_123".to_string());
+
+        app.open_change_agent_provider_prompt()
+            .expect("open provider picker with discovered id");
+        match &app.prompt {
+            PromptState::ChangeAgentProvider(prompt) => {
+                let opencode = prompt
+                    .options
+                    .iter()
+                    .find(|option| option.provider.as_str() == "opencode")
+                    .expect("opencode option present");
+                assert!(
+                    opencode.resume_available,
+                    "opencode should advertise resume once its session id is captured"
+                );
+            }
+            other => panic!("expected change-agent-provider prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn launch_companion_terminal_sets_runtime_state_and_overlay() {
         let mut app = test_app(default_bindings());
 
@@ -13935,6 +14032,7 @@ cyan = "#00ffff"
         );
         app.config.ui.auto_reopen_agents = true;
         app.sessions[0].desired_running = true;
+        app.sessions[0].started_providers = vec!["codex".to_string()];
 
         app.restore_sessions();
         drain_until(&mut app, |app| {

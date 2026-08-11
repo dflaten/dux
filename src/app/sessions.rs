@@ -445,6 +445,9 @@ impl App {
             })
             .unwrap_or_default();
         AgentLaunchRequest {
+            provider_session_id: session
+                .provider_session_id(&session.provider)
+                .map(str::to_string),
             session,
             provider_config: cfg,
             env,
@@ -505,7 +508,10 @@ impl App {
 
     pub(crate) fn should_resume_session(&self, session: &AgentSession) -> bool {
         let cfg = provider_config(&self.config, &session.provider);
-        cfg.supports_session_resume() && session.has_started_provider(&session.provider)
+        session.has_started_provider(&session.provider)
+            && cfg
+                .resume_args_for(session.provider_session_id(&session.provider))
+                .is_some()
     }
 
     pub(crate) fn spawn_companion_terminal_for_session(
@@ -1332,7 +1338,10 @@ impl App {
                 let provider = ProviderKind::new(name.clone());
                 let cfg = provider_config(&self.config, &provider);
                 let supports_resume = cfg.supports_session_resume();
-                let resume_available = supports_resume && session.has_started_provider(&provider);
+                let resume_available = session.has_started_provider(&provider)
+                    && cfg
+                        .resume_args_for(session.provider_session_id(&provider))
+                        .is_some();
                 ChangeAgentProviderOption {
                     is_current: provider == session.provider,
                     provider,
@@ -3209,6 +3218,7 @@ mod tests {
             worktree_path: worktree.to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,

@@ -130,6 +130,7 @@ pub struct AgentSession {
     pub worktree_path: String,
     pub title: Option<String>,
     pub started_providers: Vec<String>,
+    pub provider_session_ids: BTreeMap<String, String>,
     pub desired_running: bool,
     pub auto_reopen_enabled: bool,
     pub status: SessionStatus,
@@ -149,6 +150,25 @@ impl AgentSession {
             return false;
         }
         self.started_providers.push(provider.as_str().to_string());
+        true
+    }
+
+    pub fn provider_session_id(&self, provider: &ProviderKind) -> Option<&str> {
+        self.provider_session_ids
+            .get(provider.as_str())
+            .map(String::as_str)
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    pub fn set_provider_session_id(&mut self, provider: &ProviderKind, session_id: String) -> bool {
+        if session_id.trim().is_empty() {
+            return false;
+        }
+        let key = provider.as_str().to_string();
+        if self.provider_session_ids.get(&key) == Some(&session_id) {
+            return false;
+        }
+        self.provider_session_ids.insert(key, session_id);
         true
     }
 }
