@@ -28,6 +28,13 @@ impl App {
                 WorkerEvent::AgentLaunchFailed(boxed) => {
                     self.handle_agent_launch_failed(*boxed);
                 }
+                WorkerEvent::ProviderSessionIdDiscovered {
+                    session_id,
+                    provider,
+                    provider_session_id,
+                } => {
+                    self.record_provider_session_id(&session_id, &provider, provider_session_id);
+                }
                 WorkerEvent::ChangedFilesReady {
                     watched,
                     quiet,
@@ -1226,7 +1233,11 @@ impl App {
     }
 
     fn handle_agent_launch_ready(&mut self, data: AgentLaunchReadyData) {
-        let AgentLaunchReadyData { request, client } = data;
+        let AgentLaunchReadyData {
+            request,
+            client,
+            previous_provider_session_ids,
+        } = data;
         let session = request.session.clone();
         let session_id = session.id.clone();
         self.agent_launches_in_flight.remove(&session_id);
@@ -1249,6 +1260,11 @@ impl App {
             if request.resume {
                 self.resume_fallback_candidates
                     .insert(session.id.clone(), Instant::now());
+            } else {
+                self.spawn_provider_session_id_discovery(
+                    &session,
+                    previous_provider_session_ids.clone(),
+                );
             }
             self.update_branch_sync_sessions();
             self.rebuild_left_items();
@@ -1294,6 +1310,8 @@ impl App {
         if request.resume {
             self.resume_fallback_candidates
                 .insert(session.id.clone(), Instant::now());
+        } else {
+            self.spawn_provider_session_id_discovery(&session, previous_provider_session_ids);
         }
         self.mark_session_desired_running(&session.id, true);
         self.mark_session_status(&session.id, SessionStatus::Active);
@@ -1320,6 +1338,62 @@ impl App {
             AgentLaunchKind::StartupAutoReopen => {}
             AgentLaunchKind::Create { .. } => unreachable!("create launch handled above"),
         }
+    }
+
+    fn spawn_provider_session_id_discovery(
+        &self,
+        session: &AgentSession,
+        previous_provider_session_ids: HashSet<String>,
+    ) {
+        if session.provider.as_str() != "opencode" {
+            return;
+        }
+        let session_id = session.id.clone();
+        let provider = session.provider.clone();
+        let worktree_path = session.worktree_path.clone();
+        let tx = self.worker_tx.clone();
+        thread::spawn(move || {
+            for _ in 0..60 {
+                if let Some(provider_session_id) = crate::opencode::latest_session_id_for_worktree(
+                    Path::new(&worktree_path),
+                    &previous_provider_session_ids,
+                ) {
+                    let _ = tx.send(WorkerEvent::ProviderSessionIdDiscovered {
+                        session_id,
+                        provider,
+                        provider_session_id,
+                    });
+                    return;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
+
+    fn record_provider_session_id(
+        &mut self,
+        session_id: &str,
+        provider: &ProviderKind,
+        provider_session_id: String,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return;
+        };
+        if !session.set_provider_session_id(provider, provider_session_id.clone()) {
+            return;
+        }
+        session.updated_at = Utc::now();
+        let _ = self.session_store.upsert_session(session);
+        logger::info(&format!(
+            "recorded {} session id for dux session {}: {}",
+            provider.as_str(),
+            session_id,
+            provider_session_id
+        ));
     }
 
     fn handle_agent_launch_failed(&mut self, data: AgentLaunchFailedData) {
@@ -2766,7 +2840,10 @@ pub(crate) fn run_create_agent_job(
             branch_name
         ));
     }
-    let started_providers = if launch_with_resume {
+    let provider_cfg = provider_config(&config, &provider);
+    let effective_launch_with_resume =
+        launch_with_resume && provider_cfg.resume_args_for(None).is_some();
+    let started_providers = if effective_launch_with_resume {
         vec![provider.as_str().to_string()]
     } else {
         Vec::new()
@@ -2781,13 +2858,13 @@ pub(crate) fn run_create_agent_job(
         worktree_path: worktree_path.to_string_lossy().to_string(),
         title,
         started_providers,
+        provider_session_ids: Default::default(),
         desired_running: true,
         auto_reopen_enabled: true,
         status: SessionStatus::Active,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let provider_cfg = provider_config(&config, &session.provider);
     // A provider must be configured to launch. A worktree pinned to one that
     // isn't (e.g. a retired default like Gemini after its stock block is pruned)
     // is refused rather than spawned as a bare command from PATH.
@@ -2869,7 +2946,7 @@ pub(crate) fn run_create_agent_job(
             )),
         }
     }
-    let launch_message = if launch_with_resume {
+    let launch_message = if effective_launch_with_resume {
         format!(
             "Continuing {} in the existing worktree...",
             session.provider.as_str()
@@ -2886,8 +2963,9 @@ pub(crate) fn run_create_agent_job(
     let request = AgentLaunchRequest {
         session,
         provider_config: provider_cfg,
+        provider_session_id: None,
         env,
-        resume: launch_with_resume,
+        resume: effective_launch_with_resume,
         pty_size: (rows, cols),
         scrollback_lines: config.ui.agent_scrollback_lines,
         kind: AgentLaunchKind::Create {
@@ -2901,7 +2979,18 @@ pub(crate) fn run_create_agent_job(
 }
 
 pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<WorkerEvent>) {
-    let launch_args = request.provider_config.interactive_args(request.resume);
+    let previous_provider_session_ids =
+        if !request.resume && request.session.provider.as_str() == "opencode" {
+            crate::opencode::session_ids_for_worktree(Path::new(&request.session.worktree_path))
+        } else {
+            HashSet::new()
+        };
+    let launch_args = request
+        .provider_config
+        .interactive_args_with_provider_session_id(
+            request.resume,
+            request.provider_session_id.as_deref(),
+        );
     let (rows, cols) = request.pty_size;
     logger::debug(&format!(
         "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
@@ -2978,7 +3067,11 @@ pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sende
     };
     logger::info(&format!("PTY session started for {}", request.session.id));
     let _ = worker_tx.send(WorkerEvent::AgentLaunchReady(Box::new(
-        AgentLaunchReadyData { request, client },
+        AgentLaunchReadyData {
+            request,
+            client,
+            previous_provider_session_ids,
+        },
     )));
 }
 
@@ -3346,6 +3439,7 @@ mod tests {
             worktree_path: worktree.to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
@@ -3501,6 +3595,7 @@ mod tests {
                 args: vec!["--ignored".to_string()],
                 ..Default::default()
             },
+            provider_session_id: None,
             resume: false,
             pty_size: (24, 80),
             scrollback_lines: 1_000,
@@ -3581,6 +3676,7 @@ mod tests {
             worktree_path: tmp.path().join("source").to_string_lossy().to_string(),
             title: None,
             started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,

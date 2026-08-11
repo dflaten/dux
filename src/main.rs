@@ -11,6 +11,7 @@ mod keybindings;
 mod lockfile;
 mod logger;
 mod model;
+mod opencode;
 mod provider;
 mod pty;
 mod raw_input;

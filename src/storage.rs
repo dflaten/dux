@@ -102,6 +102,12 @@ impl SessionStore {
         ensure_column(
             &self.conn,
             "agent_sessions",
+            "provider_session_ids",
+            "text not null default '{}'",
+        )?;
+        ensure_column(
+            &self.conn,
+            "agent_sessions",
             "desired_running",
             "integer not null default 0",
         )?;
@@ -429,9 +435,9 @@ impl SessionStore {
         self.conn.execute(
             r#"
             insert into agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             on conflict(id) do update set
                 project_path=excluded.project_path,
                 provider=excluded.provider,
@@ -440,6 +446,7 @@ impl SessionStore {
                 worktree_path=excluded.worktree_path,
                 title=excluded.title,
                 started_providers=excluded.started_providers,
+                provider_session_ids=excluded.provider_session_ids,
                 desired_running=excluded.desired_running,
                 auto_reopen_enabled=excluded.auto_reopen_enabled,
                 status=excluded.status,
@@ -455,6 +462,7 @@ impl SessionStore {
                 session.worktree_path,
                 session.title,
                 serialize_started_providers(&session.started_providers),
+                serialize_provider_session_ids(&session.provider_session_ids),
                 session.desired_running,
                 session.auto_reopen_enabled,
                 session.status.as_str(),
@@ -468,15 +476,16 @@ impl SessionStore {
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, desired_running, auto_reopen_enabled, status, created_at, updated_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at
             from agent_sessions
             order by updated_at desc
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
-            let created_at: String = row.get(12)?;
-            let updated_at: String = row.get(13)?;
+            let provider_session_ids: String = row.get(9)?;
+            let created_at: String = row.get(13)?;
+            let updated_at: String = row.get(14)?;
             Ok(AgentSession {
                 id: row.get(0)?,
                 project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -487,9 +496,10 @@ impl SessionStore {
                 title: row.get(6)?,
                 project_path: row.get(7)?,
                 started_providers: parse_started_providers(&started_providers),
-                desired_running: row.get(9)?,
-                auto_reopen_enabled: row.get(10)?,
-                status: SessionStatus::from_str(row.get::<_, String>(11)?.as_str()),
+                provider_session_ids: parse_provider_session_ids(&provider_session_ids),
+                desired_running: row.get(10)?,
+                auto_reopen_enabled: row.get(11)?,
+                status: SessionStatus::from_str(row.get::<_, String>(12)?.as_str()),
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
                 updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
             })
@@ -547,6 +557,14 @@ fn parse_started_providers(value: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
 }
 
+fn serialize_provider_session_ids(provider_session_ids: &BTreeMap<String, String>) -> String {
+    serde_json::to_string(provider_session_ids).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn parse_provider_session_ids(value: &str) -> BTreeMap<String, String> {
+    serde_json::from_str::<BTreeMap<String, String>>(value).unwrap_or_default()
+}
+
 pub fn fallback_pr_url(host: &str, owner_repo: &str, pr_number: u64) -> String {
     let host = if host.trim().is_empty() {
         "github.com"
@@ -587,6 +605,7 @@ fn test_session(
         worktree_path: format!("/tmp/{id}"),
         title: None,
         started_providers: Vec::new(),
+        provider_session_ids: BTreeMap::new(),
         desired_running: false,
         auto_reopen_enabled: true,
         status: SessionStatus::Active,
@@ -659,6 +678,24 @@ mod tests {
             vec!["claude".to_string(), "codex".to_string()]
         );
     }
+
+    #[test]
+    fn provider_session_ids_round_trip() {
+        let store = test_store();
+        let now = Utc::now();
+        let mut session = test_session("provider-session", now, now);
+        session.provider_session_ids = BTreeMap::from([
+            ("opencode".to_string(), "ses_opencode".to_string()),
+            ("codex".to_string(), "codex-session".to_string()),
+        ]);
+
+        store.upsert_session(&session).unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].provider_session_ids, session.provider_session_ids);
+    }
+
     #[test]
     fn projects_round_trip_all_project_fields() {
         let store = test_store();
@@ -780,6 +817,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(!loaded[0].desired_running);
         assert!(loaded[0].auto_reopen_enabled);
+        assert!(loaded[0].provider_session_ids.is_empty());
     }
 }
 

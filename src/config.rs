@@ -319,14 +319,40 @@ impl Default for ProviderCommandConfig {
 }
 
 impl ProviderCommandConfig {
-    pub fn interactive_args(&self, resume_session: bool) -> Vec<String> {
+    pub fn interactive_args_with_provider_session_id(
+        &self,
+        resume_session: bool,
+        provider_session_id: Option<&str>,
+    ) -> Vec<String> {
         let mut args = self.args.clone();
-        if resume_session
-            && let Some(resume_args) = self.resume_args.as_deref().filter(|args| !args.is_empty())
-        {
-            args.extend(resume_args.iter().cloned());
+        if resume_session && let Some(resume_args) = self.resume_args_for(provider_session_id) {
+            args.extend(resume_args);
         }
         args
+    }
+
+    pub fn resume_args_for(&self, provider_session_id: Option<&str>) -> Option<Vec<String>> {
+        let resume_args = self
+            .resume_args
+            .as_deref()
+            .filter(|args| !args.is_empty())?;
+        let requires_provider_session_id = resume_args
+            .iter()
+            .any(|arg| arg.contains("{provider_session_id}"));
+        if requires_provider_session_id && provider_session_id.is_none() {
+            return None;
+        }
+        Some(
+            resume_args
+                .iter()
+                .map(|arg| {
+                    arg.replace(
+                        "{provider_session_id}",
+                        provider_session_id.unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub fn supports_session_resume(&self) -> bool {
@@ -483,7 +509,8 @@ pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
         .with_context(|| format!("failed to parse {}", paths.config_path.display()))?;
     let deprecations_changed = apply_config_deprecations(&mut doc)?;
     let retired_changed = prune_retired_providers(&mut doc);
-    if deprecations_changed || retired_changed {
+    let opencode_resume_changed = disable_unsafe_stock_opencode_resume(&mut doc);
+    if deprecations_changed || retired_changed || opencode_resume_changed {
         fs::write(&paths.config_path, doc.to_string())
             .with_context(|| format!("failed to write {}", paths.config_path.display()))?;
     }
@@ -621,6 +648,57 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         install_hint: Some("brew install gemini-cli".to_string()),
         forward_scroll: false,
     }
+}
+
+/// The OpenCode block dux shipped before disabling provider-level resume. Its
+/// `--continue` flag resumes OpenCode's most recent global session, so startup
+/// auto-reopen could attach several dux worktrees to the same conversation.
+fn unsafe_stock_opencode_resume() -> ProviderCommandConfig {
+    ProviderCommandConfig {
+        command: "opencode".to_string(),
+        args: Vec::new(),
+        resume_args: Some(vec!["--continue".to_string()]),
+        resume_wait_timeout_ms: Some(3_000),
+        oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
+        oneshot_output: OneshotOutput::Stdout,
+        install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
+        forward_scroll: true,
+    }
+}
+
+/// Replace unsafe stock OpenCode resume args in existing configs while
+/// preserving customized OpenCode blocks. This keeps auto-reopen from asking
+/// OpenCode for its global "last session" for every worktree.
+fn disable_unsafe_stock_opencode_resume(doc: &mut DocumentMut) -> bool {
+    let Some(providers) = doc.get_mut("providers").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    let Some(table) = providers.get_mut("opencode").and_then(Item::as_table_mut) else {
+        return false;
+    };
+    let Some(provider) = provider_table_config(table) else {
+        return false;
+    };
+    let unsafe_stock = unsafe_stock_opencode_resume();
+    if provider.command != unsafe_stock.command
+        || provider.args != unsafe_stock.args
+        || provider.resume_args != unsafe_stock.resume_args
+        || provider.oneshot_args != unsafe_stock.oneshot_args
+        || provider.oneshot_output != unsafe_stock.oneshot_output
+        || provider.install_hint != unsafe_stock.install_hint
+        || provider.forward_scroll != unsafe_stock.forward_scroll
+    {
+        return false;
+    }
+
+    let safe_stock = stock_opencode();
+    let mut resume = Array::new();
+    for arg in safe_stock.resume_args.as_deref().unwrap_or(&[]) {
+        resume.push(arg.as_str());
+    }
+    table["resume_args"] = toml_edit::value(resume);
+    table.remove("resume_wait_timeout_ms");
+    true
 }
 
 /// Remove top-level provider tables for retired providers when they still match
@@ -1618,19 +1696,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 forward_scroll: false,
             },
         ),
-        (
-            "opencode",
-            ProviderCommandConfig {
-                command: "opencode".to_string(),
-                args: Vec::new(),
-                resume_args: Some(vec!["--continue".to_string()]),
-                resume_wait_timeout_ms: Some(3_000),
-                oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
-                oneshot_output: OneshotOutput::Stdout,
-                install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
-                forward_scroll: true,
-            },
-        ),
+        ("opencode", stock_opencode()),
         (
             "copilot",
             ProviderCommandConfig {
@@ -1638,8 +1704,8 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 args: Vec::new(),
                 // Copilot's --continue resumes the most recent session
                 // globally, not scoped to the current working directory.
-                // Unlike claude/codex/opencode, there is no flag to limit
-                // resume to the CWD, so we disable it.
+                // Unlike claude/codex, there is no flag to limit resume to the
+                // CWD, so we disable it.
                 resume_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
@@ -1653,6 +1719,22 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
             },
         ),
     ]
+}
+
+fn stock_opencode() -> ProviderCommandConfig {
+    ProviderCommandConfig {
+        command: "opencode".to_string(),
+        args: Vec::new(),
+        resume_args: Some(vec![
+            "--session".to_string(),
+            "{provider_session_id}".to_string(),
+        ]),
+        resume_wait_timeout_ms: None,
+        oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
+        oneshot_output: OneshotOutput::Stdout,
+        install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
+        forward_scroll: true,
+    }
 }
 
 fn render_provider_configs(out: &mut String, providers: &ProvidersConfig) {
@@ -1796,7 +1878,8 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     out.push_str(&format!("args = {}\n", render_string_list(&config.args)));
     out.push_str(
         "# Optional args dux should use when reconnecting a detached session.\n\
-         # Leave this empty for CLIs that do not support cwd/repo-scoped session resume.\n",
+         # Use {provider_session_id} for CLIs that need their own persisted session id.\n\
+         # Leave this empty for CLIs that do not support scoped session resume.\n",
     );
     out.push_str(&format!(
         "resume_args = {}\n",
@@ -2542,6 +2625,95 @@ oneshot_output = "stdout"
     }
 
     #[test]
+    fn disable_unsafe_stock_opencode_resume_replaces_stock_continue() {
+        let mut rendered = String::new();
+        render_provider_config(&mut rendered, "opencode", &unsafe_stock_opencode_resume());
+        let mut doc: DocumentMut = rendered.parse().expect("parse opencode provider");
+
+        let changed = disable_unsafe_stock_opencode_resume(&mut doc);
+
+        assert!(changed, "stock opencode resume args should be replaced");
+        let provider = provider_table_config(
+            doc["providers"]["opencode"]
+                .as_table()
+                .expect("opencode table"),
+        )
+        .expect("parse migrated opencode provider");
+        assert_eq!(
+            provider.resume_args,
+            Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string()
+            ])
+        );
+        assert_eq!(provider.resume_wait_timeout_ms, None);
+        assert!(provider.supports_session_resume());
+    }
+
+    #[test]
+    fn disable_unsafe_stock_opencode_resume_keeps_customized_block() {
+        let mut doc: DocumentMut = r#"
+[providers.opencode]
+command = "opencode-wrapper"
+args = []
+resume_args = ["--continue"]
+resume_wait_timeout_ms = 3000
+oneshot_args = ["run", "{prompt}"]
+oneshot_output = "stdout"
+install_hint = "curl -fsSL https://opencode.ai/install | bash"
+forward_scroll = true
+"#
+        .parse()
+        .expect("parse customized opencode provider");
+
+        let changed = disable_unsafe_stock_opencode_resume(&mut doc);
+
+        assert!(!changed, "customized opencode block must be preserved");
+        let provider = provider_table_config(
+            doc["providers"]["opencode"]
+                .as_table()
+                .expect("opencode table"),
+        )
+        .expect("parse preserved opencode provider");
+        assert_eq!(provider.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(provider.resume_wait_timeout_ms, Some(3_000));
+    }
+
+    #[test]
+    fn disable_unsafe_stock_opencode_resume_handles_missing_timeout() {
+        let mut doc: DocumentMut = r#"
+[providers.opencode]
+command = "opencode"
+args = []
+resume_args = ["--continue"]
+oneshot_args = ["run", "{prompt}"]
+oneshot_output = "stdout"
+install_hint = "curl -fsSL https://opencode.ai/install | bash"
+forward_scroll = true
+"#
+        .parse()
+        .expect("parse older opencode provider");
+
+        let changed = disable_unsafe_stock_opencode_resume(&mut doc);
+
+        assert!(changed, "older stock opencode block should be migrated");
+        let provider = provider_table_config(
+            doc["providers"]["opencode"]
+                .as_table()
+                .expect("opencode table"),
+        )
+        .expect("parse migrated opencode provider");
+        assert_eq!(
+            provider.resume_args,
+            Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string()
+            ])
+        );
+        assert_eq!(provider.resume_wait_timeout_ms, None);
+    }
+
+    #[test]
     fn ensure_config_prunes_stock_gemini_from_existing_config() {
         use tempfile::tempdir;
         let tmp = tempdir().expect("tempdir");
@@ -2680,7 +2852,7 @@ dangerous = true
     }
 
     #[test]
-    fn built_in_providers_ship_resume_args() {
+    fn built_in_cwd_scoped_providers_ship_resume_args() {
         let config = Config::default();
         assert_eq!(config.defaults.provider, "claude");
         let claude = config
@@ -2716,9 +2888,12 @@ dangerous = true
             install_hint: None,
             forward_scroll: false,
         };
-        assert_eq!(cfg.interactive_args(false), ["--interactive"]);
         assert_eq!(
-            cfg.interactive_args(true),
+            cfg.interactive_args_with_provider_session_id(false, None),
+            ["--interactive"]
+        );
+        assert_eq!(
+            cfg.interactive_args_with_provider_session_id(true, None),
             ["--interactive", "--resume", "--last"]
         );
 
@@ -2732,8 +2907,34 @@ dangerous = true
             install_hint: None,
             forward_scroll: false,
         };
-        assert_eq!(unsupported.interactive_args(true), ["--interactive"]);
+        assert_eq!(
+            unsupported.interactive_args_with_provider_session_id(true, None),
+            ["--interactive"]
+        );
         assert!(!unsupported.supports_session_resume());
+    }
+
+    #[test]
+    fn provider_command_config_expands_provider_session_id_resume_args() {
+        let cfg = ProviderCommandConfig {
+            command: "example".to_string(),
+            args: Vec::new(),
+            resume_args: Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.resume_args_for(None), None);
+        assert_eq!(
+            cfg.resume_args_for(Some("ses_123")),
+            Some(vec!["--session".to_string(), "ses_123".to_string()])
+        );
+        assert_eq!(
+            cfg.interactive_args_with_provider_session_id(true, Some("ses_123")),
+            vec!["--session".to_string(), "ses_123".to_string()]
+        );
     }
 
     #[test]
@@ -2848,13 +3049,21 @@ dangerous = true
     }
 
     #[test]
-    fn built_in_opencode_ships_resume_timeout() {
+    fn built_in_opencode_resumes_with_provider_session_id() {
         let config = Config::default();
         let opencode = config
             .providers
             .get("opencode")
             .expect("opencode provider should exist");
-        assert_eq!(opencode.resume_wait_timeout_ms, Some(3_000));
+        assert_eq!(
+            opencode.resume_args,
+            Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string()
+            ])
+        );
+        assert_eq!(opencode.resume_wait_timeout_ms, None);
+        assert!(opencode.supports_session_resume());
     }
 
     #[test]
@@ -2894,7 +3103,10 @@ dangerous = true
             .expect("custom provider should exist");
         assert_eq!(provider.resume_args, None);
         assert_eq!(provider.resume_wait_timeout_ms, None);
-        assert_eq!(provider.interactive_args(true), ["chat"]);
+        assert_eq!(
+            provider.interactive_args_with_provider_session_id(true, None),
+            ["chat"]
+        );
     }
 
     #[test]
@@ -3074,7 +3286,14 @@ oneshot_output = "stdout"
         assert_eq!(cfg.command, "opencode");
         assert_eq!(cfg.oneshot_args, vec!["run", "{prompt}"]);
         assert!(matches!(cfg.oneshot_output, OneshotOutput::Stdout));
-        assert!(cfg.resume_args.is_some());
+        assert_eq!(
+            cfg.resume_args,
+            Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string()
+            ])
+        );
+        assert!(cfg.supports_session_resume());
     }
 
     #[test]

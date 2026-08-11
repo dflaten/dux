@@ -71,7 +71,7 @@ args = ["--some-flag"]
 resume_args = ["--continue"]
 ```
 
-Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it.
+Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it. Use `{provider_session_id}` for CLIs that need their own persisted session id; OpenCode uses this by default so dux can pass `--session <id>` instead of the unsafe global `--continue`.
 
 When a provider supports resume args, dux can auto-reopen agents that were still running when the app exited. A normal agent exit with status code 0 is treated as intentional and will not be reopened. The feature is off by default; enable it globally with `[ui].auto_reopen_agents = true`, opt out a project with `auto_reopen_agents = false` in its `[[projects]]` entry, or use the `toggle-project-auto-reopen-agents` and `toggle-agent-auto-reopen` palette commands for project and per-agent opt-outs.
 
