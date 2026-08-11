@@ -2342,13 +2342,20 @@ impl App {
                         let shift_held = mouse_ev
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT);
-                        let should_select = !child_wants_mouse || shift_held;
+                        let should_select = !child_wants_mouse;
 
                         if should_select {
                             self.handle_terminal_selection_mouse(mouse_ev);
                         } else if child_wants_mouse {
-                            if Self::is_left_button_selection_event(mouse_ev.kind) {
+                            if Self::is_left_button_selection_event(mouse_ev.kind) && !shift_held {
                                 self.handle_terminal_selection_mouse(mouse_ev);
+                            } else if matches!(
+                                mouse_ev.kind,
+                                MouseEventKind::Down(MouseButton::Left)
+                            ) && shift_held
+                            {
+                                self.terminal_selection = None;
+                                self.terminal_selection_text = None;
                             }
                             // Translate screen-absolute coordinates to
                             // child-relative coordinates before forwarding.
@@ -14541,6 +14548,73 @@ cyan = "#00ffff"
         assert!(
             rendered.contains("[<64;10;5M"),
             "mouse-aware alt-screen child should receive translated scroll event, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn shift_click_forwards_to_mouse_mode_agent_without_local_selection() {
+        let mut app = test_app(default_bindings());
+        install_mouse_layout(&mut app);
+        let session_id = app.sessions[0].id.clone();
+        let worktree_path = app.sessions[0].worktree_path.clone();
+
+        let agent = PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf '\\033[?1000h'; stty raw -echo; exec cat -v".to_string(),
+            ],
+            std::path::Path::new(&worktree_path),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn mouse-aware agent pty");
+        app.providers.insert(session_id, agent);
+        app.session_surface = SessionSurface::Agent;
+        app.input_target = InputTarget::Agent;
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+
+        for _ in 0..100 {
+            if app
+                .selected_terminal_surface_client()
+                .is_some_and(|provider| provider.has_mouse_mode())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.selected_terminal_surface_client()
+                .is_some_and(|provider| provider.has_mouse_mode()),
+            "test setup should enable child mouse reporting"
+        );
+        app.terminal_selection = Some(TerminalSelection {
+            anchor: TermGridPos { row: 0, col: 0 },
+            end: TermGridPos { row: 0, col: 3 },
+            dragging: false,
+        });
+        app.terminal_selection_text = Some("stale".to_string());
+
+        app.process_raw_input_bytes(b"\x1b[<4;31;6M")
+            .expect("process shift-click event");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        assert!(
+            app.terminal_selection.is_none(),
+            "Shift-click in mouse mode should clear stale dux text selection"
+        );
+        assert!(
+            app.terminal_selection_text.is_none(),
+            "Shift-click in mouse mode should clear stale copied selection text"
+        );
+        let rendered = app
+            .selected_terminal_surface_client()
+            .expect("agent provider")
+            .visible_text_excerpt(5);
+        assert!(
+            rendered.contains("[<4;10;5M"),
+            "mouse-aware child should receive translated Shift-click event, got: {rendered:?}"
         );
     }
 
