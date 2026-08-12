@@ -7251,7 +7251,8 @@ impl App {
 
 fn is_terminal_link_click_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(
-        KeyModifiers::CONTROL
+        KeyModifiers::SHIFT
+            | KeyModifiers::CONTROL
             | KeyModifiers::ALT
             | KeyModifiers::SUPER
             | KeyModifiers::HYPER
@@ -7765,11 +7766,11 @@ mod tests {
 
     #[test]
     fn terminal_link_click_modifiers_include_macos_command_when_reported() {
+        assert!(is_terminal_link_click_modifier(KeyModifiers::SHIFT));
         assert!(is_terminal_link_click_modifier(KeyModifiers::SUPER));
         assert!(is_terminal_link_click_modifier(KeyModifiers::META));
         assert!(is_terminal_link_click_modifier(KeyModifiers::CONTROL));
         assert!(is_terminal_link_click_modifier(KeyModifiers::ALT));
-        assert!(!is_terminal_link_click_modifier(KeyModifiers::SHIFT));
         assert!(!is_terminal_link_click_modifier(KeyModifiers::NONE));
     }
 
