@@ -3,6 +3,7 @@ use super::components::{
     shared_button_width,
 };
 use super::*;
+use std::num::NonZeroU16;
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -472,7 +473,6 @@ impl App {
         self.render_files(frame, right);
         self.render_footer(frame, footer);
         self.render_overlay(frame);
-        keep_box_drawing_cells_fresh(frame.buffer_mut());
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1431,6 +1431,7 @@ impl App {
                 }
                 self.prev_scrollback_offset = scrollback_offset;
 
+                let hyperlink_ranges = terminal_links::ranges(&self.snapshot_buf);
                 let buf = frame.buffer_mut();
                 for cell in &self.snapshot_buf.cells {
                     if cell.row >= self.snapshot_buf.rows
@@ -1453,7 +1454,8 @@ impl App {
                     {
                         style = self.theme.selection_style();
                     }
-                    draw_terminal_snapshot_cell(buf, term_area, cell, style);
+                    let hyperlink = terminal_links::url_for_cell(cell, &hyperlink_ranges);
+                    draw_terminal_snapshot_cell(buf, term_area, cell, style, hyperlink);
                 }
 
                 // Suppress the scrollback indicator when the child is using
@@ -7879,11 +7881,21 @@ fn draw_text_cells(
     used
 }
 
+fn osc8_link_symbol(symbol: &str, url: &str) -> String {
+    let mut out = String::from("\x1b]8;;");
+    out.push_str(url);
+    out.push_str("\x1b\\");
+    out.push_str(symbol);
+    out.push_str("\x1b]8;;\x1b\\");
+    out
+}
+
 fn draw_terminal_snapshot_cell(
     buf: &mut ratatui::buffer::Buffer,
     term_area: Rect,
     cell: &crate::pty::SnapshotCell,
     style: Style,
+    hyperlink: Option<&str>,
 ) {
     if cell.row >= term_area.height || cell.col >= term_area.width {
         return;
@@ -7898,29 +7910,24 @@ fn draw_terminal_snapshot_cell(
         return;
     }
 
-    buf[(x, y)].set_symbol(&cell.symbol).set_style(style);
+    let rendered_symbol = hyperlink
+        .map(|link| osc8_link_symbol(&cell.symbol, link))
+        .unwrap_or_else(|| cell.symbol.to_string());
+    let target = &mut buf[(x, y)];
+    target.set_symbol(&rendered_symbol).set_style(style);
+    if hyperlink.is_some() {
+        let forced_width = u16::try_from(symbol_width)
+            .ok()
+            .and_then(NonZeroU16::new)
+            .unwrap_or(NonZeroU16::MIN);
+        target.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(forced_width));
+    }
     for offset in 1..symbol_width {
         let spacer_x = x.saturating_add(offset as u16);
         if spacer_x < term_area.x + term_area.width {
             buf[(spacer_x, y)].set_symbol(" ").set_style(style);
         }
     }
-}
-
-fn keep_box_drawing_cells_fresh(buf: &mut ratatui::buffer::Buffer) {
-    let area = *buf.area();
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            let cell = &mut buf[(x, y)];
-            if cell.symbol().chars().any(is_box_drawing_char) {
-                cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
-            }
-        }
-    }
-}
-
-fn is_box_drawing_char(ch: char) -> bool {
-    matches!(ch, '\u{2500}'..='\u{257f}')
 }
 
 /// Truncate `text` to at most `available` **characters**, appending `…` when
@@ -7958,6 +7965,36 @@ fn status_footer_lines(status_text: &str, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_terminal_snapshot_cell_wraps_url_cells_with_osc8() {
+        let mut buffer = ratatui::buffer::Buffer::with_lines(["x"]);
+        let cell = crate::pty::SnapshotCell {
+            row: 0,
+            col: 0,
+            symbol: "h".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::empty(),
+        };
+
+        draw_terminal_snapshot_cell(
+            &mut buffer,
+            Rect::new(0, 0, 1, 1),
+            &cell,
+            Style::default().fg(Color::White),
+            Some("https://example.com"),
+        );
+
+        assert_eq!(
+            buffer[(0, 0)].symbol(),
+            "\x1b]8;;https://example.com\x1b\\h\x1b]8;;\x1b\\"
+        );
+        assert_eq!(
+            buffer[(0, 0)].diff_option,
+            ratatui::buffer::CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
+        );
+    }
 
     #[test]
     fn scrollback_indicator_uses_fractional_label() {
@@ -8448,6 +8485,7 @@ mod tests {
             Rect::new(0, 0, 4, 1),
             &cell,
             Style::default().fg(Color::White),
+            None,
         );
 
         assert_eq!(buffer[(1, 0)].symbol(), "界");
@@ -8471,6 +8509,7 @@ mod tests {
             Rect::new(0, 0, 3, 1),
             &cell,
             Style::default().fg(Color::White),
+            None,
         );
 
         assert_eq!(buffer[(2, 0)].symbol(), " ");
@@ -8478,35 +8517,29 @@ mod tests {
     }
 
     #[test]
-    fn keep_box_drawing_cells_fresh_marks_borders_for_repaint() {
-        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-        keep_box_drawing_cells_fresh(&mut next);
+    fn unchanged_box_drawing_cells_do_not_produce_diff_output() {
+        let prev = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
+        let next = prev.clone();
 
-        for y in 0..3 {
-            for x in 0..3 {
-                let cell = &next[(x, y)];
-                let expected = if x == 1 && y == 1 {
-                    ratatui::buffer::CellDiffOption::None
-                } else {
-                    ratatui::buffer::CellDiffOption::AlwaysUpdate
-                };
-                assert_eq!(cell.diff_option, expected, "cell ({x}, {y})");
-            }
-        }
+        assert!(
+            prev.diff(&next).is_empty(),
+            "unchanged ordinary borders must not produce continuous terminal output"
+        );
     }
 
     #[test]
-    fn keep_box_drawing_cells_fresh_forces_unchanged_border_diff() {
-        let prev = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-
-        keep_box_drawing_cells_fresh(&mut next);
+    fn replacing_wide_glyph_with_border_repaints_trailing_cell() {
+        let mut prev = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        prev[(1, 0)].set_symbol("界");
+        let mut next = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        next[(1, 0)].set_symbol("x");
+        next[(2, 0)].set_symbol("│");
 
         let diff = prev.diff(&next);
         assert!(
             diff.iter()
-                .any(|(x, y, cell)| *x == 2 && *y == 1 && cell.symbol() == "│"),
-            "unchanged right border must be emitted so terminals repaint cells cleared by wide glyphs"
+                .any(|(x, y, cell)| *x == 2 && *y == 0 && cell.symbol() == "│"),
+            "the trailing border must be emitted after replacing a wide glyph"
         );
     }
 }

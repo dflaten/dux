@@ -10,7 +10,6 @@ const MAX_RIGHT_WIDTH_PCT: u16 = 50;
 const MIN_CENTER_WIDTH_PCT: u16 = 20;
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 const ESC_AMBIGUITY_TIMEOUT: Duration = Duration::from_millis(25);
-const URL_PREFIXES: [&str; 2] = ["https://", "http://"];
 
 fn configure_project_text_input_mut(prompt: &mut PromptState) -> Option<&mut TextInput> {
     match prompt {
@@ -2081,8 +2080,8 @@ impl App {
                 continue;
             }
             // Mouse events must be handled by the UI, not forwarded to the
-            // PTY. crossterm's EnableMouseCapture uses SGR (1006) encoding,
-            // so terminal mouse events arrive as CSI `<…M` / `<…m`.
+            // PTY. Dux mouse capture uses SGR (1006) encoding, so terminal
+            // mouse events arrive as CSI `<…M` / `<…m`.
             if let Some(mouse_ev) = crate::raw_input::parse_sgr_mouse(seq) {
                 actions.push(SeqAction::Mouse(mouse_ev, seq.to_vec()));
                 continue;
@@ -6766,7 +6765,7 @@ impl App {
     fn terminal_url_at_screen_pos(&mut self, screen_col: u16, screen_row: u16) -> Option<String> {
         let grid_pos = self.screen_to_grid(screen_col, screen_row)?;
         self.refresh_snapshot_buf();
-        terminal_url_at_grid_pos(&self.snapshot_buf, grid_pos)
+        terminal_links::url_at_grid_pos(&self.snapshot_buf, grid_pos)
     }
 
     /// Map screen coordinates to terminal grid position, clamping to the
@@ -7251,102 +7250,12 @@ impl App {
 
 fn is_terminal_link_click_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(
-        KeyModifiers::CONTROL
+        KeyModifiers::SHIFT
+            | KeyModifiers::CONTROL
             | KeyModifiers::ALT
             | KeyModifiers::SUPER
             | KeyModifiers::HYPER
             | KeyModifiers::META,
-    )
-}
-
-fn terminal_url_at_grid_pos(
-    snapshot: &crate::pty::TerminalSnapshot,
-    pos: TermGridPos,
-) -> Option<String> {
-    let (chars, clicked_index) = terminal_row_chars_at_col(snapshot, pos)?;
-    url_at_char_index(&chars, clicked_index)
-}
-
-fn terminal_row_chars_at_col(
-    snapshot: &crate::pty::TerminalSnapshot,
-    pos: TermGridPos,
-) -> Option<(Vec<char>, usize)> {
-    if pos.row >= snapshot.rows || pos.col >= snapshot.cols {
-        return None;
-    }
-
-    let mut row_cells: Vec<_> = snapshot
-        .cells
-        .iter()
-        .filter(|cell| cell.row == pos.row)
-        .collect();
-    row_cells.sort_by_key(|cell| cell.col);
-
-    let mut chars = Vec::new();
-    let mut next_col = 0u16;
-    let mut clicked_index = None;
-    for cell in row_cells {
-        while next_col < cell.col {
-            if next_col == pos.col {
-                clicked_index = Some(chars.len());
-            }
-            chars.push(' ');
-            next_col = next_col.saturating_add(1);
-        }
-
-        for ch in cell.symbol.chars() {
-            let width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
-            let width = u16::try_from(width).unwrap_or(1);
-            if pos.col >= next_col && pos.col < next_col.saturating_add(width) {
-                clicked_index = Some(chars.len());
-            }
-            chars.push(ch);
-            next_col = next_col.saturating_add(width);
-        }
-    }
-
-    clicked_index.map(|index| (chars, index))
-}
-
-fn url_at_char_index(chars: &[char], clicked_index: usize) -> Option<String> {
-    for start in 0..chars.len() {
-        if !URL_PREFIXES
-            .iter()
-            .any(|prefix| chars_start_with(chars, start, prefix))
-        {
-            continue;
-        }
-
-        let mut end = start;
-        while end < chars.len() && !chars[end].is_whitespace() {
-            end += 1;
-        }
-        while end > start && is_url_trailing_punctuation(chars[end - 1]) {
-            end -= 1;
-        }
-
-        if clicked_index >= start && clicked_index < end {
-            return Some(chars[start..end].iter().collect());
-        }
-    }
-    None
-}
-
-fn chars_start_with(chars: &[char], start: usize, prefix: &str) -> bool {
-    let prefix_len = prefix.chars().count();
-    if start.saturating_add(prefix_len) > chars.len() {
-        return false;
-    }
-    chars[start..start + prefix_len]
-        .iter()
-        .copied()
-        .eq(prefix.chars())
-}
-
-fn is_url_trailing_punctuation(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
     )
 }
 
@@ -7369,9 +7278,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
 
     use super::components::{ButtonPressedTarget, PressedButton};
-    use super::{
-        DOUBLE_CLICK_THRESHOLD, is_terminal_link_click_modifier, terminal_url_at_grid_pos,
-    };
+    use super::{DOUBLE_CLICK_THRESHOLD, is_terminal_link_click_modifier};
     use crate::app::input::{
         build_diff_comments_prompt, build_rebase_failed_prompt, startup_command_log_visual_lines,
     };
@@ -7396,16 +7303,14 @@ mod tests {
         AgentSession, ChangedFile, CompanionTerminalStatus, PrInfo, PrState, Project,
         ProjectBranchStatus, ProviderKind, SessionStatus, SessionSurface,
     };
-    use crate::pty::{PtyClient, SnapshotCell, TerminalSnapshot};
+    use crate::pty::PtyClient;
     use crate::statusline::StatusLine;
     use crate::storage::SessionStore;
     use crate::theme::Theme;
     use chrono::Utc;
-    use compact_str::CompactString;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
-    use ratatui::style::{Color, Modifier};
     use ratatui::text::Line;
     use std::process::Command;
     use tempfile::tempdir;
@@ -7716,60 +7621,13 @@ mod tests {
         };
     }
 
-    fn snapshot_from_line(line: &str) -> TerminalSnapshot {
-        TerminalSnapshot {
-            rows: 1,
-            cols: 120,
-            scrollback_offset: 0,
-            scrollback_total: 0,
-            cursor: None,
-            cells: line
-                .chars()
-                .enumerate()
-                .map(|(col, ch)| SnapshotCell {
-                    row: 0,
-                    col: u16::try_from(col).expect("test line fits in u16"),
-                    symbol: CompactString::from(ch.to_string()),
-                    fg: Color::Reset,
-                    bg: Color::Reset,
-                    modifier: Modifier::empty(),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn terminal_url_hit_testing_finds_url_under_clicked_cell() {
-        let line = "Open https://example.com/path?q=1 now";
-        let snapshot = snapshot_from_line(line);
-
-        let url = terminal_url_at_grid_pos(&snapshot, TermGridPos { row: 0, col: 14 });
-
-        assert_eq!(url.as_deref(), Some("https://example.com/path?q=1"));
-    }
-
-    #[test]
-    fn terminal_url_hit_testing_trims_trailing_punctuation() {
-        let line = "See (https://example.com/path).";
-        let snapshot = snapshot_from_line(line);
-
-        let url = terminal_url_at_grid_pos(&snapshot, TermGridPos { row: 0, col: 10 });
-
-        assert_eq!(url.as_deref(), Some("https://example.com/path"));
-        assert_eq!(
-            terminal_url_at_grid_pos(&snapshot, TermGridPos { row: 0, col: 30 }),
-            None,
-            "clicking trimmed punctuation should not open the link"
-        );
-    }
-
     #[test]
     fn terminal_link_click_modifiers_include_macos_command_when_reported() {
+        assert!(is_terminal_link_click_modifier(KeyModifiers::SHIFT));
         assert!(is_terminal_link_click_modifier(KeyModifiers::SUPER));
         assert!(is_terminal_link_click_modifier(KeyModifiers::META));
         assert!(is_terminal_link_click_modifier(KeyModifiers::CONTROL));
         assert!(is_terminal_link_click_modifier(KeyModifiers::ALT));
-        assert!(!is_terminal_link_click_modifier(KeyModifiers::SHIFT));
         assert!(!is_terminal_link_click_modifier(KeyModifiers::NONE));
     }
 

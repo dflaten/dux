@@ -45,6 +45,7 @@ pub struct TerminalSnapshot {
     pub scrollback_total: usize,
     pub cursor: Option<SnapshotCursor>,
     pub cells: Vec<SnapshotCell>,
+    pub wrapped_rows: Vec<bool>,
 }
 
 impl TerminalSnapshot {
@@ -57,7 +58,15 @@ impl TerminalSnapshot {
             scrollback_total: 0,
             cursor: None,
             cells: Vec::new(),
+            wrapped_rows: Vec::new(),
         }
+    }
+
+    pub fn row_wraps(&self, row: u16) -> bool {
+        self.wrapped_rows
+            .get(usize::from(row))
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -708,18 +717,24 @@ impl TerminalState {
         };
 
         target.cells.clear();
+        target.wrapped_rows.clear();
+        target.wrapped_rows.resize(usize::from(self.rows), false);
         for indexed in renderable.display_iter {
             let cell = indexed.cell;
+            let Some(point) = term::point_to_viewport(display_offset, indexed.point) else {
+                continue;
+            };
+            if cell.flags.contains(Flags::WRAPLINE)
+                && let Some(wrapped) = target.wrapped_rows.get_mut(point.line)
+            {
+                *wrapped = true;
+            }
             if cell
                 .flags
                 .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
             }
-
-            let Some(point) = term::point_to_viewport(display_offset, indexed.point) else {
-                continue;
-            };
 
             let mut symbol = CompactString::new("");
             symbol.push(cell.c);
@@ -1573,6 +1588,7 @@ mod tests {
         assert_eq!(owned.cols, buf.cols);
         assert_eq!(owned.scrollback_offset, buf.scrollback_offset);
         assert_eq!(owned.scrollback_total, buf.scrollback_total);
+        assert_eq!(owned.wrapped_rows, buf.wrapped_rows);
         assert_eq!(owned.cells.len(), buf.cells.len());
         for (a, b) in owned.cells.iter().zip(buf.cells.iter()) {
             assert_eq!(a.row, b.row);
@@ -1582,6 +1598,17 @@ mod tests {
             assert_eq!(a.bg, b.bg);
             assert_eq!(a.modifier, b.modifier);
         }
+    }
+
+    #[test]
+    fn snapshot_records_soft_wrapped_rows() {
+        let mut terminal = TerminalState::with_scrollback(2, 5, 100);
+        terminal.process(b"abcdef");
+
+        let snapshot = terminal.snapshot();
+
+        assert!(snapshot.row_wraps(0));
+        assert!(!snapshot.row_wraps(1));
     }
 
     #[test]
