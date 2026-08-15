@@ -473,7 +473,6 @@ impl App {
         self.render_files(frame, right);
         self.render_footer(frame, footer);
         self.render_overlay(frame);
-        keep_box_drawing_cells_fresh(frame.buffer_mut());
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -8069,22 +8068,6 @@ fn draw_terminal_snapshot_cell(
     }
 }
 
-fn keep_box_drawing_cells_fresh(buf: &mut ratatui::buffer::Buffer) {
-    let area = *buf.area();
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            let cell = &mut buf[(x, y)];
-            if cell.symbol().chars().any(is_box_drawing_char) {
-                cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
-            }
-        }
-    }
-}
-
-fn is_box_drawing_char(ch: char) -> bool {
-    matches!(ch, '\u{2500}'..='\u{257f}')
-}
-
 /// Truncate `text` to at most `available` **characters**, appending `…` when
 /// trimmed. Using char-based counting avoids panics when the text contains
 /// multi-byte UTF-8 (e.g. box-drawing or block characters).
@@ -8709,35 +8692,29 @@ mod tests {
     }
 
     #[test]
-    fn keep_box_drawing_cells_fresh_marks_borders_for_repaint() {
-        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-        keep_box_drawing_cells_fresh(&mut next);
+    fn unchanged_box_drawing_cells_do_not_produce_diff_output() {
+        let prev = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
+        let next = prev.clone();
 
-        for y in 0..3 {
-            for x in 0..3 {
-                let cell = &next[(x, y)];
-                let expected = if x == 1 && y == 1 {
-                    ratatui::buffer::CellDiffOption::None
-                } else {
-                    ratatui::buffer::CellDiffOption::AlwaysUpdate
-                };
-                assert_eq!(cell.diff_option, expected, "cell ({x}, {y})");
-            }
-        }
+        assert!(
+            prev.diff(&next).is_empty(),
+            "unchanged ordinary borders must not produce continuous terminal output"
+        );
     }
 
     #[test]
-    fn keep_box_drawing_cells_fresh_forces_unchanged_border_diff() {
-        let prev = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-        let mut next = ratatui::buffer::Buffer::with_lines(["╭─╮", "│x│", "╰─╯"]);
-
-        keep_box_drawing_cells_fresh(&mut next);
+    fn replacing_wide_glyph_with_border_repaints_trailing_cell() {
+        let mut prev = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        prev[(1, 0)].set_symbol("界");
+        let mut next = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 3, 1));
+        next[(1, 0)].set_symbol("x");
+        next[(2, 0)].set_symbol("│");
 
         let diff = prev.diff(&next);
         assert!(
             diff.iter()
-                .any(|(x, y, cell)| *x == 2 && *y == 1 && cell.symbol() == "│"),
-            "unchanged right border must be emitted so terminals repaint cells cleared by wide glyphs"
+                .any(|(x, y, cell)| *x == 2 && *y == 0 && cell.symbol() == "│"),
+            "the trailing border must be emitted after replacing a wide glyph"
         );
     }
 }
