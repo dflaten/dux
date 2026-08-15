@@ -3,6 +3,7 @@ use super::components::{
     shared_button_width,
 };
 use super::*;
+use std::num::NonZeroU16;
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1431,6 +1432,7 @@ impl App {
                 }
                 self.prev_scrollback_offset = scrollback_offset;
 
+                let hyperlink_ranges = terminal_hyperlink_ranges(&self.snapshot_buf);
                 let buf = frame.buffer_mut();
                 for cell in &self.snapshot_buf.cells {
                     if cell.row >= self.snapshot_buf.rows
@@ -1453,7 +1455,8 @@ impl App {
                     {
                         style = self.theme.selection_style();
                     }
-                    draw_terminal_snapshot_cell(buf, term_area, cell, style);
+                    let hyperlink = terminal_hyperlink_for_cell(cell, &hyperlink_ranges);
+                    draw_terminal_snapshot_cell(buf, term_area, cell, style, hyperlink);
                 }
 
                 // Suppress the scrollback indicator when the child is using
@@ -7879,11 +7882,159 @@ fn draw_text_cells(
     used
 }
 
+const TERMINAL_URL_PREFIXES: [&str; 2] = ["https://", "http://"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalHyperlinkRange {
+    row: u16,
+    start_col: u16,
+    end_col: u16,
+    url: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalHyperlinkCell<'a> {
+    url: &'a str,
+}
+
+fn terminal_hyperlink_ranges(
+    snapshot: &crate::pty::TerminalSnapshot,
+) -> Vec<TerminalHyperlinkRange> {
+    let mut ranges = Vec::new();
+    for row in 0..snapshot.rows {
+        let Some((chars, char_cols, char_widths)) = terminal_row_chars(snapshot, row) else {
+            continue;
+        };
+        ranges.extend(url_ranges_for_row(row, &chars, &char_cols, &char_widths));
+    }
+    ranges
+}
+
+fn terminal_row_chars(
+    snapshot: &crate::pty::TerminalSnapshot,
+    row: u16,
+) -> Option<(Vec<char>, Vec<u16>, Vec<u16>)> {
+    let mut row_cells: Vec<_> = snapshot
+        .cells
+        .iter()
+        .filter(|cell| cell.row == row)
+        .collect();
+    row_cells.sort_by_key(|cell| cell.col);
+    if row_cells.is_empty() {
+        return None;
+    }
+
+    let mut chars = Vec::new();
+    let mut char_cols = Vec::new();
+    let mut char_widths = Vec::new();
+    let mut next_col = 0u16;
+    for cell in row_cells {
+        while next_col < cell.col {
+            chars.push(' ');
+            char_cols.push(next_col);
+            char_widths.push(1);
+            next_col = next_col.saturating_add(1);
+        }
+
+        for ch in cell.symbol.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+            let width = u16::try_from(width).unwrap_or(1);
+            chars.push(ch);
+            char_cols.push(next_col);
+            char_widths.push(width);
+            next_col = next_col.saturating_add(width);
+        }
+    }
+
+    Some((chars, char_cols, char_widths))
+}
+
+fn url_ranges_for_row(
+    row: u16,
+    chars: &[char],
+    char_cols: &[u16],
+    char_widths: &[u16],
+) -> Vec<TerminalHyperlinkRange> {
+    let mut ranges = Vec::new();
+    for start in 0..chars.len() {
+        if !TERMINAL_URL_PREFIXES
+            .iter()
+            .any(|prefix| chars_start_with(chars, start, prefix))
+        {
+            continue;
+        }
+
+        let mut end = start;
+        while end < chars.len() && !chars[end].is_whitespace() && !chars[end].is_ascii_control() {
+            end += 1;
+        }
+        while end > start && is_url_trailing_punctuation(chars[end - 1]) {
+            end -= 1;
+        }
+
+        if end <= start {
+            continue;
+        }
+
+        let start_col = char_cols[start];
+        let end_col = char_cols[end - 1].saturating_add(char_widths[end - 1]);
+        ranges.push(TerminalHyperlinkRange {
+            row,
+            start_col,
+            end_col,
+            url: chars[start..end].iter().collect(),
+        });
+    }
+    ranges
+}
+
+fn terminal_hyperlink_for_cell<'a>(
+    cell: &crate::pty::SnapshotCell,
+    ranges: &'a [TerminalHyperlinkRange],
+) -> Option<TerminalHyperlinkCell<'a>> {
+    let symbol_width = u16::try_from(display_width(&cell.symbol).max(1)).unwrap_or(1);
+    let cell_end = cell.col.saturating_add(symbol_width);
+    ranges
+        .iter()
+        .find(|range| {
+            range.row == cell.row && cell.col < range.end_col && cell_end > range.start_col
+        })
+        .map(|range| TerminalHyperlinkCell { url: &range.url })
+}
+
+fn osc8_link_symbol(symbol: &str, link: TerminalHyperlinkCell<'_>) -> String {
+    let mut out = String::from("\x1b]8;;");
+    out.push_str(link.url);
+    out.push_str("\x1b\\");
+    out.push_str(symbol);
+    out.push_str("\x1b]8;;\x1b\\");
+    out
+}
+
+fn chars_start_with(chars: &[char], start: usize, prefix: &str) -> bool {
+    let prefix_len = prefix.chars().count();
+    if start.saturating_add(prefix_len) > chars.len() {
+        return false;
+    }
+    chars[start..start + prefix_len]
+        .iter()
+        .copied()
+        .eq(prefix.chars())
+}
+
+fn is_url_trailing_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+    )
+}
+
 fn draw_terminal_snapshot_cell(
     buf: &mut ratatui::buffer::Buffer,
     term_area: Rect,
     cell: &crate::pty::SnapshotCell,
     style: Style,
+    hyperlink: Option<TerminalHyperlinkCell<'_>>,
 ) {
     if cell.row >= term_area.height || cell.col >= term_area.width {
         return;
@@ -7898,7 +8049,18 @@ fn draw_terminal_snapshot_cell(
         return;
     }
 
-    buf[(x, y)].set_symbol(&cell.symbol).set_style(style);
+    let rendered_symbol = hyperlink
+        .map(|link| osc8_link_symbol(&cell.symbol, link))
+        .unwrap_or_else(|| cell.symbol.to_string());
+    let target = &mut buf[(x, y)];
+    target.set_symbol(&rendered_symbol).set_style(style);
+    if hyperlink.is_some() {
+        let forced_width = u16::try_from(symbol_width)
+            .ok()
+            .and_then(NonZeroU16::new)
+            .unwrap_or(NonZeroU16::MIN);
+        target.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(forced_width));
+    }
     for offset in 1..symbol_width {
         let spacer_x = x.saturating_add(offset as u16);
         if spacer_x < term_area.x + term_area.width {
@@ -7958,6 +8120,73 @@ fn status_footer_lines(status_text: &str, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_snapshot_from_line(line: &str) -> crate::pty::TerminalSnapshot {
+        crate::pty::TerminalSnapshot {
+            rows: 1,
+            cols: 120,
+            scrollback_offset: 0,
+            scrollback_total: 0,
+            cursor: None,
+            cells: line
+                .chars()
+                .enumerate()
+                .map(|(col, ch)| crate::pty::SnapshotCell {
+                    row: 0,
+                    col: u16::try_from(col).expect("test line fits"),
+                    symbol: ch.to_string().into(),
+                    fg: Color::Reset,
+                    bg: Color::Reset,
+                    modifier: Modifier::empty(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn terminal_hyperlink_ranges_detect_urls() {
+        let snapshot = terminal_snapshot_from_line("Open https://example.com/path?q=1 now");
+
+        let ranges = terminal_hyperlink_ranges(&snapshot);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].row, 0);
+        assert_eq!(ranges[0].start_col, 5);
+        assert_eq!(ranges[0].end_col, 33);
+        assert_eq!(ranges[0].url, "https://example.com/path?q=1");
+    }
+
+    #[test]
+    fn draw_terminal_snapshot_cell_wraps_url_cells_with_osc8() {
+        let mut buffer = ratatui::buffer::Buffer::with_lines(["x"]);
+        let cell = crate::pty::SnapshotCell {
+            row: 0,
+            col: 0,
+            symbol: "h".into(),
+            fg: Color::White,
+            bg: Color::Reset,
+            modifier: Modifier::empty(),
+        };
+
+        draw_terminal_snapshot_cell(
+            &mut buffer,
+            Rect::new(0, 0, 1, 1),
+            &cell,
+            Style::default().fg(Color::White),
+            Some(TerminalHyperlinkCell {
+                url: "https://example.com",
+            }),
+        );
+
+        assert_eq!(
+            buffer[(0, 0)].symbol(),
+            "\x1b]8;;https://example.com\x1b\\h\x1b]8;;\x1b\\"
+        );
+        assert_eq!(
+            buffer[(0, 0)].diff_option,
+            ratatui::buffer::CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
+        );
+    }
 
     #[test]
     fn scrollback_indicator_uses_fractional_label() {
@@ -8448,6 +8677,7 @@ mod tests {
             Rect::new(0, 0, 4, 1),
             &cell,
             Style::default().fg(Color::White),
+            None,
         );
 
         assert_eq!(buffer[(1, 0)].symbol(), "界");
@@ -8471,6 +8701,7 @@ mod tests {
             Rect::new(0, 0, 3, 1),
             &cell,
             Style::default().fg(Color::White),
+            None,
         );
 
         assert_eq!(buffer[(2, 0)].symbol(), " ");
