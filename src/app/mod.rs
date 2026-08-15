@@ -1792,6 +1792,7 @@ mod components;
 mod input;
 mod render;
 mod sessions;
+mod terminal_links;
 pub(crate) mod text_input;
 mod workers;
 
