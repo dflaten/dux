@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -11,10 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
-use crossterm::execute;
+use crossterm::{Command, execute};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Modifier, Style};
@@ -50,6 +51,26 @@ use crate::storage::SessionStore;
 use crate::theme::Theme;
 
 use text_input::TextInput;
+
+const DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE: &str = concat!(
+    // Normal tracking: report button press/release and scroll events.
+    "\x1b[?1000h",
+    // Button-event tracking: report drag motion while a button is held.
+    "\x1b[?1002h",
+    // RXVT coordinates for terminals that still prefer them.
+    "\x1b[?1015h",
+    // SGR coordinates, preferred by crossterm and our raw input parser.
+    "\x1b[?1006h",
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DuxEnableMouseCapture;
+
+impl Command for DuxEnableMouseCapture {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE)
+    }
+}
 
 pub struct App {
     pub(crate) config: Config,
@@ -1962,7 +1983,7 @@ impl App {
         self.spawn_project_branch_status_checks();
         self.spawn_gh_status_check();
         let mut terminal = ratatui::init();
-        execute!(stdout(), EnableMouseCapture)?;
+        execute!(stdout(), DuxEnableMouseCapture)?;
 
         let result: Result<()> = {
             loop {
@@ -1985,7 +2006,7 @@ impl App {
                     }
                     // Re-enable mouse capture — terminal.clear() resets
                     // terminal state which drops the mouse capture mode.
-                    let _ = execute!(stdout(), EnableMouseCapture);
+                    let _ = execute!(stdout(), DuxEnableMouseCapture);
                 }
 
                 if let Err(err) = terminal.draw(|frame| self.render(frame)) {
@@ -3816,6 +3837,17 @@ pub(crate) fn provider_config(config: &Config, provider: &ProviderKind) -> Provi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dux_mouse_capture_keeps_hover_motion_untracked() {
+        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1000h"));
+        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1002h"));
+        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1006h"));
+        assert!(
+            !DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1003h"),
+            "all-motion tracking competes with terminal-side link hover detection"
+        );
+    }
 
     fn test_project(id: &str) -> Project {
         Project {

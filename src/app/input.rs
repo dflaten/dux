@@ -2081,8 +2081,8 @@ impl App {
                 continue;
             }
             // Mouse events must be handled by the UI, not forwarded to the
-            // PTY. crossterm's EnableMouseCapture uses SGR (1006) encoding,
-            // so terminal mouse events arrive as CSI `<…M` / `<…m`.
+            // PTY. Dux mouse capture uses SGR (1006) encoding, so terminal
+            // mouse events arrive as CSI `<…M` / `<…m`.
             if let Some(mouse_ev) = crate::raw_input::parse_sgr_mouse(seq) {
                 actions.push(SeqAction::Mouse(mouse_ev, seq.to_vec()));
                 continue;
