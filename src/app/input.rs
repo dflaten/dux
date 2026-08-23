@@ -3007,6 +3007,58 @@ impl App {
             return Ok(false);
         }
 
+        if let PromptState::RecoverDeletedAgent(prompt) = &mut self.prompt {
+            let is_plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = if is_plain_char {
+                None
+            } else {
+                self.bindings.lookup(&key, BindingScope::Palette)
+            };
+            match action {
+                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+                Some(Action::MoveDown) => {
+                    let matching =
+                        deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                    if let Some(current) = prompt.selected
+                        && let Some(position) = matching.iter().position(|index| *index == current)
+                        && let Some(next) = matching.get(position + 1)
+                    {
+                        prompt.selected = Some(*next);
+                    } else if prompt.selected.is_none() {
+                        prompt.selected = matching.into_iter().next();
+                    }
+                }
+                Some(Action::MoveUp) => {
+                    let matching =
+                        deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                    if let Some(current) = prompt.selected
+                        && let Some(position) = matching.iter().position(|index| *index == current)
+                        && position > 0
+                    {
+                        prompt.selected = Some(matching[position - 1]);
+                    } else if prompt.selected.is_none() {
+                        prompt.selected = matching.into_iter().next();
+                    }
+                }
+                Some(Action::Confirm) => self.restore_selected_deleted_agent(),
+                _ => {
+                    let before = prompt.filter.text.clone();
+                    if prompt.filter.handle_key(key) && prompt.filter.text != before {
+                        let matching =
+                            deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                        if !prompt
+                            .selected
+                            .is_some_and(|selected| matching.contains(&selected))
+                        {
+                            prompt.selected = matching.into_iter().next();
+                        }
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
         if let PromptState::ChangeAgentProvider(prompt) = &mut self.prompt {
             let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
             let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
@@ -3432,42 +3484,23 @@ impl App {
             return Ok(false);
         }
 
-        if let PromptState::ConfirmDeleteAgent {
-            focus,
-            delete_worktree,
-            worktree_shared,
-            ..
-        } = &mut self.prompt
-        {
-            // When the worktree is shared with another session it is always
-            // preserved, so the checkbox is hidden and the focus cycle skips
-            // over it (Cancel ↔ Delete only).
-            let shared = *worktree_shared;
+        if let PromptState::ConfirmDeleteAgent { focus, .. } = &mut self.prompt {
             if is_reverse_tab(key) {
-                *focus = match (*focus, shared) {
-                    (DeleteAgentFocus::Cancel, false) => DeleteAgentFocus::Checkbox,
-                    (DeleteAgentFocus::Delete, false) => DeleteAgentFocus::Cancel,
-                    (DeleteAgentFocus::Checkbox, _) => DeleteAgentFocus::Delete,
-                    (DeleteAgentFocus::Cancel, true) => DeleteAgentFocus::Delete,
-                    (DeleteAgentFocus::Delete, true) => DeleteAgentFocus::Cancel,
+                *focus = match *focus {
+                    DeleteAgentFocus::Cancel => DeleteAgentFocus::Delete,
+                    DeleteAgentFocus::Delete => DeleteAgentFocus::Cancel,
                 };
                 return Ok(false);
             }
             match self.bindings.lookup(&key, BindingScope::Dialog) {
                 Some(Action::CloseOverlay) => self.prompt = PromptState::None,
                 Some(Action::ToggleSelection) => {
-                    *focus = match (*focus, shared) {
-                        (DeleteAgentFocus::Cancel, false) => DeleteAgentFocus::Delete,
-                        (DeleteAgentFocus::Delete, false) => DeleteAgentFocus::Checkbox,
-                        (DeleteAgentFocus::Checkbox, _) => DeleteAgentFocus::Cancel,
-                        (DeleteAgentFocus::Cancel, true) => DeleteAgentFocus::Delete,
-                        (DeleteAgentFocus::Delete, true) => DeleteAgentFocus::Cancel,
+                    *focus = match *focus {
+                        DeleteAgentFocus::Cancel => DeleteAgentFocus::Delete,
+                        DeleteAgentFocus::Delete => DeleteAgentFocus::Cancel,
                     };
                 }
                 Some(Action::Confirm) => match *focus {
-                    DeleteAgentFocus::Checkbox => {
-                        *delete_worktree = !*delete_worktree;
-                    }
                     DeleteAgentFocus::Cancel => {
                         return Ok(self.resolve_confirm_delete_agent(false));
                     }
@@ -3475,12 +3508,7 @@ impl App {
                         return Ok(self.resolve_confirm_delete_agent(true));
                     }
                 },
-                // Space activates the focused element — toggles the checkbox
-                // when focused there, otherwise activates the current button.
                 _ if key.code == KeyCode::Char(' ') => match *focus {
-                    DeleteAgentFocus::Checkbox => {
-                        *delete_worktree = !*delete_worktree;
-                    }
                     DeleteAgentFocus::Cancel => {
                         return Ok(self.resolve_confirm_delete_agent(false));
                     }
@@ -4447,11 +4475,8 @@ impl App {
             OverlayMouseLayout::ConfirmDeleteAgent {
                 cancel_button,
                 delete_button,
-                checkbox,
             } => {
-                if checkbox.is_some_and(|checkbox| contains_point(checkbox.rect, column, row)) {
-                    checkbox.map(|checkbox| PromptMouseTarget::Checkbox(checkbox.id))
-                } else if contains_point(cancel_button, column, row) {
+                if contains_point(cancel_button, column, row) {
                     Some(PromptMouseTarget::ConfirmDeleteCancel)
                 } else if contains_point(delete_button, column, row) {
                     Some(PromptMouseTarget::ConfirmDeleteConfirm)
@@ -5321,20 +5346,13 @@ impl App {
     }
 
     fn resolve_confirm_delete_agent(&mut self, confirm: bool) -> bool {
-        let (session_id, delete_worktree) = match &self.prompt {
-            PromptState::ConfirmDeleteAgent {
-                session_id,
-                delete_worktree,
-                ..
-            } => (session_id.clone(), *delete_worktree),
+        let session_id = match &self.prompt {
+            PromptState::ConfirmDeleteAgent { session_id, .. } => session_id.clone(),
             _ => return false,
         };
         self.prompt = PromptState::None;
         if confirm {
-            // Dispatches git work to a worker when needed, so the UI stays
-            // responsive. Errors arrive asynchronously via
-            // `WorkerEvent::WorktreeRemoveCompleted`.
-            self.begin_delete_session(&session_id, delete_worktree);
+            self.begin_delete_session(&session_id, false);
         }
         false
     }
@@ -5621,19 +5639,6 @@ impl App {
 
     fn toggle_overlay_checkbox(&mut self, checkbox_id: OverlayCheckboxId) {
         match checkbox_id {
-            OverlayCheckboxId::DeleteAgentWorktree => {
-                if let PromptState::ConfirmDeleteAgent {
-                    delete_worktree,
-                    focus,
-                    worktree_shared,
-                    ..
-                } = &mut self.prompt
-                    && !*worktree_shared
-                {
-                    *delete_worktree = !*delete_worktree;
-                    *focus = DeleteAgentFocus::Checkbox;
-                }
-            }
             OverlayCheckboxId::RenameSessionBranch => {
                 if let PromptState::RenameSession { rename_branch, .. } = &mut self.prompt {
                     *rename_branch = !*rename_branch;
@@ -7581,6 +7586,8 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
+            pending_restorations: std::collections::HashMap::new(),
+            pending_project_removals: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
             syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
@@ -7843,10 +7850,6 @@ not_a_real_action = ["x"]
         app.overlay_layout.active = OverlayMouseLayout::ConfirmDeleteAgent {
             cancel_button: Rect::new(34, 10, 16, 3),
             delete_button: Rect::new(52, 10, 16, 3),
-            checkbox: Some(OverlayCheckbox {
-                id: OverlayCheckboxId::DeleteAgentWorktree,
-                rect: Rect::new(24, 7, 44, 1),
-            }),
         };
     }
 
@@ -11989,36 +11992,6 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn prompt_mouse_down_on_checkbox_still_fires_on_down() {
-        // Regression guard: non-button targets (text inputs, list rows,
-        // checkboxes) keep their original on-Down behavior so users get
-        // immediate feedback for cursor moves and toggles.
-        let mut app = test_app(default_bindings());
-        app.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
-            focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
-        };
-        install_confirm_delete_overlay(&mut app);
-
-        // Click the checkbox at (30, 7) — install_confirm_delete_overlay
-        // places the checkbox at (24, 7, 44, 1).
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 7));
-
-        match &app.prompt {
-            PromptState::ConfirmDeleteAgent {
-                delete_worktree, ..
-            } => {
-                assert!(*delete_worktree, "checkbox toggles on mouse-down");
-            }
-            other => panic!("expected delete prompt, got {other:?}"),
-        }
-        assert_eq!(app.pressed_button, None);
-    }
-
-    #[test]
     fn mouse_click_quit_dialog_buttons_cancel_or_exit() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmQuit {
@@ -12925,8 +12898,6 @@ cyan = "#00ffff"
             session_id: app.sessions[0].id.clone(),
             branch_name: app.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
         };
         install_confirm_delete_overlay(&mut app);
 
@@ -12938,103 +12909,13 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn mouse_click_delete_dialog_checkbox_toggles_delete_worktree() {
-        let mut app = test_app(default_bindings());
-        app.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
-            focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
-        };
-        install_confirm_delete_overlay(&mut app);
-
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 7));
-
-        match &app.prompt {
-            PromptState::ConfirmDeleteAgent {
-                delete_worktree,
-                focus,
-                ..
-            } => {
-                assert!(*delete_worktree);
-                assert_eq!(*focus, DeleteAgentFocus::Checkbox);
-            }
-            other => panic!("expected delete prompt, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn delete_agent_dialog_spaces_checkbox_from_buttons() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut app = test_app(default_bindings());
-        app.prompt = PromptState::ConfirmDeleteAgent {
-            session_id: app.sessions[0].id.clone(),
-            branch_name: app.sessions[0].branch_name.clone(),
-            focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
-        };
-
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| app.render(frame))
-            .expect("render frame");
-
-        let (checkbox, cancel_button) = match app.overlay_layout.active {
-            OverlayMouseLayout::ConfirmDeleteAgent {
-                checkbox: Some(checkbox),
-                cancel_button,
-                ..
-            } => (checkbox.rect, cancel_button),
-            other => panic!("expected delete-agent overlay layout, got {other:?}"),
-        };
-        let spacer_y = checkbox.y + checkbox.height;
-
-        assert_eq!(
-            cancel_button.y,
-            spacer_y + 1,
-            "buttons should start one blank row below the checkbox"
-        );
-        assert_eq!(
-            terminal
-                .backend()
-                .buffer()
-                .cell((cancel_button.x, spacer_y))
-                .expect("spacer cell")
-                .symbol(),
-            " ",
-            "expected blank space between checkbox and buttons"
-        );
-    }
-
-    #[test]
     fn shift_tab_moves_delete_agent_focus_backwards() {
         let mut app = test_app(default_bindings());
         app.prompt = PromptState::ConfirmDeleteAgent {
             session_id: app.sessions[0].id.clone(),
             branch_name: app.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
         };
-
-        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .unwrap();
-
-        match &app.prompt {
-            PromptState::ConfirmDeleteAgent { focus, .. } => {
-                assert_eq!(
-                    *focus,
-                    DeleteAgentFocus::Checkbox,
-                    "Shift-Tab should move backward from Cancel to the checkbox"
-                );
-            }
-            other => panic!("expected delete-agent confirmation, got {other:?}"),
-        }
 
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
             .unwrap();
@@ -13044,7 +12925,7 @@ cyan = "#00ffff"
                 assert_eq!(
                     *focus,
                     DeleteAgentFocus::Delete,
-                    "Shift-Tab should continue backward from the checkbox to Delete"
+                    "Shift-Tab should move backward from Cancel to Delete"
                 );
             }
             other => panic!("expected delete-agent confirmation, got {other:?}"),
@@ -13058,8 +12939,6 @@ cyan = "#00ffff"
             session_id: app.sessions[0].id.clone(),
             branch_name: app.sessions[0].branch_name.clone(),
             focus: DeleteAgentFocus::Cancel,
-            delete_worktree: false,
-            worktree_shared: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
@@ -13069,22 +12948,8 @@ cyan = "#00ffff"
             PromptState::ConfirmDeleteAgent { focus, .. } => {
                 assert_eq!(
                     *focus,
-                    DeleteAgentFocus::Checkbox,
-                    "Shift-Tab delivered as Tab + Shift should move backward to the checkbox"
-                );
-            }
-            other => panic!("expected delete-agent confirmation, got {other:?}"),
-        }
-
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT))
-            .unwrap();
-
-        match &app.prompt {
-            PromptState::ConfirmDeleteAgent { focus, .. } => {
-                assert_eq!(
-                    *focus,
                     DeleteAgentFocus::Delete,
-                    "Tab + Shift should continue backward from the checkbox to Delete"
+                    "Shift-Tab delivered as Tab + Shift should move backward to Delete"
                 );
             }
             other => panic!("expected delete-agent confirmation, got {other:?}"),

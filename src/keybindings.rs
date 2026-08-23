@@ -111,6 +111,7 @@ pub enum Action {
     ForceReconnectAgent,
     ChangeTheme,
     ReloadConfig,
+    RecoverDeletedAgent,
 }
 
 /// Where a binding's key combo is matched.
@@ -305,6 +306,7 @@ impl Action {
             Action::ForceReconnectAgent => "force_reconnect_agent",
             Action::ChangeTheme => "change_theme",
             Action::ReloadConfig => "reload_config",
+            Action::RecoverDeletedAgent => "recover_deleted_agent",
         }
     }
 
@@ -423,7 +425,7 @@ impl Action {
             }
             Action::ToggleAgentAutoReopen => "Toggle startup auto-reopen for the selected agent.",
             Action::CleanupWorktrees => {
-                "Remove inactive dux-managed worktrees older than two weeks."
+                "Permanently remove inactive dux-managed worktrees older than two weeks."
             }
             Action::ConfigureStartupCommand => {
                 "Configure the selected project's startup command for newly created agents."
@@ -449,6 +451,7 @@ impl Action {
             Action::ForceReconnectAgent => "Restart the agent without resuming the prior session.",
             Action::ChangeTheme => "Open a picker to switch the dux color theme.",
             Action::ReloadConfig => "Reload the configuration file.",
+            Action::RecoverDeletedAgent => "Search and recover recently deleted agent sessions.",
         }
     }
 
@@ -551,7 +554,8 @@ impl Action {
             | Action::ChangeDefaultProvider
             | Action::ChangeProjectDefaultProvider
             | Action::ChangeTheme
-            | Action::ReloadConfig => None,
+            | Action::ReloadConfig
+            | Action::RecoverDeletedAgent => None,
         }
     }
 }
@@ -781,7 +785,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "cleanup-worktrees",
-            description: "Remove inactive dux-managed worktrees older than two weeks",
+            description: "Permanently remove inactive dux-managed worktrees older than two weeks",
         }),
     },
     BindingDef {
@@ -981,7 +985,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Left, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Projects pane",
-            description: "Delete selected session/worktree",
+            description: "Remove selected agent from dux (preserves worktree)",
         }),
         hint_contexts: &[
             (HintContext::LeftSession, "Delete"),
@@ -990,7 +994,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         ],
         palette: Some(PaletteEntry {
             name: "delete-agent",
-            description: "Delete the selected agent session",
+            description: "Remove the selected agent from dux and preserve its worktree",
         }),
     },
     BindingDef {
@@ -1660,6 +1664,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "kill-running",
             description: "Open a modal to kill running agents and companion terminals",
+        }),
+    },
+    BindingDef {
+        action: Action::RecoverDeletedAgent,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "recover-deleted-agent",
+            description: "Search and recover recently deleted agent sessions",
         }),
     },
     BindingDef {

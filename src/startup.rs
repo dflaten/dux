@@ -430,6 +430,19 @@ mod tests {
     }
 
     #[test]
+    fn delete_agent_logs_removes_session_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let dir = agent_log_dir(&paths, "project-1", "session-1");
+        fs::create_dir_all(&dir).expect("log dir");
+        fs::write(dir.join("one.log"), "log").expect("log file");
+
+        delete_agent_logs(&paths, "project-1", "session-1").expect("delete logs");
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn startup_command_shell_defaults_to_login_non_interactive_mode() {
         let terminal = StartupCommandTerminalConfig::default();
         assert_eq!(terminal.command, "$SHELL");
@@ -497,19 +510,6 @@ mod tests {
         assert!(result.status.is_ok());
         let log = read_log(&result.log_path).expect("log");
         assert!(log.contains("--- stdout ---\ntrue:secret"));
-    }
-
-    #[test]
-    fn delete_agent_logs_removes_session_directory() {
-        let tmp = tempdir().expect("tempdir");
-        let paths = test_paths(tmp.path());
-        let dir = agent_log_dir(&paths, "project-1", "session-1");
-        fs::create_dir_all(&dir).expect("log dir");
-        fs::write(dir.join("one.log"), "log").expect("log file");
-
-        delete_agent_logs(&paths, "project-1", "session-1").expect("delete logs");
-
-        assert!(!dir.exists());
     }
 
     #[test]

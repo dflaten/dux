@@ -212,6 +212,13 @@ pub struct App {
     /// visual cue on the left pane row so the user can see the in-flight
     /// state.
     pub(crate) pending_deletions: HashSet<String>,
+    /// Deleted sessions currently being restored, keyed by session ID with
+    /// their owning project ID. Project removal must wait for these workers
+    /// so a completion cannot recreate a session for a removed project.
+    pub(crate) pending_restorations: HashMap<String, String>,
+    /// Projects being removed from the workspace. Restores are rejected while
+    /// this is set so a persistence worker cannot race a recovery worker.
+    pub(crate) pending_project_removals: HashSet<String>,
     /// Maps session IDs to the exact Busy message set by
     /// `begin_delete_session`. Used by the worker event handler to decide
     /// whether the current status-line content was set by this deletion (and
@@ -633,6 +640,15 @@ pub(crate) struct PickProjectWorktreePrompt {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RecoverDeletedAgentPrompt {
+    pub(crate) entries: Vec<crate::storage::DeletedAgentSession>,
+    pub(crate) filter: TextInput,
+    pub(crate) loading: bool,
+    pub(crate) selected: Option<usize>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ConfirmKillRunningPrompt {
     pub(crate) previous: KillRunningPrompt,
     pub(crate) action: KillRunningAction,
@@ -647,13 +663,11 @@ pub(crate) enum ConfigReloadFailedFocus {
     Checkbox,
 }
 
-/// Which selectable element has focus in the Delete Agent confirmation modal.
-/// Focus cycles through all three via Tab / arrow keys / h / l.
+/// Which button has focus in the Delete Agent confirmation modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeleteAgentFocus {
     Cancel,
     Delete,
-    Checkbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -758,6 +772,7 @@ pub(crate) enum PromptState {
     #[allow(dead_code)]
     StartupCommandLogs(StartupCommandLogPrompt),
     PickProjectWorktree(PickProjectWorktreePrompt),
+    RecoverDeletedAgent(RecoverDeletedAgentPrompt),
     KillRunning(KillRunningPrompt),
     ConfirmKillRunning(ConfirmKillRunningPrompt),
     ConfigReloadFailed {
@@ -769,11 +784,6 @@ pub(crate) enum PromptState {
         session_id: String,
         branch_name: String,
         focus: DeleteAgentFocus,
-        delete_worktree: bool,
-        /// True when one or more other sessions share this worktree. In that
-        /// case the worktree is always preserved regardless of the user's
-        /// choice, so the checkbox is hidden and a note is shown instead.
-        worktree_shared: bool,
     },
     ConfirmWorktreeCleanup {
         candidates: Vec<WorktreeCleanupCandidate>,
@@ -1060,6 +1070,34 @@ pub(crate) fn selectable_project_worktree_indices_for_filter(
         .collect()
 }
 
+pub(crate) fn deleted_agent_matches_filter(
+    entry: &crate::storage::DeletedAgentSession,
+    filter: &str,
+) -> bool {
+    let needle = filter.trim();
+    needle.is_empty()
+        || [
+            entry.session.title.as_deref().unwrap_or_default(),
+            entry.session.branch_name.as_str(),
+            entry.session.provider.as_str(),
+            entry.session.project_path.as_deref().unwrap_or_default(),
+            entry.session.worktree_path.as_str(),
+        ]
+        .iter()
+        .any(|candidate| fuzzy_subsequence_match(candidate, needle))
+}
+
+pub(crate) fn deleted_agent_indices_for_filter(
+    entries: &[crate::storage::DeletedAgentSession],
+    filter: &str,
+) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| deleted_agent_matches_filter(entry, filter).then_some(index))
+        .collect()
+}
+
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1262,7 +1300,6 @@ impl OverlayMouseLayoutState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayCheckboxId {
-    DeleteAgentWorktree,
     RenameSessionBranch,
     NonDefaultBranchCheckoutDefault,
     NameNewAgentRandomizedPetName,
@@ -1364,7 +1401,6 @@ pub(crate) enum OverlayMouseLayout {
     ConfirmDeleteAgent {
         cancel_button: Rect,
         delete_button: Rect,
-        checkbox: Option<OverlayCheckbox>,
     },
     ConfirmDeleteTerminal {
         cancel_button: Rect,
@@ -1663,6 +1699,11 @@ pub(crate) enum WorkerEvent {
         project_id: String,
         result: Result<Vec<ProjectWorktreeEntry>, String>,
     },
+    DeletedAgentsReady(Result<Vec<crate::storage::DeletedAgentSession>, String>),
+    DeletedAgentRestored {
+        session_id: String,
+        result: Result<AgentSession, String>,
+    },
     ClipboardCopyCompleted {
         /// Human-readable success message shown in the status bar.
         label: String,
@@ -1960,6 +2001,8 @@ impl App {
             refs_watch_paths: HashMap::new(),
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
+            pending_restorations: HashMap::new(),
+            pending_project_removals: HashSet::new(),
             deletion_busy_messages: HashMap::new(),
             syntax_cache: SyntaxCache::new(),
             snapshot_buf: TerminalSnapshot::empty(),
@@ -2481,6 +2524,7 @@ impl App {
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
+            "recover-deleted-agent" => self.open_recover_deleted_agent_prompt(),
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "reconnect-agent" => self.reconnect_selected_session(),
@@ -3886,6 +3930,23 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn deleted_agent_filter_matches_title_branch_provider_and_path() {
+        let mut session = test_session("recover-branch", "project-1", 0);
+        session.title = Some("Refactor search picker".to_string());
+        session.provider = ProviderKind::from_str("opencode");
+        session.worktree_path = "/tmp/worktrees/search-picker".to_string();
+        let entries = vec![crate::storage::DeletedAgentSession {
+            session,
+            deleted_at: Utc::now(),
+        }];
+
+        for filter in ["refactor", "branch", "open", "picker"] {
+            assert_eq!(deleted_agent_indices_for_filter(&entries, filter), vec![0]);
+        }
+        assert!(deleted_agent_indices_for_filter(&entries, "missing").is_empty());
     }
 
     #[test]
