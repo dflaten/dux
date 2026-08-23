@@ -425,7 +425,7 @@ impl Action {
             }
             Action::ToggleAgentAutoReopen => "Toggle startup auto-reopen for the selected agent.",
             Action::CleanupWorktrees => {
-                "Remove inactive dux-managed worktrees older than two weeks."
+                "Permanently remove inactive dux-managed worktrees older than two weeks."
             }
             Action::ConfigureStartupCommand => {
                 "Configure the selected project's startup command for newly created agents."
@@ -785,7 +785,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "cleanup-worktrees",
-            description: "Remove inactive dux-managed worktrees older than two weeks",
+            description: "Permanently remove inactive dux-managed worktrees older than two weeks",
         }),
     },
     BindingDef {
@@ -985,7 +985,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Left, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Projects pane",
-            description: "Delete selected session/worktree",
+            description: "Remove selected agent from dux (preserves worktree)",
         }),
         hint_contexts: &[
             (HintContext::LeftSession, "Delete"),
@@ -994,7 +994,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         ],
         palette: Some(PaletteEntry {
             name: "delete-agent",
-            description: "Delete the selected agent session",
+            description: "Remove the selected agent from dux and preserve its worktree",
         }),
     },
     BindingDef {

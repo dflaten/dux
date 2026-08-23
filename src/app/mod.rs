@@ -663,13 +663,11 @@ pub(crate) enum ConfigReloadFailedFocus {
     Checkbox,
 }
 
-/// Which selectable element has focus in the Delete Agent confirmation modal.
-/// Focus cycles through all three via Tab / arrow keys / h / l.
+/// Which button has focus in the Delete Agent confirmation modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeleteAgentFocus {
     Cancel,
     Delete,
-    Checkbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -786,11 +784,6 @@ pub(crate) enum PromptState {
         session_id: String,
         branch_name: String,
         focus: DeleteAgentFocus,
-        delete_worktree: bool,
-        /// True when one or more other sessions share this worktree. In that
-        /// case the worktree is always preserved regardless of the user's
-        /// choice, so the checkbox is hidden and a note is shown instead.
-        worktree_shared: bool,
     },
     ConfirmWorktreeCleanup {
         candidates: Vec<WorktreeCleanupCandidate>,
@@ -1307,7 +1300,6 @@ impl OverlayMouseLayoutState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayCheckboxId {
-    DeleteAgentWorktree,
     RenameSessionBranch,
     NonDefaultBranchCheckoutDefault,
     NameNewAgentRandomizedPetName,
@@ -1409,7 +1401,6 @@ pub(crate) enum OverlayMouseLayout {
     ConfirmDeleteAgent {
         cancel_button: Rect,
         delete_button: Rect,
-        checkbox: Option<OverlayCheckbox>,
     },
     ConfirmDeleteTerminal {
         cancel_button: Rect,

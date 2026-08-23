@@ -797,16 +797,10 @@ impl App {
             self.set_error("Select a session first.");
             return Ok(());
         };
-        let worktree_shared = self
-            .sessions
-            .iter()
-            .any(|s| s.id != session.id && s.worktree_path == session.worktree_path);
         self.prompt = PromptState::ConfirmDeleteAgent {
             session_id: session.id.clone(),
             branch_name: session.branch_name.clone(),
             focus: DeleteAgentFocus::Cancel, // Cancel is the safe default
-            delete_worktree: false,          // Opt-in destructive action
-            worktree_shared,
         };
         Ok(())
     }

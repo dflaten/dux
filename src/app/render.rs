@@ -4963,38 +4963,11 @@ impl App {
                     OverlayMouseLayout::AddProjectFailed { ok_button: ok_area };
             }
             PromptState::ConfirmDeleteAgent {
-                branch_name,
-                focus,
-                delete_worktree,
-                worktree_shared,
-                ..
+                branch_name, focus, ..
             } => {
                 self.render_dim_overlay(frame);
                 let dialog_width = 56.min(frame.area().width.max(1));
                 let inner_width = dialog_width.saturating_sub(2);
-                let checkbox_height = if *worktree_shared {
-                    0
-                } else {
-                    let state = if *focus == DeleteAgentFocus::Checkbox {
-                        CheckboxState::Focused
-                    } else {
-                        CheckboxState::Normal
-                    };
-                    let checkbox = Checkbox::new("Also delete the worktree and branch")
-                        .checked(*delete_worktree)
-                        .state(state);
-                    checkbox
-                        .layout(
-                            inner_width,
-                            checkbox.marker_style(Style::default()),
-                            checkbox.label_style(Style::default()),
-                        )
-                        .height
-                };
-
-                // Body: question text + conditional warning/hint/shared note.
-                // Long warning text is split into two explicit Lines so it
-                // renders correctly even at narrow dialog widths.
                 let mut body_lines = vec![
                     Line::from(""),
                     Line::from(vec![
@@ -5007,75 +4980,25 @@ impl App {
                     ]),
                     Line::from(""),
                 ];
-                if *worktree_shared {
-                    body_lines.push(Line::from(Span::styled(
-                        " Worktree is shared with another agent and will be preserved.",
-                        Style::default().fg(self.theme.hint_desc_fg),
-                    )));
-                } else if *delete_worktree {
-                    body_lines.push(Line::from(Span::styled(
-                        " All uncommitted and unpushed changes in this",
-                        Style::default().fg(self.theme.warning_fg),
-                    )));
-                    body_lines.push(Line::from(Span::styled(
-                        " worktree will be permanently lost.",
-                        Style::default().fg(self.theme.warning_fg),
-                    )));
-                } else {
-                    body_lines.push(Line::from(Span::styled(
-                        " Worktree and branch will be preserved on disk.",
-                        Style::default().fg(self.theme.hint_desc_fg),
-                    )));
-                }
+                body_lines.push(Line::from(Span::styled(
+                    " Worktree and branch will be preserved on disk.",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                )));
                 let body_height = wrapped_line_count(&body_lines, inner_width, false);
-                let checkbox_spacing = u16::from(!*worktree_shared);
-                let button_spacing = u16::from(!*worktree_shared);
-                let area = centered_rect_exact(
-                    dialog_width,
-                    2 + body_height + checkbox_spacing + checkbox_height + button_spacing + 3,
-                    frame.area(),
-                );
+                let area = centered_rect_exact(dialog_width, 2 + body_height + 3, frame.area());
                 self.clear_overlay_area(frame, area);
                 let outer = self.themed_overlay_block("Delete Agent");
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
-                let [body_area, _, checkbox_area, _, buttons_area] = Layout::default()
+                let [body_area, buttons_area] = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(body_height),
-                        Constraint::Length(checkbox_spacing),
-                        Constraint::Length(checkbox_height),
-                        Constraint::Length(button_spacing),
-                        Constraint::Length(3),
-                    ])
+                    .constraints([Constraint::Length(body_height), Constraint::Length(3)])
                     .areas(inner);
 
                 Paragraph::new(body_lines)
                     .wrap(Wrap { trim: false })
                     .render(body_area, frame.buffer_mut());
-
-                let checkbox_rect = if !*worktree_shared {
-                    let checkbox_state = if *focus == DeleteAgentFocus::Checkbox {
-                        CheckboxState::Focused
-                    } else {
-                        CheckboxState::Normal
-                    };
-                    let (rect, _) = self.render_overlay_checkbox(
-                        frame,
-                        checkbox_area,
-                        "Also delete the worktree and branch",
-                        *delete_worktree,
-                        checkbox_state,
-                        None,
-                    );
-                    Some(OverlayCheckbox {
-                        id: OverlayCheckboxId::DeleteAgentWorktree,
-                        rect,
-                    })
-                } else {
-                    None
-                };
 
                 // Button area: two bordered panels side by side.
                 let btn_width = 16u16;
@@ -5119,7 +5042,6 @@ impl App {
                 self.overlay_layout.active = OverlayMouseLayout::ConfirmDeleteAgent {
                     cancel_button: cancel_area,
                     delete_button: delete_area,
-                    checkbox: checkbox_rect,
                 };
             }
             PromptState::WorktreeCleanupStart => {
