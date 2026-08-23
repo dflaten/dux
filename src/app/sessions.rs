@@ -21,13 +21,25 @@ impl App {
             PromptState::RecoverDeletedAgent(prompt) => prompt
                 .selected
                 .and_then(|index| prompt.entries.get(index))
-                .map(|entry| entry.session.id.clone()),
+                .map(|entry| (entry.session.id.clone(), entry.session.project_id.clone())),
             _ => None,
         };
-        let Some(session_id) = selected else {
+        let Some((session_id, project_id)) = selected else {
             self.set_error("No deleted agent is selected.");
             return;
         };
+        if self.pending_project_removals.contains(&project_id) {
+            self.set_error("That agent's project is being removed and cannot be recovered.");
+            return;
+        }
+        if self
+            .pending_restorations
+            .insert(session_id.clone(), project_id)
+            .is_some()
+        {
+            self.set_info("That deleted agent is already being restored.");
+            return;
+        }
         self.set_busy("Restoring deleted agent session...");
         self.spawn_restore_deleted_agent(session_id);
     }
@@ -979,11 +991,6 @@ impl App {
                 .find(|session| session.id == *session_id)
             {
                 self.session_store.archive_and_delete_session(session)?;
-                Self::spawn_delete_startup_command_logs(
-                    self.paths.clone(),
-                    candidate.project_id.clone(),
-                    session_id.clone(),
-                );
             }
             self.providers.remove(session_id);
             self.running_provider_pins.remove(session_id);
@@ -1233,11 +1240,6 @@ impl App {
         // in-memory state first and the DB call then failed, the session
         // would vanish from the UI but reappear on restart.
         self.session_store.archive_and_delete_session(&session)?;
-        Self::spawn_delete_startup_command_logs(
-            self.paths.clone(),
-            session.project_id.clone(),
-            session.id.clone(),
-        );
 
         self.providers.remove(&session.id);
         self.running_provider_pins.remove(&session.id);
@@ -2061,16 +2063,6 @@ impl App {
         ));
     }
 
-    fn spawn_delete_startup_command_logs(paths: DuxPaths, project_id: String, session_id: String) {
-        std::thread::spawn(move || {
-            if let Err(err) = crate::startup::delete_agent_logs(&paths, &project_id, &session_id) {
-                logger::error(&format!(
-                    "failed to delete startup command logs for session {session_id}: {err:#}"
-                ));
-            }
-        });
-    }
-
     pub(crate) fn open_change_theme_prompt(&mut self) -> Result<()> {
         let options = crate::theme::discover_available(&self.paths);
         if options.is_empty() {
@@ -2185,10 +2177,17 @@ impl App {
             return Ok(());
         };
         let has_sessions = self.sessions.iter().any(|s| s.project_id == project.id);
-        if has_sessions {
-            self.set_error("Delete all agents in this project first.");
+        let has_pending_restore = self
+            .pending_restorations
+            .values()
+            .any(|project_id| project_id == &project.id);
+        if has_sessions || has_pending_restore {
+            self.set_error(
+                "Delete all agents in this project and wait for pending recoveries first.",
+            );
             return Ok(());
         }
+        self.pending_project_removals.insert(project.id.clone());
         self.spawn_project_persistence(ProjectPersistenceAction::Remove {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
@@ -2215,9 +2214,13 @@ impl App {
             .sessions
             .iter()
             .any(|s| s.project_id == project.id && self.pending_deletions.contains(&s.id));
-        if pending_in_project {
+        let pending_restore_in_project = self
+            .pending_restorations
+            .values()
+            .any(|project_id| project_id == &project.id);
+        if pending_in_project || pending_restore_in_project {
             self.set_error(
-                "Cannot delete project while agent worktree removals are in progress. \
+                "Cannot delete project while agent worktree removals or recoveries are in progress. \
                  Wait for them to finish, then try again.",
             );
             return Ok(());
@@ -2249,6 +2252,7 @@ impl App {
                 self.do_delete_session(&session_id, true)?;
             }
         }
+        self.pending_project_removals.insert(project.id.clone());
         self.spawn_project_persistence(ProjectPersistenceAction::Delete {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
@@ -3221,6 +3225,8 @@ mod tests {
             refs_watch_paths: std::collections::HashMap::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
             pending_deletions: std::collections::HashSet::new(),
+            pending_restorations: std::collections::HashMap::new(),
+            pending_project_removals: std::collections::HashSet::new(),
             deletion_busy_messages: std::collections::HashMap::new(),
             syntax_cache: crate::diff::SyntaxCache::new(),
             snapshot_buf: crate::pty::TerminalSnapshot::empty(),
@@ -4165,6 +4171,64 @@ mod tests {
             worktree_dir.path().exists(),
             "worktree directory must be preserved when the flag is off",
         );
+    }
+
+    #[test]
+    fn deleting_an_agent_preserves_its_startup_command_logs_for_recovery() {
+        let project = make_project("project-1", "claude");
+        let mut session = make_session("s1", "claude", "/tmp/wt/a");
+        session.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        let log_dir = crate::startup::agent_log_dir(&app.paths, "project-1", "s1");
+        std::fs::create_dir_all(&log_dir).expect("log dir");
+        let log_path = log_dir.join("startup.log");
+        std::fs::write(&log_path, "startup output").expect("log file");
+
+        app.finish_delete_session("s1", false, None, true)
+            .expect("finish delete");
+
+        assert!(
+            log_path.exists(),
+            "recovery must retain startup command logs"
+        );
+    }
+
+    #[test]
+    fn project_removal_and_deletion_wait_for_pending_recovery() {
+        let project = make_project("project-1", "claude");
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        app.pending_restorations
+            .insert("s1".to_string(), "project-1".to_string());
+
+        app.remove_selected_project().expect("remove request");
+        assert!(app.status.text().contains("pending recoveries"));
+
+        app.delete_selected_project().expect("delete request");
+        assert!(app.status.text().contains("recoveries are in progress"));
+    }
+
+    #[test]
+    fn recovery_waits_for_pending_project_removal() {
+        let project = make_project("project-1", "claude");
+        let mut session = make_session("s1", "claude", "/tmp/wt/a");
+        session.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        app.pending_project_removals.insert("project-1".to_string());
+        app.prompt = PromptState::RecoverDeletedAgent(RecoverDeletedAgentPrompt {
+            entries: vec![crate::storage::DeletedAgentSession {
+                session,
+                deleted_at: Utc::now(),
+            }],
+            filter: TextInput::new(),
+            loading: false,
+            selected: Some(0),
+            error: None,
+        });
+
+        app.restore_selected_deleted_agent();
+
+        assert!(app.status.text().contains("being removed"));
+        assert!(app.pending_restorations.is_empty());
     }
 
     #[test]

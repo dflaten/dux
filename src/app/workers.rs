@@ -422,15 +422,17 @@ impl App {
                         }
                     }
                 }
-                WorkerEvent::DeletedAgentRestored(result) => match result {
+                WorkerEvent::DeletedAgentRestored { session_id, result } => {
+                    self.pending_restorations.remove(&session_id);
+                    match result {
                     Ok(session) => {
-                        let session_id = session.id.clone();
+                        let restored_session_id = session.id.clone();
                         let branch_name = session.branch_name.clone();
                         self.sessions.push(session);
                         self.update_branch_sync_sessions();
                         self.rebuild_left_items();
                         if let Some(index) = self.left_items().iter().position(|item| {
-                            matches!(item, LeftItem::Session(index) if self.sessions[*index].id == session_id)
+                            matches!(item, LeftItem::Session(index) if self.sessions[*index].id == restored_session_id)
                         }) {
                             self.selected_left = index;
                         }
@@ -442,7 +444,8 @@ impl App {
                         }
                     }
                     Err(error) => self.set_error(format!("Could not restore deleted agent: {error}")),
-                },
+                    }
+                }
                 WorkerEvent::WorktreeRemoveCompleted { session_id, result } => {
                     // Always clear the in-flight guard so the session is
                     // interactive again — whether we're about to remove it
@@ -750,6 +753,13 @@ impl App {
                     }
                 },
                 WorkerEvent::ProjectPersistenceCompleted { action, result } => {
+                    match &action {
+                        ProjectPersistenceAction::Remove { project_id, .. }
+                        | ProjectPersistenceAction::Delete { project_id, .. } => {
+                            self.pending_project_removals.remove(project_id);
+                        }
+                        _ => {}
+                    }
                     self.apply_project_persistence_result(action, result);
                 }
                 WorkerEvent::GlobalEnvPersistenceCompleted { env, result } => match result {
@@ -1562,7 +1572,7 @@ impl App {
                     .map_err(|error| format!("{error:#}"))?
                     .ok_or_else(|| "The deleted agent is no longer available.".to_string())
             })();
-            let _ = tx.send(WorkerEvent::DeletedAgentRestored(result));
+            let _ = tx.send(WorkerEvent::DeletedAgentRestored { session_id, result });
         });
     }
 

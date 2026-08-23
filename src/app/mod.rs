@@ -212,6 +212,13 @@ pub struct App {
     /// visual cue on the left pane row so the user can see the in-flight
     /// state.
     pub(crate) pending_deletions: HashSet<String>,
+    /// Deleted sessions currently being restored, keyed by session ID with
+    /// their owning project ID. Project removal must wait for these workers
+    /// so a completion cannot recreate a session for a removed project.
+    pub(crate) pending_restorations: HashMap<String, String>,
+    /// Projects being removed from the workspace. Restores are rejected while
+    /// this is set so a persistence worker cannot race a recovery worker.
+    pub(crate) pending_project_removals: HashSet<String>,
     /// Maps session IDs to the exact Busy message set by
     /// `begin_delete_session`. Used by the worker event handler to decide
     /// whether the current status-line content was set by this deletion (and
@@ -1702,7 +1709,10 @@ pub(crate) enum WorkerEvent {
         result: Result<Vec<ProjectWorktreeEntry>, String>,
     },
     DeletedAgentsReady(Result<Vec<crate::storage::DeletedAgentSession>, String>),
-    DeletedAgentRestored(Result<AgentSession, String>),
+    DeletedAgentRestored {
+        session_id: String,
+        result: Result<AgentSession, String>,
+    },
     ClipboardCopyCompleted {
         /// Human-readable success message shown in the status bar.
         label: String,
@@ -2000,6 +2010,8 @@ impl App {
             refs_watch_paths: HashMap::new(),
             resume_fallback_candidates: HashMap::new(),
             pending_deletions: HashSet::new(),
+            pending_restorations: HashMap::new(),
+            pending_project_removals: HashSet::new(),
             deletion_busy_messages: HashMap::new(),
             syntax_cache: SyntaxCache::new(),
             snapshot_buf: TerminalSnapshot::empty(),

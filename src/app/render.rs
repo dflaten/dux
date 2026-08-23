@@ -4247,6 +4247,7 @@ impl App {
                 };
             }
             PromptState::RecoverDeletedAgent(prompt) => {
+                self.overlay_layout.active = OverlayMouseLayout::None;
                 self.render_dim_overlay(frame);
                 let area = centered_rect(78, 58, frame.area());
                 self.clear_overlay_area(frame, area);
