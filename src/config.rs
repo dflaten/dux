@@ -218,6 +218,7 @@ pub struct UiConfig {
     pub diff_tab_width: u16,
     pub github_integration: bool,
     pub auto_reopen_agents: bool,
+    pub deleted_agent_retention_days: u16,
     pub pr_banner_position: String,
     pub theme: String,
 }
@@ -249,6 +250,7 @@ impl Default for Config {
                 diff_tab_width: 4,
                 github_integration: true,
                 auto_reopen_agents: false,
+                deleted_agent_retention_days: 30,
                 pr_banner_position: "bottom".to_string(),
                 theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
             },
@@ -414,6 +416,7 @@ impl Default for UiConfig {
             diff_tab_width: 4,
             github_integration: true,
             auto_reopen_agents: false,
+            deleted_agent_retention_days: 30,
             pr_banner_position: "bottom".to_string(),
             theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
         }
@@ -985,6 +988,13 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.ui.auto_reopen_agents),
         },
         ConfigEntry::Field {
+            key: "deleted_agent_retention_days",
+            comment: Some(CommentSource::Static(
+                "# Number of days deleted agents remain recoverable. Their startup-command logs are removed with the archive.\n# Set to 0 to discard deleted agents the next time you open recover-deleted-agent.",
+            )),
+            value_fn: |c| FieldValue::U16(c.ui.deleted_agent_retention_days),
+        },
+        ConfigEntry::Field {
             key: "pr_banner_position",
             comment: Some(CommentSource::Static(
                 "# Position of the PR banner in the agent pane: \"top\" or \"bottom\".\n# Toggle at runtime from the command palette.",
@@ -1222,6 +1232,12 @@ pub fn save_config(
         "ui",
         "auto_reopen_agents",
         config.ui.auto_reopen_agents,
+    );
+    patch_table_u16(
+        &mut doc,
+        "ui",
+        "deleted_agent_retention_days",
+        config.ui.deleted_agent_retention_days,
     );
     patch_table_str(
         &mut doc,
@@ -2316,6 +2332,7 @@ mod tests {
         assert!(rendered.contains("base_branch_fetch_interval = 300"));
         assert!(rendered.contains("empty_project_separator_min_projects = 5"));
         assert!(rendered.contains("auto_reopen_agents = false"));
+        assert!(rendered.contains("deleted_agent_retention_days = 30"));
         assert!(rendered.contains("staged_pane_height_pct = "));
         assert!(rendered.contains("commit_pane_height_pct = "));
         assert!(rendered.contains("[editor]"));

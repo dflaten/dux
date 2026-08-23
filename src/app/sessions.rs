@@ -12,7 +12,7 @@ impl App {
             error: None,
         });
         self.set_busy("Loading recently deleted agents...");
-        self.spawn_load_deleted_agents();
+        self.spawn_load_deleted_agents(self.config.ui.deleted_agent_retention_days);
         Ok(())
     }
 
@@ -984,7 +984,12 @@ impl App {
                 .iter()
                 .find(|session| session.id == *session_id)
             {
-                self.session_store.archive_and_delete_session(session)?;
+                self.session_store.permanently_delete_session(session_id)?;
+                Self::spawn_delete_startup_command_logs(
+                    self.paths.clone(),
+                    session.project_id.clone(),
+                    session_id.clone(),
+                );
             }
             self.providers.remove(session_id);
             self.running_provider_pins.remove(session_id);
@@ -1233,7 +1238,16 @@ impl App {
         // untouched and the session remains visible in the UI. If we cleared
         // in-memory state first and the DB call then failed, the session
         // would vanish from the UI but reappear on restart.
-        self.session_store.archive_and_delete_session(&session)?;
+        if delete_worktree {
+            self.session_store.permanently_delete_session(&session.id)?;
+            Self::spawn_delete_startup_command_logs(
+                self.paths.clone(),
+                session.project_id.clone(),
+                session.id.clone(),
+            );
+        } else {
+            self.session_store.archive_and_delete_session(&session)?;
+        }
 
         self.providers.remove(&session.id);
         self.running_provider_pins.remove(&session.id);
@@ -2079,6 +2093,16 @@ impl App {
             "Themes preview live as you move. Enter saves the choice; Esc reverts to the previous theme.",
         );
         Ok(())
+    }
+
+    fn spawn_delete_startup_command_logs(paths: DuxPaths, project_id: String, session_id: String) {
+        std::thread::spawn(move || {
+            if let Err(err) = crate::startup::delete_agent_logs(&paths, &project_id, &session_id) {
+                logger::error(&format!(
+                    "failed to delete startup command logs for session {session_id}: {err:#}"
+                ));
+            }
+        });
     }
 
     /// Live-preview the theme at the prompt's current selection. Called every
@@ -4046,6 +4070,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deleting_worktree_permanently_removes_recovery_record() {
+        let project = make_project("project-1", "claude");
+        let mut session = make_session("s1", "claude", "/tmp/wt/a");
+        session.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+
+        app.finish_delete_session("s1", true, Some(false), true)
+            .expect("permanent deletion");
+
+        assert!(app.session_store.load_sessions().unwrap().is_empty());
+        assert!(
+            app.session_store
+                .load_deleted_sessions()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// When another session shares the worktree, the worktree must be
     /// preserved even if the user checked "also delete the worktree" — other
     /// sessions still depend on it. Git must not be invoked.
@@ -4223,6 +4266,61 @@ mod tests {
 
         assert!(app.status.text().contains("being removed"));
         assert!(app.pending_restorations.is_empty());
+    }
+
+    #[test]
+    fn recovery_completion_keeps_unrelated_prompt_open() {
+        let project = make_project("project-1", "claude");
+        let mut restored = make_session("restored", "claude", "/tmp/wt/restored");
+        restored.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(Vec::new(), vec![project]);
+        app.prompt = PromptState::Command {
+            input: TextInput::new(),
+            selected: 0,
+        };
+        app.pending_restorations
+            .insert(restored.id.clone(), restored.project_id.clone());
+
+        app.worker_tx
+            .send(WorkerEvent::DeletedAgentRestored {
+                session_id: restored.id.clone(),
+                result: Ok(restored),
+            })
+            .expect("send recovery completion");
+        app.drain_events();
+
+        assert!(matches!(app.prompt, PromptState::Command { .. }));
+        assert!(app.sessions.iter().any(|session| session.id == "restored"));
+    }
+
+    #[test]
+    fn recovery_completion_preserves_archive_when_worktree_is_reused() {
+        let project = make_project("project-1", "claude");
+        let worktree_path = "/tmp/wt/shared";
+        let mut active = make_session("active", "claude", worktree_path);
+        active.project_id = project.id.clone();
+        let mut restored = make_session("restored", "claude", worktree_path);
+        restored.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(vec![active], vec![project]);
+        app.pending_restorations
+            .insert(restored.id.clone(), restored.project_id.clone());
+
+        app.worker_tx
+            .send(WorkerEvent::DeletedAgentRestored {
+                session_id: restored.id.clone(),
+                result: Ok(restored),
+            })
+            .expect("send recovery completion");
+        app.drain_events();
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, "active");
+        assert_eq!(
+            app.session_store.load_deleted_sessions().unwrap()[0]
+                .session
+                .id,
+            "restored"
+        );
     }
 
     #[test]

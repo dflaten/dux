@@ -244,6 +244,12 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         defaults.ui.auto_reopen_agents,
         current.ui.auto_reopen_agents,
     );
+    diff_u16(
+        &mut changes,
+        "ui.deleted_agent_retention_days",
+        defaults.ui.deleted_agent_retention_days,
+        current.ui.deleted_agent_retention_days,
+    );
     diff_str(
         &mut changes,
         "ui.pr_banner_position",

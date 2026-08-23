@@ -57,6 +57,14 @@ pub fn agent_log_dir(paths: &DuxPaths, project_id: &str, session_id: &str) -> Pa
     paths.root.join(LOG_ROOT).join(project_id).join(session_id)
 }
 
+pub fn delete_agent_logs(paths: &DuxPaths, project_id: &str, session_id: &str) -> Result<()> {
+    let dir = agent_log_dir(paths, project_id, session_id);
+    if !dir.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&dir).with_context(|| format!("failed to delete {}", dir.display()))
+}
+
 pub fn list_agent_logs(
     paths: &DuxPaths,
     project_id: &str,
@@ -419,6 +427,19 @@ mod tests {
         assert!(log.contains("success = true"));
         assert!(log.contains("command = printf hello"));
         assert!(log.contains("--- stdout ---\nhello"));
+    }
+
+    #[test]
+    fn delete_agent_logs_removes_session_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let dir = agent_log_dir(&paths, "project-1", "session-1");
+        fs::create_dir_all(&dir).expect("log dir");
+        fs::write(dir.join("one.log"), "log").expect("log file");
+
+        delete_agent_logs(&paths, "project-1", "session-1").expect("delete logs");
+
+        assert!(!dir.exists());
     }
 
     #[test]

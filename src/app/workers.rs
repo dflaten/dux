@@ -428,19 +428,47 @@ impl App {
                     Ok(session) => {
                         let restored_session_id = session.id.clone();
                         let branch_name = session.branch_name.clone();
+                        if self
+                            .sessions
+                            .iter()
+                            .any(|candidate| candidate.worktree_path == session.worktree_path)
+                        {
+                            match self.session_store.archive_and_delete_session(&session) {
+                                Ok(()) => self.set_error(format!(
+                                    "Could not restore agent \"{branch_name}\": another agent already uses its worktree."
+                                )),
+                                Err(error) => self.set_error(format!(
+                                    "Could not restore agent \"{branch_name}\" and could not return it to recovery: {error:#}"
+                                )),
+                            }
+                            continue;
+                        }
+                        let recovery_prompt_is_open = matches!(
+                            self.prompt,
+                            PromptState::RecoverDeletedAgent(_)
+                        );
                         self.sessions.push(session);
                         self.update_branch_sync_sessions();
                         self.rebuild_left_items();
-                        if let Some(index) = self.left_items().iter().position(|item| {
-                            matches!(item, LeftItem::Session(index) if self.sessions[*index].id == restored_session_id)
-                        }) {
-                            self.selected_left = index;
+                        if recovery_prompt_is_open {
+                            if let Some(index) = self.left_items().iter().position(|item| {
+                                matches!(item, LeftItem::Session(index) if self.sessions[*index].id == restored_session_id)
+                            }) {
+                                self.selected_left = index;
+                            }
+                            self.prompt = PromptState::None;
                         }
-                        self.prompt = PromptState::None;
                         self.reload_changed_files();
-                        self.set_info(format!("Restored agent \"{branch_name}\". Reconnecting it now."));
-                        if let Err(error) = self.reconnect_selected_session() {
-                            self.set_error(format!("Restored agent but could not reconnect it: {error:#}"));
+                        if recovery_prompt_is_open {
+                            self.set_info(format!("Restored agent \"{branch_name}\". Reconnecting it now."));
+                            if let Err(error) = self.reconnect_selected_session() {
+                                self.set_error(format!("Restored agent but could not reconnect it: {error:#}"));
+                            }
+                        } else {
+                            let reconnect_key = self.bindings.label_for(Action::ReconnectAgent);
+                            self.set_info(format!(
+                                "Restored agent \"{branch_name}\" without interrupting your current view. Select it and press {reconnect_key} to reconnect."
+                            ));
                         }
                     }
                     Err(error) => self.set_error(format!("Could not restore deleted agent: {error}")),
@@ -1532,13 +1560,24 @@ impl App {
         });
     }
 
-    pub(crate) fn spawn_load_deleted_agents(&self) {
+    pub(crate) fn spawn_load_deleted_agents(&self, retention_days: u16) {
         let tx = self.worker_tx.clone();
         let db_path = self.paths.sessions_db_path.clone();
+        let paths = self.paths.clone();
         thread::spawn(move || {
-            let result = SessionStore::open(&db_path)
-                .and_then(|store| store.load_deleted_sessions())
-                .map_err(|error| format!("{error:#}"));
+            let result = (|| {
+                let mut store = SessionStore::open(&db_path)?;
+                let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+                for entry in store.purge_deleted_sessions_older_than(cutoff)? {
+                    crate::startup::delete_agent_logs(
+                        &paths,
+                        &entry.session.project_id,
+                        &entry.session.id,
+                    )?;
+                }
+                store.load_deleted_sessions()
+            })()
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
             let _ = tx.send(WorkerEvent::DeletedAgentsReady(result));
         });
     }
@@ -1550,6 +1589,11 @@ impl App {
             .projects
             .iter()
             .map(|project| project.id.clone())
+            .collect::<HashSet<_>>();
+        let worktree_paths = self
+            .sessions
+            .iter()
+            .map(|session| session.worktree_path.clone())
             .collect::<HashSet<_>>();
         thread::spawn(move || {
             let result = (|| -> Result<AgentSession, String> {
@@ -1566,6 +1610,9 @@ impl App {
                 }
                 if !Path::new(&entry.session.worktree_path).is_dir() {
                     return Err("Its worktree no longer exists.".to_string());
+                }
+                if worktree_paths.contains(&entry.session.worktree_path) {
+                    return Err("Another agent already uses its worktree.".to_string());
                 }
                 store
                     .restore_deleted_session(&session_id)

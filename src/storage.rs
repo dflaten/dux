@@ -564,6 +564,45 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn permanently_delete_session(&mut self, id: &str) -> Result<()> {
+        let transaction = self.conn.transaction()?;
+        transaction.execute("delete from agent_sessions where id = ?1", params![id])?;
+        transaction.execute(
+            "delete from deleted_agent_sessions where id = ?1",
+            params![id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn purge_deleted_sessions_older_than(
+        &mut self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<DeletedAgentSession>> {
+        let mut statement = self.conn.prepare(
+            r#"
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at, deleted_at
+            from deleted_agent_sessions where deleted_at <= ?1
+            "#,
+        )?;
+        let deleted = statement
+            .query_map(params![cutoff.to_rfc3339()], |row| {
+                Ok(DeletedAgentSession {
+                    session: session_from_row(row)?,
+                    deleted_at: parse_time(&row.get::<_, String>(15)?).unwrap_or_else(Utc::now),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "delete from deleted_agent_sessions where deleted_at <= ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        transaction.commit()?;
+        Ok(deleted)
+    }
+
     pub fn load_deleted_sessions(&self) -> Result<Vec<DeletedAgentSession>> {
         let mut statement = self.conn.prepare(
             r#"
@@ -833,6 +872,50 @@ mod tests {
         assert_eq!(store.load_deleted_sessions().unwrap().len(), 1);
         assert_eq!(store.load_sessions().unwrap()[0].id, "newer");
         assert!(store.restore_deleted_session("newer").unwrap().is_none());
+    }
+
+    #[test]
+    fn permanently_deleting_session_removes_active_and_archived_records() {
+        let mut store = test_store();
+        let now = Utc::now();
+        let session = test_session("permanent", now, now);
+        store.upsert_session(&session).unwrap();
+        store.archive_and_delete_session(&session).unwrap();
+
+        store.permanently_delete_session("permanent").unwrap();
+
+        assert!(store.load_sessions().unwrap().is_empty());
+        assert!(store.load_deleted_sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn purging_deleted_sessions_removes_only_records_at_or_before_cutoff() {
+        let mut store = test_store();
+        let now = Utc::now();
+        let expired = test_session("expired", now, now);
+        let retained = test_session("retained", now, now);
+        store.upsert_session(&expired).unwrap();
+        store.upsert_session(&retained).unwrap();
+        store.archive_and_delete_session(&expired).unwrap();
+        store.archive_and_delete_session(&retained).unwrap();
+        store
+            .conn
+            .execute(
+                "update deleted_agent_sessions set deleted_at = ?2 where id = ?1",
+                params!["expired", (now - Duration::days(31)).to_rfc3339()],
+            )
+            .unwrap();
+
+        let purged = store
+            .purge_deleted_sessions_older_than(now - Duration::days(30))
+            .unwrap();
+
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0].session.id, "expired");
+        assert_eq!(
+            store.load_deleted_sessions().unwrap()[0].session.id,
+            "retained"
+        );
     }
 
     #[test]
