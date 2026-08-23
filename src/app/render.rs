@@ -4246,6 +4246,141 @@ impl App {
                     offset: state.offset(),
                 };
             }
+            PromptState::RecoverDeletedAgent(prompt) => {
+                self.render_dim_overlay(frame);
+                let area = centered_rect(78, 58, frame.area());
+                self.clear_overlay_area(frame, area);
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let move_down = self.bindings.label_for(Action::MoveDown);
+                let move_up = self.bindings.label_for(Action::MoveUp);
+                let mut bottom_spans = vec![Span::raw(" ")];
+                bottom_spans.extend(self.theme.key_badge_default(&move_down));
+                bottom_spans.push(Span::styled(
+                    " down  ",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                bottom_spans.extend(self.theme.key_badge_default(&move_up));
+                bottom_spans.push(Span::styled(
+                    " up  ",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                bottom_spans.extend(self.theme.key_badge_default(&confirm_key));
+                bottom_spans.push(Span::styled(
+                    " restore  ",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                bottom_spans.extend(self.theme.key_badge_default(&close_key));
+                bottom_spans.push(Span::styled(
+                    " cancel",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                let [details_area, search_area, list_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(4),
+                        Constraint::Length(3),
+                        Constraint::Min(6),
+                    ])
+                    .areas(area);
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "Deleted agents are newest first.",
+                        Style::default().fg(self.theme.text_fg).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "An agent can be restored only if its project and preserved worktree still exist.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                ])
+                .block(self.themed_overlay_block("Recover Deleted Agent").title_bottom(Line::from(bottom_spans)))
+                .render(details_area, frame.buffer_mut());
+                Paragraph::new(render_single_line_cursor_input(
+                    " Search: ",
+                    &prompt.filter.text,
+                    prompt.filter.cursor,
+                    self.theme.input_cursor_fg,
+                    self.theme.input_cursor_bg,
+                ))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT | Borders::RIGHT)
+                        .border_style(Style::default().fg(self.theme.overlay_border))
+                        .style(Style::default().bg(self.theme.overlay_bg)),
+                )
+                .render(search_area, frame.buffer_mut());
+                let matching =
+                    deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                let items = if prompt.loading {
+                    vec![ListItem::new(Line::from(Span::styled(
+                        "  Loading deleted agents...",
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    )))]
+                } else if let Some(error) = &prompt.error {
+                    vec![ListItem::new(Line::from(Span::styled(
+                        format!("  Could not load deleted agents: {error}"),
+                        Style::default().fg(self.theme.status_error_fg),
+                    )))]
+                } else if matching.is_empty() {
+                    vec![ListItem::new(Line::from(Span::styled(
+                        "  No deleted agents match this search.",
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    )))]
+                } else {
+                    matching
+                        .iter()
+                        .map(|index| {
+                            let entry = &prompt.entries[*index];
+                            let name = entry
+                                .session
+                                .title
+                                .as_deref()
+                                .unwrap_or(&entry.session.branch_name);
+                            ListItem::new(vec![
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!("  {name}"),
+                                        Style::default()
+                                            .fg(self.theme.text_fg)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        format!("  {}", entry.session.provider.as_str()),
+                                        Style::default().fg(self.theme.branch_fg),
+                                    ),
+                                    Span::styled(
+                                        format!(
+                                            "  deleted {}",
+                                            entry.deleted_at.format("%Y-%m-%d %H:%M UTC")
+                                        ),
+                                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                                    ),
+                                ]),
+                                Line::from(Span::styled(
+                                    format!("    {}", entry.session.worktree_path),
+                                    Style::default().fg(self.theme.hint_desc_fg),
+                                )),
+                            ])
+                        })
+                        .collect()
+                };
+                let selected = prompt
+                    .selected
+                    .and_then(|selected| matching.iter().position(|index| *index == selected));
+                let mut state = ListState::default().with_selected(selected);
+                let list_block = Block::default()
+                    .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+                    .border_style(Style::default().fg(self.theme.overlay_border))
+                    .style(Style::default().bg(self.theme.overlay_bg));
+                StatefulWidget::render(
+                    List::new(items)
+                        .block(list_block)
+                        .highlight_style(self.theme.selection_style()),
+                    list_area,
+                    frame.buffer_mut(),
+                    &mut state,
+                );
+            }
             PromptState::KillRunning(prompt) => {
                 self.render_dim_overlay(frame);
                 let popup = centered_rect(78, 72, frame.area());

@@ -633,6 +633,15 @@ pub(crate) struct PickProjectWorktreePrompt {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RecoverDeletedAgentPrompt {
+    pub(crate) entries: Vec<crate::storage::DeletedAgentSession>,
+    pub(crate) filter: TextInput,
+    pub(crate) loading: bool,
+    pub(crate) selected: Option<usize>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ConfirmKillRunningPrompt {
     pub(crate) previous: KillRunningPrompt,
     pub(crate) action: KillRunningAction,
@@ -758,6 +767,7 @@ pub(crate) enum PromptState {
     #[allow(dead_code)]
     StartupCommandLogs(StartupCommandLogPrompt),
     PickProjectWorktree(PickProjectWorktreePrompt),
+    RecoverDeletedAgent(RecoverDeletedAgentPrompt),
     KillRunning(KillRunningPrompt),
     ConfirmKillRunning(ConfirmKillRunningPrompt),
     ConfigReloadFailed {
@@ -1057,6 +1067,34 @@ pub(crate) fn selectable_project_worktree_indices_for_filter(
         .filter_map(|(index, entry)| {
             (entry.is_selectable && project_worktree_matches_filter(entry, filter)).then_some(index)
         })
+        .collect()
+}
+
+pub(crate) fn deleted_agent_matches_filter(
+    entry: &crate::storage::DeletedAgentSession,
+    filter: &str,
+) -> bool {
+    let needle = filter.trim();
+    needle.is_empty()
+        || [
+            entry.session.title.as_deref().unwrap_or_default(),
+            entry.session.branch_name.as_str(),
+            entry.session.provider.as_str(),
+            entry.session.project_path.as_deref().unwrap_or_default(),
+            entry.session.worktree_path.as_str(),
+        ]
+        .iter()
+        .any(|candidate| fuzzy_subsequence_match(candidate, needle))
+}
+
+pub(crate) fn deleted_agent_indices_for_filter(
+    entries: &[crate::storage::DeletedAgentSession],
+    filter: &str,
+) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| deleted_agent_matches_filter(entry, filter).then_some(index))
         .collect()
 }
 
@@ -1663,6 +1701,8 @@ pub(crate) enum WorkerEvent {
         project_id: String,
         result: Result<Vec<ProjectWorktreeEntry>, String>,
     },
+    DeletedAgentsReady(Result<Vec<crate::storage::DeletedAgentSession>, String>),
+    DeletedAgentRestored(Result<AgentSession, String>),
     ClipboardCopyCompleted {
         /// Human-readable success message shown in the status bar.
         label: String,
@@ -2481,6 +2521,7 @@ impl App {
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
+            "recover-deleted-agent" => self.open_recover_deleted_agent_prompt(),
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "reconnect-agent" => self.reconnect_selected_session(),
@@ -3886,6 +3927,23 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn deleted_agent_filter_matches_title_branch_provider_and_path() {
+        let mut session = test_session("recover-branch", "project-1", 0);
+        session.title = Some("Refactor search picker".to_string());
+        session.provider = ProviderKind::from_str("opencode");
+        session.worktree_path = "/tmp/worktrees/search-picker".to_string();
+        let entries = vec![crate::storage::DeletedAgentSession {
+            session,
+            deleted_at: Utc::now(),
+        }];
+
+        for filter in ["refactor", "branch", "open", "picker"] {
+            assert_eq!(deleted_agent_indices_for_filter(&entries, filter), vec![0]);
+        }
+        assert!(deleted_agent_indices_for_filter(&entries, "missing").is_empty());
     }
 
     #[test]

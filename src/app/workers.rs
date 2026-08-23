@@ -391,6 +391,58 @@ impl App {
                         }
                     }
                 }
+                WorkerEvent::DeletedAgentsReady(result) => {
+                    let mut status = None;
+                    if let PromptState::RecoverDeletedAgent(prompt) = &mut self.prompt {
+                        prompt.loading = false;
+                        match result {
+                            Ok(entries) => {
+                                prompt.selected = deleted_agent_indices_for_filter(
+                                    &entries,
+                                    &prompt.filter.text,
+                                )
+                                .into_iter()
+                                .next();
+                                prompt.entries = entries;
+                                prompt.error = None;
+                                status = Some(Ok("Choose a deleted agent to restore."));
+                            }
+                            Err(error) => {
+                                prompt.entries.clear();
+                                prompt.selected = None;
+                                prompt.error = Some(error.clone());
+                                status = Some(Err(format!("Could not load deleted agents: {error}")));
+                            }
+                        }
+                    }
+                    if let Some(status) = status {
+                        match status {
+                            Ok(message) => self.set_info(message),
+                            Err(message) => self.set_error(message),
+                        }
+                    }
+                }
+                WorkerEvent::DeletedAgentRestored(result) => match result {
+                    Ok(session) => {
+                        let session_id = session.id.clone();
+                        let branch_name = session.branch_name.clone();
+                        self.sessions.push(session);
+                        self.update_branch_sync_sessions();
+                        self.rebuild_left_items();
+                        if let Some(index) = self.left_items().iter().position(|item| {
+                            matches!(item, LeftItem::Session(index) if self.sessions[*index].id == session_id)
+                        }) {
+                            self.selected_left = index;
+                        }
+                        self.prompt = PromptState::None;
+                        self.reload_changed_files();
+                        self.set_info(format!("Restored agent \"{branch_name}\". Reconnecting it now."));
+                        if let Err(error) = self.reconnect_selected_session() {
+                            self.set_error(format!("Restored agent but could not reconnect it: {error:#}"));
+                        }
+                    }
+                    Err(error) => self.set_error(format!("Could not restore deleted agent: {error}")),
+                },
                 WorkerEvent::WorktreeRemoveCompleted { session_id, result } => {
                     // Always clear the in-flight guard so the session is
                     // interactive again — whether we're about to remove it
@@ -1467,6 +1519,50 @@ impl App {
                 project_id: project.id,
                 result,
             });
+        });
+    }
+
+    pub(crate) fn spawn_load_deleted_agents(&self) {
+        let tx = self.worker_tx.clone();
+        let db_path = self.paths.sessions_db_path.clone();
+        thread::spawn(move || {
+            let result = SessionStore::open(&db_path)
+                .and_then(|store| store.load_deleted_sessions())
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(WorkerEvent::DeletedAgentsReady(result));
+        });
+    }
+
+    pub(crate) fn spawn_restore_deleted_agent(&self, session_id: String) {
+        let tx = self.worker_tx.clone();
+        let db_path = self.paths.sessions_db_path.clone();
+        let project_ids = self
+            .projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<HashSet<_>>();
+        thread::spawn(move || {
+            let result = (|| -> Result<AgentSession, String> {
+                let mut store =
+                    SessionStore::open(&db_path).map_err(|error| format!("{error:#}"))?;
+                let entry = store
+                    .load_deleted_sessions()
+                    .map_err(|error| format!("{error:#}"))?
+                    .into_iter()
+                    .find(|entry| entry.session.id == session_id)
+                    .ok_or_else(|| "The deleted agent is no longer available.".to_string())?;
+                if !project_ids.contains(&entry.session.project_id) {
+                    return Err("Its project is no longer registered.".to_string());
+                }
+                if !Path::new(&entry.session.worktree_path).is_dir() {
+                    return Err("Its worktree no longer exists.".to_string());
+                }
+                store
+                    .restore_deleted_session(&session_id)
+                    .map_err(|error| format!("{error:#}"))?
+                    .ok_or_else(|| "The deleted agent is no longer available.".to_string())
+            })();
+            let _ = tx.send(WorkerEvent::DeletedAgentRestored(result));
         });
     }
 

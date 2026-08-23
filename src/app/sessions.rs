@@ -3,6 +3,35 @@ use crate::browser;
 use crate::editor;
 
 impl App {
+    pub(crate) fn open_recover_deleted_agent_prompt(&mut self) -> Result<()> {
+        self.prompt = PromptState::RecoverDeletedAgent(RecoverDeletedAgentPrompt {
+            entries: Vec::new(),
+            filter: TextInput::new().with_placeholder("Search deleted agents..."),
+            loading: true,
+            selected: None,
+            error: None,
+        });
+        self.set_busy("Loading recently deleted agents...");
+        self.spawn_load_deleted_agents();
+        Ok(())
+    }
+
+    pub(crate) fn restore_selected_deleted_agent(&mut self) {
+        let selected = match &self.prompt {
+            PromptState::RecoverDeletedAgent(prompt) => prompt
+                .selected
+                .and_then(|index| prompt.entries.get(index))
+                .map(|entry| entry.session.id.clone()),
+            _ => None,
+        };
+        let Some(session_id) = selected else {
+            self.set_error("No deleted agent is selected.");
+            return;
+        };
+        self.set_busy("Restoring deleted agent session...");
+        self.spawn_restore_deleted_agent(session_id);
+    }
+
     pub(crate) fn open_project_browser(&mut self) -> Result<()> {
         let start_dir = self
             .config
@@ -944,12 +973,12 @@ impl App {
             candidate.session_ids.iter().cloned().collect();
 
         for session_id in &candidate.session_ids {
-            if self
+            if let Some(session) = self
                 .sessions
                 .iter()
-                .any(|session| session.id == *session_id)
+                .find(|session| session.id == *session_id)
             {
-                self.session_store.delete_session(session_id)?;
+                self.session_store.archive_and_delete_session(session)?;
                 Self::spawn_delete_startup_command_logs(
                     self.paths.clone(),
                     candidate.project_id.clone(),
@@ -1203,7 +1232,7 @@ impl App {
         // untouched and the session remains visible in the UI. If we cleared
         // in-memory state first and the DB call then failed, the session
         // would vanish from the UI but reappear on restart.
-        self.session_store.delete_session(&session.id)?;
+        self.session_store.archive_and_delete_session(&session)?;
         Self::spawn_delete_startup_command_logs(
             self.paths.clone(),
             session.project_id.clone(),

@@ -111,6 +111,7 @@ pub enum Action {
     ForceReconnectAgent,
     ChangeTheme,
     ReloadConfig,
+    RecoverDeletedAgent,
 }
 
 /// Where a binding's key combo is matched.
@@ -305,6 +306,7 @@ impl Action {
             Action::ForceReconnectAgent => "force_reconnect_agent",
             Action::ChangeTheme => "change_theme",
             Action::ReloadConfig => "reload_config",
+            Action::RecoverDeletedAgent => "recover_deleted_agent",
         }
     }
 
@@ -449,6 +451,7 @@ impl Action {
             Action::ForceReconnectAgent => "Restart the agent without resuming the prior session.",
             Action::ChangeTheme => "Open a picker to switch the dux color theme.",
             Action::ReloadConfig => "Reload the configuration file.",
+            Action::RecoverDeletedAgent => "Search and recover recently deleted agent sessions.",
         }
     }
 
@@ -551,7 +554,8 @@ impl Action {
             | Action::ChangeDefaultProvider
             | Action::ChangeProjectDefaultProvider
             | Action::ChangeTheme
-            | Action::ReloadConfig => None,
+            | Action::ReloadConfig
+            | Action::RecoverDeletedAgent => None,
         }
     }
 }
@@ -1660,6 +1664,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "kill-running",
             description: "Open a modal to kill running agents and companion terminals",
+        }),
+    },
+    BindingDef {
+        action: Action::RecoverDeletedAgent,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "recover-deleted-agent",
+            description: "Search and recover recently deleted agent sessions",
         }),
     },
     BindingDef {

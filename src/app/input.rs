@@ -3007,6 +3007,58 @@ impl App {
             return Ok(false);
         }
 
+        if let PromptState::RecoverDeletedAgent(prompt) = &mut self.prompt {
+            let is_plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = if is_plain_char {
+                None
+            } else {
+                self.bindings.lookup(&key, BindingScope::Palette)
+            };
+            match action {
+                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+                Some(Action::MoveDown) => {
+                    let matching =
+                        deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                    if let Some(current) = prompt.selected
+                        && let Some(position) = matching.iter().position(|index| *index == current)
+                        && let Some(next) = matching.get(position + 1)
+                    {
+                        prompt.selected = Some(*next);
+                    } else if prompt.selected.is_none() {
+                        prompt.selected = matching.into_iter().next();
+                    }
+                }
+                Some(Action::MoveUp) => {
+                    let matching =
+                        deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                    if let Some(current) = prompt.selected
+                        && let Some(position) = matching.iter().position(|index| *index == current)
+                        && position > 0
+                    {
+                        prompt.selected = Some(matching[position - 1]);
+                    } else if prompt.selected.is_none() {
+                        prompt.selected = matching.into_iter().next();
+                    }
+                }
+                Some(Action::Confirm) => self.restore_selected_deleted_agent(),
+                _ => {
+                    let before = prompt.filter.text.clone();
+                    if prompt.filter.handle_key(key) && prompt.filter.text != before {
+                        let matching =
+                            deleted_agent_indices_for_filter(&prompt.entries, &prompt.filter.text);
+                        if !prompt
+                            .selected
+                            .is_some_and(|selected| matching.contains(&selected))
+                        {
+                            prompt.selected = matching.into_iter().next();
+                        }
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
         if let PromptState::ChangeAgentProvider(prompt) = &mut self.prompt {
             let palette_action = self.bindings.lookup(&key, BindingScope::Palette);
             let dialog_action = self.bindings.lookup(&key, BindingScope::Dialog);
