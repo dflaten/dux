@@ -1443,20 +1443,20 @@ impl App {
         let worktree_path = session.worktree_path.clone();
         let tx = self.worker_tx.clone();
         thread::spawn(move || {
-            for _ in 0..60 {
-                if let Some(provider_session_id) = crate::opencode::latest_session_id_for_worktree(
-                    Path::new(&worktree_path),
-                    &previous_provider_session_ids,
-                ) {
-                    let _ = tx.send(WorkerEvent::ProviderSessionIdDiscovered {
-                        session_id,
-                        provider,
-                        provider_session_id,
-                    });
-                    return;
-                }
-                thread::sleep(Duration::from_millis(500));
-            }
+            let provider_session_id = wait_for_provider_session_id(
+                || {
+                    crate::opencode::latest_session_id_for_worktree(
+                        Path::new(&worktree_path),
+                        &previous_provider_session_ids,
+                    )
+                },
+                Duration::from_millis(500),
+            );
+            let _ = tx.send(WorkerEvent::ProviderSessionIdDiscovered {
+                session_id,
+                provider,
+                provider_session_id,
+            });
         });
     }
 
@@ -3536,6 +3536,18 @@ fn parse_pr_json_value(
         url,
     })
 }
+fn wait_for_provider_session_id(
+    mut discover: impl FnMut() -> Option<String>,
+    retry_interval: Duration,
+) -> String {
+    loop {
+        if let Some(session_id) = discover() {
+            return session_id;
+        }
+        thread::sleep(retry_interval);
+    }
+}
+
 fn parse_resolved_pull_request_json(
     json: &str,
     project: Project,
@@ -3606,6 +3618,22 @@ mod tests {
 
     use super::*;
     use crate::model::PrState;
+
+    #[test]
+    fn provider_session_discovery_waits_past_previous_timeout() {
+        let mut attempts = 0;
+
+        let session_id = wait_for_provider_session_id(
+            || {
+                attempts += 1;
+                (attempts > 60).then(|| "ses_lazily_created".to_string())
+            },
+            Duration::ZERO,
+        );
+
+        assert_eq!(attempts, 61);
+        assert_eq!(session_id, "ses_lazily_created");
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
