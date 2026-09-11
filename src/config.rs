@@ -698,13 +698,12 @@ fn disable_unsafe_stock_opencode_resume(doc: &mut DocumentMut) -> bool {
     let Some(provider) = provider_table_config(table) else {
         return false;
     };
+    let has_explicit_fork_args = table.contains_key("fork_args");
     let unsafe_stock = unsafe_stock_opencode_resume();
     if provider.command != unsafe_stock.command
         || provider.args != unsafe_stock.args
         || provider.resume_args != unsafe_stock.resume_args
-        || provider.fork_args.as_ref().is_some_and(|args| {
-            !args.is_empty() && Some(args.as_slice()) != stock_opencode().fork_args.as_deref()
-        })
+        || has_explicit_fork_args
         || provider.oneshot_args != unsafe_stock.oneshot_args
         || provider.oneshot_output != unsafe_stock.oneshot_output
         || provider.install_hint != unsafe_stock.install_hint
@@ -2692,6 +2691,10 @@ oneshot_output = "stdout"
         let mut rendered = String::new();
         render_provider_config(&mut rendered, "opencode", &unsafe_stock_opencode_resume());
         let mut doc: DocumentMut = rendered.parse().expect("parse opencode provider");
+        doc["providers"]["opencode"]
+            .as_table_mut()
+            .expect("opencode table")
+            .remove("fork_args");
 
         let changed = disable_unsafe_stock_opencode_resume(&mut doc);
 
@@ -2742,6 +2745,34 @@ forward_scroll = true
         assert_eq!(provider.resume_args, Some(vec!["--continue".to_string()]));
         assert_eq!(provider.fork_args, Some(vec!["--custom-fork".to_string()]));
         assert_eq!(provider.resume_wait_timeout_ms, Some(3_000));
+    }
+
+    #[test]
+    fn disable_unsafe_stock_opencode_resume_preserves_explicit_fork_disable() {
+        let mut doc: DocumentMut = r#"
+[providers.opencode]
+command = "opencode"
+args = []
+resume_args = ["--continue"]
+fork_args = []
+resume_wait_timeout_ms = 3000
+oneshot_args = ["run", "{prompt}"]
+oneshot_output = "stdout"
+install_hint = "curl -fsSL https://opencode.ai/install | bash"
+forward_scroll = true
+"#
+        .parse()
+        .expect("parse explicit fork disable");
+
+        assert!(!disable_unsafe_stock_opencode_resume(&mut doc));
+        let provider = provider_table_config(
+            doc["providers"]["opencode"]
+                .as_table()
+                .expect("opencode table"),
+        )
+        .expect("parse preserved opencode provider");
+        assert_eq!(provider.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(provider.fork_args, Some(Vec::new()));
     }
 
     #[test]
