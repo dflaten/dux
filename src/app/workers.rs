@@ -2525,6 +2525,7 @@ pub(crate) fn run_create_agent_job(
         owns_worktree,
         title,
         launch_with_resume,
+        fork_provider_session_id,
     ) = match request {
         CreateAgentRequest::NewProject {
             project,
@@ -2702,6 +2703,7 @@ pub(crate) fn run_create_agent_job(
                 owns_worktree,
                 title,
                 launch_with_resume,
+                None,
             )
         }
         CreateAgentRequest::PullRequest {
@@ -2786,6 +2788,7 @@ pub(crate) fn run_create_agent_job(
                 true,
                 None,
                 false,
+                None,
             )
         }
         CreateAgentRequest::ForkSession {
@@ -2852,8 +2855,11 @@ pub(crate) fn run_create_agent_job(
                 )));
                 return;
             }
+            let fork_provider_session_id = source_session
+                .provider_session_id(&source_session.provider)
+                .map(str::to_string);
             let status_message = format!(
-                "Forked {} agent \"{}\" from \"{}\" in project \"{}\". The new worktree starts with copied files and a fresh session.",
+                "Forked {} agent \"{}\" from \"{}\" in project \"{}\". The new worktree starts with copied files.",
                 source_session.provider.as_str(),
                 branch_name,
                 source_label,
@@ -2867,8 +2873,9 @@ pub(crate) fn run_create_agent_job(
                 branch_name,
                 worktree_path,
                 true,
-                None,
+                fork_provider_session_id,
                 false,
+                None,
             )
         }
         CreateAgentRequest::ExistingManagedWorktree {
@@ -2899,6 +2906,7 @@ pub(crate) fn run_create_agent_job(
                 false,
                 custom_name,
                 true,
+                None,
             )
         }
         CreateAgentRequest::ForkExternalWorktree {
@@ -2976,6 +2984,7 @@ pub(crate) fn run_create_agent_job(
                 true,
                 None,
                 false,
+                None,
             )
         }
     };
@@ -2996,6 +3005,18 @@ pub(crate) fn run_create_agent_job(
     let provider_cfg = provider_config(&config, &provider);
     let effective_launch_with_resume =
         launch_with_resume && provider_cfg.resume_args_for(None).is_some();
+    let fork_provider_session = fork_provider_session_id
+        .as_deref()
+        .is_some_and(|session_id| provider_cfg.fork_args_for(Some(session_id)).is_some());
+    let status_message = if fork_provider_session {
+        format!("{status_message} The provider context was forked into an independent session.")
+    } else if fork_provider_session_id.is_some() {
+        format!(
+            "{status_message} The provider does not support context forking, so a fresh session was started."
+        )
+    } else {
+        status_message
+    };
     let started_providers = if effective_launch_with_resume {
         vec![provider.as_str().to_string()]
     } else {
@@ -3099,7 +3120,12 @@ pub(crate) fn run_create_agent_job(
             )),
         }
     }
-    let launch_message = if effective_launch_with_resume {
+    let launch_message = if fork_provider_session {
+        format!(
+            "Forking {} context into the new worktree...",
+            session.provider.as_str()
+        )
+    } else if effective_launch_with_resume {
         format!(
             "Continuing {} in the existing worktree...",
             session.provider.as_str()
@@ -3116,9 +3142,10 @@ pub(crate) fn run_create_agent_job(
     let request = AgentLaunchRequest {
         session,
         provider_config: provider_cfg,
-        provider_session_id: None,
+        provider_session_id: fork_provider_session_id,
         env,
         resume: effective_launch_with_resume,
+        fork_provider_session,
         pty_size: (rows, cols),
         scrollback_lines: config.ui.agent_scrollback_lines,
         kind: AgentLaunchKind::Create {
@@ -3138,12 +3165,7 @@ pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sende
         } else {
             HashSet::new()
         };
-    let launch_args = request
-        .provider_config
-        .interactive_args_with_provider_session_id(
-            request.resume,
-            request.provider_session_id.as_deref(),
-        );
+    let launch_args = launch_args_for_request(&request);
     let (rows, cols) = request.pty_size;
     logger::debug(&format!(
         "spawning PTY {:?} {:?} in {} ({}x{}, resume_supported={})",
@@ -3226,6 +3248,21 @@ pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sende
             previous_provider_session_ids,
         },
     )));
+}
+
+fn launch_args_for_request(request: &AgentLaunchRequest) -> Vec<String> {
+    if request.fork_provider_session {
+        return request
+            .provider_config
+            .fork_args_for(request.provider_session_id.as_deref())
+            .expect("fork launch requires configured fork arguments and a provider session ID");
+    }
+    request
+        .provider_config
+        .interactive_args_with_provider_session_id(
+            request.resume,
+            request.provider_session_id.as_deref(),
+        )
 }
 
 pub(crate) fn browser_entries(dir: &Path) -> Vec<BrowserEntry> {
@@ -3750,6 +3787,7 @@ mod tests {
             },
             provider_session_id: None,
             resume: false,
+            fork_provider_session: false,
             pty_size: (24, 80),
             scrollback_lines: 1_000,
             env: Vec::new(),
@@ -3768,6 +3806,37 @@ mod tests {
             _ => panic!("expected launch failure"),
         }
         assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fork_launch_uses_source_provider_session_id_and_fork_args() {
+        let tmp = tempdir().expect("tempdir");
+        let request = AgentLaunchRequest {
+            session: test_session(tmp.path()),
+            provider_config: ProviderCommandConfig {
+                command: "opencode".to_string(),
+                fork_args: Some(vec![
+                    "--session".to_string(),
+                    "{provider_session_id}".to_string(),
+                    "--fork".to_string(),
+                ]),
+                ..Default::default()
+            },
+            provider_session_id: Some("ses_source".to_string()),
+            resume: false,
+            fork_provider_session: true,
+            pty_size: (24, 80),
+            scrollback_lines: 1_000,
+            env: Vec::new(),
+            kind: AgentLaunchKind::Reconnect {
+                status_message: "reconnect".to_string(),
+            },
+        };
+
+        assert_eq!(
+            launch_args_for_request(&request),
+            ["--session", "ses_source", "--fork"]
+        );
     }
 
     #[test]

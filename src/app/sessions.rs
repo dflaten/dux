@@ -493,6 +493,7 @@ impl App {
             provider_config: cfg,
             env,
             resume,
+            fork_provider_session: false,
             pty_size: self.pty_size_for_launch(),
             scrollback_lines: self.config.ui.agent_scrollback_lines,
             kind,

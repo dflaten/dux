@@ -99,7 +99,7 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
     },
     |b| {
         format!(
-            "`{}` forks the current agent into a brand new session. Cloning never felt so good.",
+            "`{}` forks the current agent's worktree and, when supported, its context. Cloning never felt so good.",
             b.label_for(Action::ForkAgent)
         )
     },

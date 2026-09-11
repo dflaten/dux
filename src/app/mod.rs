@@ -1598,6 +1598,7 @@ pub(crate) struct AgentLaunchRequest {
     pub(crate) provider_session_id: Option<String>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) resume: bool,
+    pub(crate) fork_provider_session: bool,
     pub(crate) pty_size: (u16, u16),
     pub(crate) scrollback_lines: usize,
     pub(crate) kind: AgentLaunchKind,
