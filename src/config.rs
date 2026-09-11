@@ -173,6 +173,7 @@ pub struct ProviderCommandConfig {
     pub command: String,
     pub args: Vec<String>,
     pub resume_args: Option<Vec<String>>,
+    pub fork_args: Option<Vec<String>>,
     pub resume_wait_timeout_ms: Option<u64>,
     pub oneshot_args: Vec<String>,
     pub oneshot_output: OneshotOutput,
@@ -311,6 +312,7 @@ impl Default for ProviderCommandConfig {
             command: String::new(),
             args: Vec::new(),
             resume_args: None,
+            fork_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -334,18 +336,27 @@ impl ProviderCommandConfig {
     }
 
     pub fn resume_args_for(&self, provider_session_id: Option<&str>) -> Option<Vec<String>> {
-        let resume_args = self
-            .resume_args
-            .as_deref()
-            .filter(|args| !args.is_empty())?;
-        let requires_provider_session_id = resume_args
+        self.session_args_for(self.resume_args.as_deref(), provider_session_id)
+    }
+
+    pub fn fork_args_for(&self, provider_session_id: Option<&str>) -> Option<Vec<String>> {
+        self.session_args_for(self.fork_args.as_deref(), provider_session_id)
+    }
+
+    fn session_args_for(
+        &self,
+        configured_args: Option<&[String]>,
+        provider_session_id: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let configured_args = configured_args.filter(|args| !args.is_empty())?;
+        let requires_provider_session_id = configured_args
             .iter()
             .any(|arg| arg.contains("{provider_session_id}"));
         if requires_provider_session_id && provider_session_id.is_none() {
             return None;
         }
         Some(
-            resume_args
+            configured_args
                 .iter()
                 .map(|arg| {
                     arg.replace(
@@ -452,6 +463,9 @@ impl ProvidersConfig {
                 indexmap::map::Entry::Occupied(mut entry) => {
                     if entry.get().resume_args.is_none() {
                         entry.get_mut().resume_args = config.resume_args;
+                    }
+                    if entry.get().fork_args.is_none() {
+                        entry.get_mut().fork_args = config.fork_args;
                     }
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
@@ -645,6 +659,7 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         command: "gemini".to_string(),
         args: Vec::new(),
         resume_args: Some(vec!["--resume".to_string()]),
+        fork_args: None,
         resume_wait_timeout_ms: None,
         oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
         oneshot_output: OneshotOutput::Stdout,
@@ -661,6 +676,7 @@ fn unsafe_stock_opencode_resume() -> ProviderCommandConfig {
         command: "opencode".to_string(),
         args: Vec::new(),
         resume_args: Some(vec!["--continue".to_string()]),
+        fork_args: None,
         resume_wait_timeout_ms: Some(3_000),
         oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
         oneshot_output: OneshotOutput::Stdout,
@@ -682,10 +698,12 @@ fn disable_unsafe_stock_opencode_resume(doc: &mut DocumentMut) -> bool {
     let Some(provider) = provider_table_config(table) else {
         return false;
     };
+    let has_explicit_fork_args = table.contains_key("fork_args");
     let unsafe_stock = unsafe_stock_opencode_resume();
     if provider.command != unsafe_stock.command
         || provider.args != unsafe_stock.args
         || provider.resume_args != unsafe_stock.resume_args
+        || has_explicit_fork_args
         || provider.oneshot_args != unsafe_stock.oneshot_args
         || provider.oneshot_output != unsafe_stock.oneshot_output
         || provider.install_hint != unsafe_stock.install_hint
@@ -700,6 +718,11 @@ fn disable_unsafe_stock_opencode_resume(doc: &mut DocumentMut) -> bool {
         resume.push(arg.as_str());
     }
     table["resume_args"] = toml_edit::value(resume);
+    let mut fork = Array::new();
+    for arg in safe_stock.fork_args.as_deref().unwrap_or(&[]) {
+        fork.push(arg.as_str());
+    }
+    table["fork_args"] = toml_edit::value(fork);
     table.remove("resume_wait_timeout_ms");
     true
 }
@@ -1409,6 +1432,11 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
             resume.push(a.as_str());
         }
         tbl["resume_args"] = toml_edit::value(resume);
+        let mut fork = Array::new();
+        for a in config.fork_args.as_deref().unwrap_or(&[]) {
+            fork.push(a.as_str());
+        }
+        tbl["fork_args"] = toml_edit::value(fork);
         if let Some(timeout_ms) = config.resume_wait_timeout_ms {
             tbl["resume_wait_timeout_ms"] = toml_edit::value(timeout_ms as i64);
         }
@@ -1675,6 +1703,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 command: "claude".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["--continue".to_string()]),
+                fork_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "--bare".to_string(),
@@ -1696,6 +1725,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 command: "codex".to_string(),
                 args: Vec::new(),
                 resume_args: Some(vec!["resume".to_string(), "--last".to_string()]),
+                fork_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "exec".to_string(),
@@ -1723,6 +1753,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 // Unlike claude/codex, there is no flag to limit resume to the
                 // CWD, so we disable it.
                 resume_args: None,
+                fork_args: None,
                 resume_wait_timeout_ms: None,
                 oneshot_args: vec![
                     "-p".to_string(),
@@ -1744,6 +1775,11 @@ fn stock_opencode() -> ProviderCommandConfig {
         resume_args: Some(vec![
             "--session".to_string(),
             "{provider_session_id}".to_string(),
+        ]),
+        fork_args: Some(vec![
+            "--session".to_string(),
+            "{provider_session_id}".to_string(),
+            "--fork".to_string(),
         ]),
         resume_wait_timeout_ms: None,
         oneshot_args: vec!["run".to_string(), "{prompt}".to_string()],
@@ -1900,6 +1936,15 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     out.push_str(&format!(
         "resume_args = {}\n",
         render_string_list(config.resume_args.as_deref().unwrap_or(&[]))
+    ));
+    out.push_str(
+        "# Optional args dux should use to fork a source agent's provider context into a new worktree.\n\
+         # Use {provider_session_id} for CLIs that need the source provider session id.\n\
+         # Leave this empty to copy only the worktree when an agent is forked.\n",
+    );
+    out.push_str(&format!(
+        "fork_args = {}\n",
+        render_string_list(config.fork_args.as_deref().unwrap_or(&[]))
     ));
     out.push_str(
         "# Optional timeout for resumed sessions that produce no visible output.\n\
@@ -2646,6 +2691,10 @@ oneshot_output = "stdout"
         let mut rendered = String::new();
         render_provider_config(&mut rendered, "opencode", &unsafe_stock_opencode_resume());
         let mut doc: DocumentMut = rendered.parse().expect("parse opencode provider");
+        doc["providers"]["opencode"]
+            .as_table_mut()
+            .expect("opencode table")
+            .remove("fork_args");
 
         let changed = disable_unsafe_stock_opencode_resume(&mut doc);
 
@@ -2674,6 +2723,7 @@ oneshot_output = "stdout"
 command = "opencode-wrapper"
 args = []
 resume_args = ["--continue"]
+fork_args = ["--custom-fork"]
 resume_wait_timeout_ms = 3000
 oneshot_args = ["run", "{prompt}"]
 oneshot_output = "stdout"
@@ -2693,7 +2743,36 @@ forward_scroll = true
         )
         .expect("parse preserved opencode provider");
         assert_eq!(provider.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(provider.fork_args, Some(vec!["--custom-fork".to_string()]));
         assert_eq!(provider.resume_wait_timeout_ms, Some(3_000));
+    }
+
+    #[test]
+    fn disable_unsafe_stock_opencode_resume_preserves_explicit_fork_disable() {
+        let mut doc: DocumentMut = r#"
+[providers.opencode]
+command = "opencode"
+args = []
+resume_args = ["--continue"]
+fork_args = []
+resume_wait_timeout_ms = 3000
+oneshot_args = ["run", "{prompt}"]
+oneshot_output = "stdout"
+install_hint = "curl -fsSL https://opencode.ai/install | bash"
+forward_scroll = true
+"#
+        .parse()
+        .expect("parse explicit fork disable");
+
+        assert!(!disable_unsafe_stock_opencode_resume(&mut doc));
+        let provider = provider_table_config(
+            doc["providers"]["opencode"]
+                .as_table()
+                .expect("opencode table"),
+        )
+        .expect("parse preserved opencode provider");
+        assert_eq!(provider.resume_args, Some(vec!["--continue".to_string()]));
+        assert_eq!(provider.fork_args, Some(Vec::new()));
     }
 
     #[test]
@@ -2899,6 +2978,7 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: Some(vec!["--resume".to_string(), "--last".to_string()]),
+            fork_args: None,
             resume_wait_timeout_ms: Some(2_000),
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -2918,6 +2998,7 @@ dangerous = true
             command: "example".to_string(),
             args: vec!["--interactive".to_string()],
             resume_args: None,
+            fork_args: None,
             resume_wait_timeout_ms: None,
             oneshot_args: Vec::new(),
             oneshot_output: OneshotOutput::Stdout,
@@ -2951,6 +3032,29 @@ dangerous = true
         assert_eq!(
             cfg.interactive_args_with_provider_session_id(true, Some("ses_123")),
             vec!["--session".to_string(), "ses_123".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_command_config_expands_provider_session_id_fork_args() {
+        let cfg = ProviderCommandConfig {
+            command: "example".to_string(),
+            fork_args: Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string(),
+                "--fork".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(cfg.fork_args_for(None), None);
+        assert_eq!(
+            cfg.fork_args_for(Some("ses_123")),
+            Some(vec![
+                "--session".to_string(),
+                "ses_123".to_string(),
+                "--fork".to_string(),
+            ])
         );
     }
 
@@ -3018,6 +3122,7 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: None,
+                    fork_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
@@ -3047,6 +3152,7 @@ dangerous = true
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(Vec::new()),
+                    fork_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: Vec::new(),
                     oneshot_output: OneshotOutput::Stdout,
@@ -3081,6 +3187,14 @@ dangerous = true
         );
         assert_eq!(opencode.resume_wait_timeout_ms, None);
         assert!(opencode.supports_session_resume());
+        assert_eq!(
+            opencode.fork_args,
+            Some(vec![
+                "--session".to_string(),
+                "{provider_session_id}".to_string(),
+                "--fork".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -3346,6 +3460,7 @@ oneshot_output = "stdout"
                     command: "claude".to_string(),
                     args: Vec::new(),
                     resume_args: Some(vec!["--continue".to_string()]),
+                    fork_args: None,
                     resume_wait_timeout_ms: None,
                     oneshot_args: vec!["-p".to_string(), "{prompt}".to_string()],
                     oneshot_output: OneshotOutput::Stdout,

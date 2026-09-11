@@ -692,12 +692,12 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Left],
         help: Some(HelpEntry {
             section: "Projects pane",
-            description: "Fork selected agent into a fresh worktree",
+            description: "Fork selected agent into a new worktree and session",
         }),
         hint_contexts: &[(HintContext::LeftSession, "Fork")],
         palette: Some(PaletteEntry {
             name: "fork-agent",
-            description: "Fork the selected agent into a fresh worktree and session",
+            description: "Fork the selected agent into a new worktree and session",
         }),
     },
     BindingDef {
