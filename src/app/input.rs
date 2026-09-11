@@ -7523,6 +7523,8 @@ mod tests {
             worker_tx,
             worker_rx,
             providers: std::collections::HashMap::new(),
+            provider_session_discovery_cancellations: std::collections::HashMap::new(),
+            provider_session_discovery_lifetime: Arc::new(()),
             running_provider_pins: std::collections::HashMap::new(),
             companion_terminals: std::collections::HashMap::new(),
             active_terminal_id: None,
