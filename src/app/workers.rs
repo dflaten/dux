@@ -2873,9 +2873,9 @@ pub(crate) fn run_create_agent_job(
                 branch_name,
                 worktree_path,
                 true,
-                fork_provider_session_id,
-                false,
                 None,
+                false,
+                fork_provider_session_id,
             )
         }
         CreateAgentRequest::ExistingManagedWorktree {
@@ -3252,10 +3252,14 @@ pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sende
 
 fn launch_args_for_request(request: &AgentLaunchRequest) -> Vec<String> {
     if request.fork_provider_session {
-        return request
-            .provider_config
-            .fork_args_for(request.provider_session_id.as_deref())
-            .expect("fork launch requires configured fork arguments and a provider session ID");
+        let mut args = request.provider_config.args.clone();
+        args.extend(
+            request
+                .provider_config
+                .fork_args_for(request.provider_session_id.as_deref())
+                .expect("fork launch requires configured fork arguments and a provider session ID"),
+        );
+        return args;
     }
     request
         .provider_config
@@ -3815,6 +3819,7 @@ mod tests {
             session: test_session(tmp.path()),
             provider_config: ProviderCommandConfig {
                 command: "opencode".to_string(),
+                args: vec!["--model".to_string(), "provider/model".to_string()],
                 fork_args: Some(vec![
                     "--session".to_string(),
                     "{provider_session_id}".to_string(),
@@ -3835,8 +3840,73 @@ mod tests {
 
         assert_eq!(
             launch_args_for_request(&request),
-            ["--session", "ses_source", "--fork"]
+            [
+                "--model",
+                "provider/model",
+                "--session",
+                "ses_source",
+                "--fork"
+            ]
         );
+    }
+
+    #[test]
+    fn fork_worker_launches_with_source_provider_context() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "source-agent");
+        let paths = test_paths(tmp.path());
+        let project = test_project(&repo);
+        let mut source_session = test_session(&repo);
+        source_session.provider = ProviderKind::from_str("opencode");
+        source_session.branch_name = "source-agent".to_string();
+        source_session.title = Some("Source agent".to_string());
+        source_session
+            .provider_session_ids
+            .insert("opencode".to_string(), "ses_source".to_string());
+        let mut config = Config::default();
+        config
+            .providers
+            .commands
+            .get_mut("opencode")
+            .expect("opencode provider")
+            .command = "true".to_string();
+        let (worker_tx, worker_rx) = mpsc::channel();
+
+        run_create_agent_job(
+            CreateAgentRequest::ForkSession {
+                project,
+                source_session: Box::new(source_session.clone()),
+                source_label: "Source agent".to_string(),
+                custom_name: Some("forked-agent".to_string()),
+            },
+            paths,
+            config,
+            vec![source_session],
+            worker_tx,
+            (80, 24),
+        );
+
+        loop {
+            match worker_rx.recv().expect("worker event") {
+                WorkerEvent::AgentLaunchReady(data) => {
+                    assert!(data.request.fork_provider_session);
+                    assert_eq!(
+                        data.request.provider_session_id.as_deref(),
+                        Some("ses_source")
+                    );
+                    assert_eq!(data.request.session.title, None);
+                    assert_eq!(
+                        launch_args_for_request(&data.request),
+                        ["--session", "ses_source", "--fork"]
+                    );
+                    break;
+                }
+                WorkerEvent::CreateAgentProgress(_) => {}
+                _ => panic!("expected agent launch ready event"),
+            }
+        }
     }
 
     #[test]
