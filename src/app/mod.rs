@@ -113,6 +113,8 @@ pub struct App {
     pub(crate) worker_tx: Sender<WorkerEvent>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
     pub(crate) providers: HashMap<String, PtyClient>,
+    pub(crate) provider_session_discovery_cancellations: HashMap<String, Arc<AtomicBool>>,
+    pub(crate) provider_session_discovery_lifetime: Arc<()>,
     /// When a provider swap happens while the agent's PTY is still running,
     /// the currently-spawned provider is pinned here so UI labels keep
     /// showing what's actually running until the user exits and relaunches
@@ -1665,6 +1667,7 @@ pub(crate) enum WorkerEvent {
         session_id: String,
         provider: ProviderKind,
         provider_session_id: String,
+        cancellation: Arc<AtomicBool>,
     },
     ChangedFilesReady {
         watched: WatchedWorktree,
@@ -1938,6 +1941,8 @@ impl App {
             worker_tx,
             worker_rx,
             providers: HashMap::new(),
+            provider_session_discovery_cancellations: HashMap::new(),
+            provider_session_discovery_lifetime: Arc::new(()),
             running_provider_pins: HashMap::new(),
             companion_terminals: HashMap::new(),
             active_terminal_id: None,

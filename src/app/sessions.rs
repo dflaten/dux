@@ -992,6 +992,7 @@ impl App {
                     session_id.clone(),
                 );
             }
+            self.cancel_provider_session_id_discovery(session_id);
             self.providers.remove(session_id);
             self.running_provider_pins.remove(session_id);
             self.last_pty_activity.remove(session_id);
@@ -1250,6 +1251,7 @@ impl App {
             self.session_store.archive_and_delete_session(&session)?;
         }
 
+        self.cancel_provider_session_id_discovery(&session.id);
         self.providers.remove(&session.id);
         self.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
@@ -2298,6 +2300,7 @@ impl App {
             return Ok(());
         }
         // Kill existing PTY if the agent is still active.
+        self.cancel_provider_session_id_discovery(&session.id);
         self.providers.remove(&session.id);
         self.running_provider_pins.remove(&session.id);
         self.last_pty_activity.remove(&session.id);
@@ -2841,6 +2844,7 @@ impl App {
             match target_id {
                 RuntimeTargetId::Agent(session_id) => {
                     if self.providers.remove(session_id).is_some() {
+                        self.cancel_provider_session_id_discovery(session_id);
                         self.running_provider_pins.remove(session_id);
                         self.last_pty_activity.remove(session_id);
                         self.mark_session_status(session_id, SessionStatus::Detached);
@@ -2910,6 +2914,7 @@ impl App {
 
         let label = self.session_label(&conflicting);
         let provider = conflicting.provider.as_str().to_string();
+        self.cancel_provider_session_id_discovery(&conflicting.id);
         self.providers.remove(&conflicting.id);
         self.running_provider_pins.remove(&conflicting.id);
         self.last_pty_activity.remove(&conflicting.id);
@@ -3181,6 +3186,8 @@ mod tests {
             worker_tx,
             worker_rx,
             providers: std::collections::HashMap::new(),
+            provider_session_discovery_cancellations: std::collections::HashMap::new(),
+            provider_session_discovery_lifetime: Arc::new(()),
             running_provider_pins: std::collections::HashMap::new(),
             companion_terminals: std::collections::HashMap::new(),
             active_terminal_id: None,
@@ -3279,6 +3286,54 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn provider_session_discovery_persists_only_current_launch() {
+        let session = make_session("session-1", "opencode", "/tmp/worktree");
+        let mut app = test_app_with_sessions(vec![session.clone()], Vec::new());
+        app.session_store
+            .upsert_session(&session)
+            .expect("persist session");
+        let current = Arc::new(AtomicBool::new(false));
+        app.provider_session_discovery_cancellations
+            .insert(session.id.clone(), Arc::clone(&current));
+        app.worker_tx
+            .send(WorkerEvent::ProviderSessionIdDiscovered {
+                session_id: session.id.clone(),
+                provider: ProviderKind::from_str("opencode"),
+                provider_session_id: "ses_current".to_string(),
+                cancellation: current,
+            })
+            .expect("send discovery event");
+
+        app.drain_events();
+
+        let persisted = app.session_store.load_sessions().expect("load sessions");
+        assert_eq!(
+            persisted[0].provider_session_id(&ProviderKind::from_str("opencode")),
+            Some("ses_current")
+        );
+
+        let current = Arc::new(AtomicBool::new(false));
+        app.provider_session_discovery_cancellations
+            .insert(session.id.clone(), current);
+        app.worker_tx
+            .send(WorkerEvent::ProviderSessionIdDiscovered {
+                session_id: session.id,
+                provider: ProviderKind::from_str("opencode"),
+                provider_session_id: "ses_stale".to_string(),
+                cancellation: Arc::new(AtomicBool::new(false)),
+            })
+            .expect("send stale discovery event");
+
+        app.drain_events();
+
+        let persisted = app.session_store.load_sessions().expect("load sessions");
+        assert_eq!(
+            persisted[0].provider_session_id(&ProviderKind::from_str("opencode")),
+            Some("ses_current")
+        );
     }
 
     fn make_project(id: &str, provider: &str) -> Project {

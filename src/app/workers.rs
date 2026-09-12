@@ -32,8 +32,14 @@ impl App {
                     session_id,
                     provider,
                     provider_session_id,
+                    cancellation,
                 } => {
-                    self.record_provider_session_id(&session_id, &provider, provider_session_id);
+                    self.record_provider_session_id(
+                        &session_id,
+                        &provider,
+                        provider_session_id,
+                        cancellation,
+                    );
                 }
                 WorkerEvent::ChangedFilesReady {
                     watched,
@@ -884,6 +890,7 @@ impl App {
             let Some(session) = self.sessions.iter().find(|s| s.id == *session_id).cloned() else {
                 continue;
             };
+            self.cancel_provider_session_id_discovery(session_id);
             self.providers.remove(session_id);
             self.running_provider_pins.remove(session_id);
             self.last_pty_activity.remove(session_id);
@@ -914,6 +921,7 @@ impl App {
             if retried.contains(session_id) {
                 continue;
             }
+            self.cancel_provider_session_id_discovery(session_id);
             self.providers.remove(session_id);
             self.running_provider_pins.remove(session_id);
             self.last_pty_activity.remove(session_id);
@@ -1431,7 +1439,7 @@ impl App {
     }
 
     fn spawn_provider_session_id_discovery(
-        &self,
+        &mut self,
         session: &AgentSession,
         previous_provider_session_ids: HashSet<String>,
     ) {
@@ -1442,22 +1450,41 @@ impl App {
         let provider = session.provider.clone();
         let worktree_path = session.worktree_path.clone();
         let tx = self.worker_tx.clone();
+        let app_lifetime = Arc::downgrade(&self.provider_session_discovery_lifetime);
+        self.cancel_provider_session_id_discovery(&session_id);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.provider_session_discovery_cancellations
+            .insert(session_id.clone(), Arc::clone(&cancellation));
         thread::spawn(move || {
-            for _ in 0..60 {
-                if let Some(provider_session_id) = crate::opencode::latest_session_id_for_worktree(
-                    Path::new(&worktree_path),
-                    &previous_provider_session_ids,
-                ) {
-                    let _ = tx.send(WorkerEvent::ProviderSessionIdDiscovered {
-                        session_id,
-                        provider,
-                        provider_session_id,
-                    });
-                    return;
-                }
-                thread::sleep(Duration::from_millis(500));
+            let provider_session_id = wait_for_provider_session_id(
+                || {
+                    crate::opencode::latest_session_id_for_worktree(
+                        Path::new(&worktree_path),
+                        &previous_provider_session_ids,
+                    )
+                },
+                &cancellation,
+                &app_lifetime,
+                Duration::from_millis(500),
+            );
+            if let Some(provider_session_id) = provider_session_id {
+                let _ = tx.send(WorkerEvent::ProviderSessionIdDiscovered {
+                    session_id,
+                    provider,
+                    provider_session_id,
+                    cancellation,
+                });
             }
         });
+    }
+
+    pub(crate) fn cancel_provider_session_id_discovery(&mut self, session_id: &str) {
+        if let Some(cancellation) = self
+            .provider_session_discovery_cancellations
+            .remove(session_id)
+        {
+            cancellation.store(true, Ordering::Relaxed);
+        }
     }
 
     fn record_provider_session_id(
@@ -1465,7 +1492,19 @@ impl App {
         session_id: &str,
         provider: &ProviderKind,
         provider_session_id: String,
+        cancellation: Arc<AtomicBool>,
     ) {
+        let is_current_discovery = self
+            .provider_session_discovery_cancellations
+            .get(session_id)
+            .is_some_and(|current| {
+                Arc::ptr_eq(current, &cancellation) && !cancellation.load(Ordering::Relaxed)
+            });
+        if !is_current_discovery {
+            return;
+        }
+        self.provider_session_discovery_cancellations
+            .remove(session_id);
         let Some(session) = self
             .sessions
             .iter_mut()
@@ -2111,6 +2150,7 @@ impl App {
             let Some(session) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
                 continue;
             };
+            self.cancel_provider_session_id_discovery(&session_id);
             self.providers.remove(&session_id);
             self.running_provider_pins.remove(&session_id);
             self.last_pty_activity.remove(&session_id);
@@ -3536,6 +3576,21 @@ fn parse_pr_json_value(
         url,
     })
 }
+fn wait_for_provider_session_id(
+    mut discover: impl FnMut() -> Option<String>,
+    cancellation: &AtomicBool,
+    app_lifetime: &std::sync::Weak<()>,
+    retry_interval: Duration,
+) -> Option<String> {
+    while app_lifetime.upgrade().is_some() && !cancellation.load(Ordering::Relaxed) {
+        if let Some(session_id) = discover() {
+            return Some(session_id);
+        }
+        thread::sleep(retry_interval);
+    }
+    None
+}
+
 fn parse_resolved_pull_request_json(
     json: &str,
     project: Project,
@@ -3606,6 +3661,68 @@ mod tests {
 
     use super::*;
     use crate::model::PrState;
+
+    #[test]
+    fn provider_session_discovery_waits_past_previous_timeout() {
+        let mut attempts = 0;
+        let cancellation = AtomicBool::new(false);
+        let app_lifetime = Arc::new(());
+
+        let session_id = wait_for_provider_session_id(
+            || {
+                attempts += 1;
+                (attempts > 60).then(|| "ses_lazily_created".to_string())
+            },
+            &cancellation,
+            &Arc::downgrade(&app_lifetime),
+            Duration::ZERO,
+        );
+
+        assert_eq!(attempts, 61);
+        assert_eq!(session_id.as_deref(), Some("ses_lazily_created"));
+    }
+
+    #[test]
+    fn provider_session_discovery_stops_when_cancelled() {
+        let cancellation = AtomicBool::new(true);
+        let mut attempts = 0;
+        let app_lifetime = Arc::new(());
+
+        let session_id = wait_for_provider_session_id(
+            || {
+                attempts += 1;
+                Some("ses_lazily_created".to_string())
+            },
+            &cancellation,
+            &Arc::downgrade(&app_lifetime),
+            Duration::ZERO,
+        );
+
+        assert_eq!(attempts, 0);
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn provider_session_discovery_stops_when_app_is_dropped() {
+        let cancellation = AtomicBool::new(false);
+        let app_lifetime = Arc::new(());
+        let weak_lifetime = Arc::downgrade(&app_lifetime);
+        drop(app_lifetime);
+        let mut attempts = 0;
+
+        let session_id = wait_for_provider_session_id(
+            || {
+                attempts += 1;
+                Some("ses_lazily_created".to_string())
+            },
+            &cancellation,
+            &weak_lifetime,
+            Duration::ZERO,
+        );
+
+        assert_eq!(attempts, 0);
+        assert_eq!(session_id, None);
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
