@@ -4,13 +4,20 @@
 
 <img src="assets/dux-logo.png" width="200" align="right" />
 
-This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). It may differ from upstream and is intended to be installed from source rather than through upstream release channels.
+This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). 
 
-Your AI agents deserve a proper office. **dux** (pronounced "dooks") is a terminal UI that lets you run multiple AI coding agents side by side, each in its own git worktree, with full companion terminals, macros, commit generation, and a command palette that knows more tricks than you do.
+**dux** is a terminal UI that lets you run multiple AI coding agents side by side, each in its own git worktree, with full companion terminals, macros, commit generation, and a command palette. The original package was great but I found myself needing additional functionality in order to use this as my day to day Agent management system.
 
-No protocol layers. No adapters. No JSON-RPC. Just real CLIs running in real terminals.
+Changes from the original package include: 
 
-Oh, and it's fast and consumes low resources: more RAM is left for Claude, Codex or any of the other agents 👍
+* The ability to copy/paste from the Agent to the terminal pane with `ctrl-e`.
+* Searchable existing worktree picker for creating/reconnecting agents. 
+* Cleanup command for inactivte managed worktrees.
+* Always shows the worktree diffs against base branch with easy option for rebaseing.
+* Ability to queue comments on selected diff lines and send back to the Agent for reworking.
+* Resume/recover opencode sessions
+  
+This fork is intended to be installed from source rather than through upstream release channels.
 
 [![asciicast](assets/dux-screenshot.svg)](https://asciinema.org/a/IvqL89rXvwCzvSxQ)
 
@@ -18,7 +25,7 @@ Oh, and it's fast and consumes low resources: more RAM is left for Claude, Codex
 
 Most AI coding tools give you one agent in one directory. dux gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Open companion terminals next to your agents for builds, tests, or just poking around.
 
-Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, OpenCode, or literally anything else) runs exactly like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work. We don't mess with your setup.
+Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, OpenCode, or others) runs like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work.
 
 ## Install
 
@@ -38,13 +45,13 @@ Make sure `~/.local/bin` is on your `PATH`, then run:
 dux
 ```
 
-On first launch, dux creates a fully commented config file. That file *is* the documentation.
+On first launch, dux creates a fully commented config file. That file is the documentation for **dux**.
 
 ## Prerequisites
 
-- **`git`** — dux is built around git worktrees, so git is non-negotiable. If it's not on your PATH, dux won't get very far.
+- **`git`** — dux is built around git worktrees, so git is non-negotiable.
 - **Rust and Cargo** — required to build this fork from source.
-- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them right in the interface. Not required, but you'll miss it once you've tried it.
+- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them right in the interface.
 
 ## How It Works
 
@@ -58,7 +65,7 @@ The interface has three panes:
 - **Center:** the agent's live terminal output (or a file diff)
 - **Right:** changed files, staging, and diffs
 
-Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or git pane when you want more room. Go fullscreen with interactive mode. It's your layout.
+Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or git pane when you want more room. Go fullscreen with interactive mode.
 
 ### Bring Any CLI
 
