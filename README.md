@@ -12,8 +12,8 @@ Changes from the original package include:
 
 * The ability to copy/paste from the Agent to the terminal pane with `ctrl-e`.
 * Searchable existing worktree picker for creating/reconnecting agents. 
-* Cleanup command for inactivte managed worktrees.
-* Always shows the worktree diffs against base branch with easy option for rebaseing.
+* Cleanup command for inactive managed worktrees.
+* Always shows the worktree diffs against base branch with easy option for rebasing.
 * Ability to queue comments on selected diff lines and send back to the Agent for reworking.
 * Resume/recover opencode sessions
   
