@@ -6858,11 +6858,11 @@ impl App {
     }
 
     /// Keep a drag that starts in OpenCode's output pane out of its sidebar.
-    /// The divider is read from the current terminal contents because its
+    /// The boundary is read from the current terminal contents because its
     /// position changes when the terminal is resized or the sidebar closes.
     pub(crate) fn terminal_selection_right_boundary(&self, sel: &TerminalSelection) -> Option<u16> {
         if !matches!(self.session_surface, SessionSurface::Agent)
-            || self.selected_session()?.provider.as_str() != "opencode"
+            || self.running_provider_for(self.selected_session()?).as_str() != "opencode"
         {
             return None;
         }
@@ -6871,11 +6871,36 @@ impl App {
     }
 }
 
-/// OpenCode's sidebar paints a persistent background across the right edge.
-/// Older themes may draw a vertical rule instead.
+/// OpenCode's sidebar paints a persistent background across the right edge
+/// and shows a footer that also works with transparent themes.
 fn opencode_sidebar_boundary(snapshot: &crate::pty::TerminalSnapshot) -> Option<u16> {
     let rows = usize::from(snapshot.rows);
     let cols = usize::from(snapshot.cols);
+    // The stock sidebar is 42 columns wide and ends at the terminal's right
+    // edge. Its footer remains visible when a transparent theme makes both
+    // pane backgrounds identical.
+    if cols > 42 {
+        let boundary = cols - 42;
+        for row in rows.saturating_sub(5)..rows {
+            let mut footer = [' '; 42];
+            for cell in snapshot
+                .cells
+                .iter()
+                .filter(|cell| usize::from(cell.row) == row)
+            {
+                let col = usize::from(cell.col);
+                if (boundary..cols).contains(&col)
+                    && let Some(ch) = cell.symbol.chars().next()
+                {
+                    footer[col - boundary] = ch;
+                }
+            }
+            if footer.iter().collect::<String>().contains("• OpenCode") {
+                return u16::try_from(boundary).ok();
+            }
+        }
+    }
+
     let minimum = rows.div_ceil(3).max(2);
     let mut backgrounds = vec![vec![None; cols]; rows];
     for cell in &snapshot.cells {
@@ -6894,7 +6919,7 @@ fn opencode_sidebar_boundary(snapshot: &crate::pty::TerminalSnapshot) -> Option<
             .iter()
             .rposition(|background| *background != Some(*sidebar_bg))
             .map_or(0, |col| col + 1);
-        if start >= 8 && cols.saturating_sub(start) >= 16 {
+        if start >= 8 && (38..=46).contains(&cols.saturating_sub(start)) {
             *panel_counts.entry(start).or_default() += 1;
         }
     }
@@ -6905,15 +6930,7 @@ fn opencode_sidebar_boundary(snapshot: &crate::pty::TerminalSnapshot) -> Option<
         return u16::try_from(col).ok();
     }
 
-    let mut counts = std::collections::BTreeMap::<u16, usize>::new();
-    for cell in &snapshot.cells {
-        if cell.col >= snapshot.cols / 3 && matches!(cell.symbol.as_str(), "│" | "┃" | "▕") {
-            *counts.entry(cell.col).or_default() += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .find_map(|(col, count)| (count >= minimum).then_some(col))
+    None
 }
 
 fn selected_terminal_text_from_snapshot(
@@ -16201,6 +16218,47 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn opencode_footer_detects_sidebar_with_matching_backgrounds() {
+        let mut snapshot = crate::pty::TerminalSnapshot::empty();
+        snapshot.rows = 6;
+        snapshot.cols = 80;
+        let footer = "• OpenCode 1.18.31";
+        for (offset, ch) in footer.chars().enumerate() {
+            snapshot.cells.push(crate::pty::SnapshotCell {
+                row: 4,
+                col: 40 + offset as u16,
+                symbol: ch.to_string().into(),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                modifier: Modifier::empty(),
+            });
+        }
+
+        assert_eq!(opencode_sidebar_boundary(&snapshot), Some(38));
+    }
+
+    #[test]
+    fn colored_output_block_is_not_mistaken_for_sidebar() {
+        let mut snapshot = crate::pty::TerminalSnapshot::empty();
+        snapshot.rows = 6;
+        snapshot.cols = 80;
+        for row in 0..6 {
+            for col in 0..80 {
+                snapshot.cells.push(crate::pty::SnapshotCell {
+                    row,
+                    col,
+                    symbol: " ".into(),
+                    fg: Color::Reset,
+                    bg: if col < 60 { Color::Black } else { Color::Blue },
+                    modifier: Modifier::empty(),
+                });
+            }
+        }
+
+        assert_eq!(opencode_sidebar_boundary(&snapshot), None);
+    }
+
+    #[test]
     fn opencode_colored_sidebar_is_excluded_without_divider_glyph() {
         let mut snapshot = crate::pty::TerminalSnapshot::empty();
         snapshot.rows = 6;
@@ -16235,10 +16293,35 @@ cyan = "#00ffff"
             selected_terminal_text_from_snapshot(&snapshot, &sel, boundary),
             "AB\n  AB\n  AB"
         );
+
+        let mut app = test_app(default_bindings());
+        app.sessions[0].provider = ProviderKind::from_str("opencode");
+        app.session_surface = SessionSurface::Agent;
+        app.snapshot_buf = snapshot;
+        assert_eq!(app.terminal_selection_right_boundary(&sel), Some(38));
+        let sidebar_selection = TerminalSelection {
+            anchor: TermGridPos { row: 1, col: 42 },
+            ..sel.clone()
+        };
+        assert_eq!(
+            app.terminal_selection_right_boundary(&sidebar_selection),
+            None
+        );
+        app.sessions[0].provider = ProviderKind::from_str("claude");
+        assert_eq!(app.terminal_selection_right_boundary(&sel), None);
+        app.running_provider_pins.insert(
+            app.sessions[0].id.clone(),
+            ProviderKind::from_str("opencode"),
+        );
+        assert_eq!(app.terminal_selection_right_boundary(&sel), Some(38));
+        app.sessions[0].provider = ProviderKind::from_str("opencode");
+        app.running_provider_pins
+            .insert(app.sessions[0].id.clone(), ProviderKind::from_str("claude"));
+        assert_eq!(app.terminal_selection_right_boundary(&sel), None);
     }
 
     #[test]
-    fn opencode_selection_excludes_sidebar_from_multiline_copy() {
+    fn repeated_output_rule_is_not_treated_as_sidebar() {
         let mut snapshot = crate::pty::TerminalSnapshot::empty();
         snapshot.rows = 6;
         snapshot.cols = 80;
@@ -16254,20 +16337,7 @@ cyan = "#00ffff"
                 });
             }
         }
-        let sel = TerminalSelection {
-            anchor: TermGridPos { row: 1, col: 2 },
-            end: TermGridPos { row: 3, col: 3 },
-            dragging: false,
-        };
-
-        let divider = opencode_sidebar_boundary(&snapshot);
-        assert_eq!(divider, Some(50));
-        assert_eq!(
-            selected_terminal_text_from_snapshot(&snapshot, &sel, divider),
-            "AB\nAB\nAB"
-        );
-        assert!(sel.contains(2, 53));
-        assert!(!divider.is_none_or(|col| 53 < col));
+        assert_eq!(opencode_sidebar_boundary(&snapshot), None);
     }
 
     #[test]
