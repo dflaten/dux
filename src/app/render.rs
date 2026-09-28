@@ -1432,6 +1432,10 @@ impl App {
                 self.prev_scrollback_offset = scrollback_offset;
 
                 let hyperlink_ranges = terminal_links::ranges(&self.snapshot_buf);
+                let selection_right_boundary = self
+                    .terminal_selection
+                    .as_ref()
+                    .and_then(|sel| self.terminal_selection_right_boundary(sel));
                 let buf = frame.buffer_mut();
                 for cell in &self.snapshot_buf.cells {
                     if cell.row >= self.snapshot_buf.rows
@@ -1451,6 +1455,7 @@ impl App {
                     if let Some(sel) = &self.terminal_selection
                         && sel.anchor != sel.end
                         && sel.contains(cell.row, cell.col)
+                        && selection_right_boundary.is_none_or(|divider| cell.col < divider)
                     {
                         style = self.theme.selection_style();
                     }
