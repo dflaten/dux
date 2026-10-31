@@ -1443,9 +1443,14 @@ impl App {
         session: &AgentSession,
         previous_provider_session_ids: HashSet<String>,
     ) {
-        if session.provider.as_str() != "opencode" {
+        let Some(discovery) = self
+            .config
+            .providers
+            .get(session.provider.as_str())
+            .and_then(|provider| provider.session_discovery.clone())
+        else {
             return;
-        }
+        };
         let session_id = session.id.clone();
         let provider = session.provider.clone();
         let worktree_path = session.worktree_path.clone();
@@ -1458,7 +1463,8 @@ impl App {
         thread::spawn(move || {
             let provider_session_id = wait_for_provider_session_id(
                 || {
-                    crate::opencode::latest_session_id_for_worktree(
+                    crate::session_discovery::latest_session_id_for_worktree(
+                        &discovery,
                         Path::new(&worktree_path),
                         &previous_provider_session_ids,
                     )
@@ -3199,12 +3205,21 @@ pub(crate) fn run_create_agent_job(
 }
 
 pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<WorkerEvent>) {
-    let previous_provider_session_ids =
-        if !request.resume && request.session.provider.as_str() == "opencode" {
-            crate::opencode::session_ids_for_worktree(Path::new(&request.session.worktree_path))
-        } else {
-            HashSet::new()
-        };
+    let previous_provider_session_ids = if !request.resume {
+        request
+            .provider_config
+            .session_discovery
+            .as_ref()
+            .map(|discovery| {
+                crate::session_discovery::session_ids_for_worktree(
+                    discovery,
+                    Path::new(&request.session.worktree_path),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
     let launch_args = launch_args_for_request(&request);
     let (rows, cols) = request.pty_size;
     logger::debug(&format!(

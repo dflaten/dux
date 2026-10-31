@@ -179,6 +179,65 @@ pub struct ProviderCommandConfig {
     pub oneshot_output: OneshotOutput,
     pub install_hint: Option<String>,
     pub forward_scroll: bool,
+    pub session_discovery: Option<SessionDiscoveryConfig>,
+}
+
+/// How dux finds a provider's own conversation session IDs.
+///
+/// Providers that expose session IDs in a local store can opt in here. Dux
+/// uses the discovered ID for `{provider_session_id}` placeholders in
+/// `resume_args` and `fork_args`, and for auto-reopening agents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum SessionDiscoveryConfig {
+    Sqlite(SqliteSessionDiscoveryConfig),
+    Json(JsonSessionDiscoveryConfig),
+    #[serde(rename = "none")]
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqliteSessionDiscoveryConfig {
+    /// SQLite database files to inspect. Paths support `$VAR` and `~`.
+    pub databases: Vec<String>,
+    /// Tables to inspect. If several contain a match, the newest row wins.
+    pub tables: Vec<String>,
+    pub id_column: String,
+    pub directory_column: String,
+    pub updated_column: String,
+}
+
+impl Default for SqliteSessionDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            databases: Vec::new(),
+            tables: vec!["session".to_string()],
+            id_column: "id".to_string(),
+            directory_column: "directory".to_string(),
+            updated_column: "time_updated".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JsonSessionDiscoveryConfig {
+    /// Directories to search recursively for JSON session files.
+    pub roots: Vec<String>,
+    pub id_field: String,
+    /// Fields to try, in order, when reading the session's working directory.
+    pub directory_fields: Vec<String>,
+}
+
+impl Default for JsonSessionDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            id_field: "id".to_string(),
+            directory_fields: vec!["directory".to_string(), "path".to_string()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +377,7 @@ impl Default for ProviderCommandConfig {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         }
     }
 }
@@ -469,6 +529,9 @@ impl ProvidersConfig {
                     }
                     if entry.get().resume_wait_timeout_ms.is_none() {
                         entry.get_mut().resume_wait_timeout_ms = config.resume_wait_timeout_ms;
+                    }
+                    if entry.get().session_discovery.is_none() {
+                        entry.get_mut().session_discovery = config.session_discovery.clone();
                     }
                 }
             }
@@ -665,6 +728,7 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
         oneshot_output: OneshotOutput::Stdout,
         install_hint: Some("brew install gemini-cli".to_string()),
         forward_scroll: false,
+        session_discovery: None,
     }
 }
 
@@ -682,6 +746,7 @@ fn unsafe_stock_opencode_resume() -> ProviderCommandConfig {
         oneshot_output: OneshotOutput::Stdout,
         install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
         forward_scroll: true,
+        session_discovery: None,
     }
 }
 
@@ -1458,7 +1523,87 @@ fn patch_providers(doc: &mut DocumentMut, providers: &ProvidersConfig) {
         }
 
         tbl["forward_scroll"] = toml_edit::value(config.forward_scroll);
+        patch_session_discovery(tbl, config.session_discovery.as_ref());
     }
+}
+
+fn patch_session_discovery(tbl: &mut Table, discovery: Option<&SessionDiscoveryConfig>) {
+    let Some(discovery) = discovery else {
+        tbl.remove("session_discovery");
+        return;
+    };
+
+    // Replacing an inline table with a standard table also needs a fresh key,
+    // otherwise toml_edit keeps the inline value's key decoration.
+    if !tbl
+        .get("session_discovery")
+        .is_some_and(|item| item.is_table())
+    {
+        tbl.remove("session_discovery");
+    }
+    let discovery_table = tbl
+        .entry("session_discovery")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .expect("session_discovery must be a table");
+
+    let keep: &[&str] = match discovery {
+        SessionDiscoveryConfig::Sqlite(_) => &[
+            "strategy",
+            "databases",
+            "tables",
+            "id_column",
+            "directory_column",
+            "updated_column",
+        ],
+        SessionDiscoveryConfig::Json(_) => &["strategy", "roots", "id_field", "directory_fields"],
+        SessionDiscoveryConfig::Disabled => &["strategy"],
+    };
+    for key in [
+        "strategy",
+        "databases",
+        "tables",
+        "id_column",
+        "directory_column",
+        "updated_column",
+        "roots",
+        "id_field",
+        "directory_fields",
+    ] {
+        if !keep.contains(&key) {
+            discovery_table.remove(key);
+        }
+    }
+
+    match discovery {
+        SessionDiscoveryConfig::Sqlite(config) => {
+            discovery_table["strategy"] = toml_edit::value("sqlite");
+            discovery_table["databases"] = toml_edit::value(array_of(&config.databases));
+            discovery_table["tables"] = toml_edit::value(array_of(&config.tables));
+            discovery_table["id_column"] = toml_edit::value(config.id_column.as_str());
+            discovery_table["directory_column"] =
+                toml_edit::value(config.directory_column.as_str());
+            discovery_table["updated_column"] = toml_edit::value(config.updated_column.as_str());
+        }
+        SessionDiscoveryConfig::Json(config) => {
+            discovery_table["strategy"] = toml_edit::value("json");
+            discovery_table["roots"] = toml_edit::value(array_of(&config.roots));
+            discovery_table["id_field"] = toml_edit::value(config.id_field.as_str());
+            discovery_table["directory_fields"] =
+                toml_edit::value(array_of(&config.directory_fields));
+        }
+        SessionDiscoveryConfig::Disabled => {
+            discovery_table["strategy"] = toml_edit::value("none");
+        }
+    }
+}
+
+fn array_of(values: &[String]) -> Array {
+    let mut array = Array::new();
+    for value in values {
+        array.push(value.as_str());
+    }
+    array
 }
 
 fn patch_macros(doc: &mut DocumentMut, macros: &MacrosConfig) {
@@ -1717,6 +1862,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://claude.ai/install.sh | bash".to_string()),
                 forward_scroll: false,
+                session_discovery: None,
             },
         ),
         (
@@ -1740,6 +1886,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 oneshot_output: OneshotOutput::Tempfile,
                 install_hint: Some("brew install --cask codex".to_string()),
                 forward_scroll: false,
+                session_discovery: None,
             },
         ),
         ("opencode", stock_opencode()),
@@ -1763,6 +1910,7 @@ fn default_provider_commands() -> [(&'static str, ProviderCommandConfig); 4] {
                 oneshot_output: OneshotOutput::Stdout,
                 install_hint: Some("curl -fsSL https://gh.io/copilot-install | bash".to_string()),
                 forward_scroll: false,
+                session_discovery: None,
             },
         ),
     ]
@@ -1786,7 +1934,23 @@ fn stock_opencode() -> ProviderCommandConfig {
         oneshot_output: OneshotOutput::Stdout,
         install_hint: Some("curl -fsSL https://opencode.ai/install | bash".to_string()),
         forward_scroll: true,
+        session_discovery: Some(opencode_session_discovery()),
     }
+}
+
+fn opencode_session_discovery() -> SessionDiscoveryConfig {
+    SessionDiscoveryConfig::Sqlite(SqliteSessionDiscoveryConfig {
+        databases: vec![
+            "$XDG_DATA_HOME/opencode/opencode.db".to_string(),
+            "~/.local/share/opencode/opencode.db".to_string(),
+            "~/.opencode/opencode.db".to_string(),
+        ],
+        // OpenCode v2 renamed the live table to session_v2. Older installs and
+        // migrated databases may still have a legacy session table, so inspect
+        // both and let the newest row win.
+        tables: vec!["session_v2".to_string(), "session".to_string()],
+        ..Default::default()
+    })
 }
 
 fn render_provider_configs(out: &mut String, providers: &ProvidersConfig) {
@@ -1980,7 +2144,72 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
          # own scrollback buffer (e.g. opencode).\n",
     );
     out.push_str(&format!("forward_scroll = {}\n", config.forward_scroll));
+    if let Some(discovery) = &config.session_discovery {
+        out.push('\n');
+        render_session_discovery_config(out, name, discovery);
+    }
     out.push('\n');
+}
+
+fn render_session_discovery_config(
+    out: &mut String,
+    name: &str,
+    discovery: &SessionDiscoveryConfig,
+) {
+    out.push_str(
+        "# Optional lookup for the provider's own conversation session ids.\n\
+         # Dux uses a discovered id for the {provider_session_id} placeholder in\n\
+         # resume_args and fork_args, and for auto-reopening agents. Set\n\
+         # strategy = \"none\" to disable discovery for this provider.\n",
+    );
+    out.push_str(&format!("[providers.{name}.session_discovery]\n"));
+    match discovery {
+        SessionDiscoveryConfig::Sqlite(config) => {
+            out.push_str("strategy = \"sqlite\"\n");
+            out.push_str("# SQLite database files to inspect. Paths support $VAR and ~.\n");
+            out.push_str(&format!(
+                "databases = {}\n",
+                render_string_list(&config.databases)
+            ));
+            out.push_str(
+                "# Tables to inspect. If several tables contain a match, the newest row wins.\n",
+            );
+            out.push_str(&format!(
+                "tables = {}\n",
+                render_string_list(&config.tables)
+            ));
+            out.push_str("# Column names in those tables.\n");
+            out.push_str(&format!(
+                "id_column = \"{}\"\n",
+                escape_toml_string(&config.id_column)
+            ));
+            out.push_str(&format!(
+                "directory_column = \"{}\"\n",
+                escape_toml_string(&config.directory_column)
+            ));
+            out.push_str(&format!(
+                "updated_column = \"{}\"\n",
+                escape_toml_string(&config.updated_column)
+            ));
+        }
+        SessionDiscoveryConfig::Json(config) => {
+            out.push_str("strategy = \"json\"\n");
+            out.push_str("# Directories searched recursively for JSON session files.\n");
+            out.push_str(&format!("roots = {}\n", render_string_list(&config.roots)));
+            out.push_str("# JSON fields containing the session id and working directory.\n");
+            out.push_str(&format!(
+                "id_field = \"{}\"\n",
+                escape_toml_string(&config.id_field)
+            ));
+            out.push_str(&format!(
+                "directory_fields = {}\n",
+                render_string_list(&config.directory_fields)
+            ));
+        }
+        SessionDiscoveryConfig::Disabled => {
+            out.push_str("strategy = \"none\"\n");
+        }
+    }
 }
 
 /// Validate all key bindings in the config. Returns a descriptive error on failure.
@@ -2984,6 +3213,7 @@ dangerous = true
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         };
         assert_eq!(
             cfg.interactive_args_with_provider_session_id(false, None),
@@ -3004,6 +3234,7 @@ dangerous = true
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         };
         assert_eq!(
             unsupported.interactive_args_with_provider_session_id(true, None),
@@ -3128,6 +3359,7 @@ dangerous = true
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    session_discovery: None,
                 },
             )]),
         };
@@ -3158,6 +3390,7 @@ dangerous = true
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    session_discovery: None,
                 },
             )]),
         };
@@ -3256,6 +3489,134 @@ oneshot_output = "stdout"
         assert_eq!(parsed.resume_args, None);
         assert_eq!(parsed.resume_wait_timeout_ms, None);
         assert!(!parsed.supports_session_resume());
+    }
+
+    #[test]
+    fn default_opencode_discovers_v2_and_legacy_session_tables() {
+        let providers = default_provider_commands();
+        let opencode = providers
+            .iter()
+            .find(|(name, _)| *name == "opencode")
+            .unwrap();
+        let discovery = opencode
+            .1
+            .session_discovery
+            .as_ref()
+            .expect("opencode should ship with session discovery");
+        let SessionDiscoveryConfig::Sqlite(config) = discovery else {
+            panic!("opencode should use sqlite session discovery");
+        };
+        assert_eq!(config.tables, vec!["session_v2", "session"]);
+        assert!(
+            config
+                .databases
+                .iter()
+                .any(|path| path.contains("opencode.db"))
+        );
+    }
+
+    #[test]
+    fn session_discovery_round_trips_through_config_renderer() {
+        let rendered = render_default_config();
+        assert!(rendered.contains("[providers.opencode.session_discovery]"));
+        assert!(rendered.contains("tables = [\"session_v2\", \"session\"]"));
+
+        let parsed: Config = toml::from_str(&rendered).expect("rendered config should parse");
+        let discovery = parsed
+            .providers
+            .get("opencode")
+            .and_then(|provider| provider.session_discovery.as_ref())
+            .expect("opencode discovery should survive the round trip");
+        assert!(matches!(discovery, SessionDiscoveryConfig::Sqlite(_)));
+    }
+
+    #[test]
+    fn ensure_defaults_backfills_missing_session_discovery_for_opencode() {
+        let mut providers = ProvidersConfig {
+            commands: IndexMap::from([(
+                "opencode".to_string(),
+                ProviderCommandConfig {
+                    command: "opencode".to_string(),
+                    session_discovery: None,
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        providers.ensure_defaults();
+
+        assert!(
+            providers
+                .get("opencode")
+                .unwrap()
+                .session_discovery
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ensure_defaults_preserves_explicit_session_discovery_disable() {
+        let mut providers = ProvidersConfig {
+            commands: IndexMap::from([(
+                "opencode".to_string(),
+                ProviderCommandConfig {
+                    command: "opencode".to_string(),
+                    session_discovery: Some(SessionDiscoveryConfig::Disabled),
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        providers.ensure_defaults();
+
+        assert_eq!(
+            providers.get("opencode").unwrap().session_discovery,
+            Some(SessionDiscoveryConfig::Disabled)
+        );
+    }
+
+    #[test]
+    fn custom_provider_can_configure_session_discovery() {
+        let parsed: Config = toml::from_str(
+            r#"
+[providers.custom]
+command = "custom-agent"
+session_discovery = { strategy = "json", roots = ["/tmp/custom-sessions"] }
+"#,
+        )
+        .expect("custom provider config should parse");
+        let discovery = parsed
+            .providers
+            .get("custom")
+            .and_then(|provider| provider.session_discovery.as_ref())
+            .expect("custom discovery should parse");
+        let SessionDiscoveryConfig::Json(config) = discovery else {
+            panic!("custom provider should use json discovery");
+        };
+        assert_eq!(config.roots, vec!["/tmp/custom-sessions"]);
+        assert_eq!(config.id_field, "id");
+        assert_eq!(config.directory_fields, vec!["directory", "path"]);
+    }
+
+    #[test]
+    fn session_discovery_can_be_disabled_explicitly() {
+        let parsed: Config = toml::from_str(
+            r#"
+[providers.opencode]
+command = "opencode"
+
+[providers.opencode.session_discovery]
+strategy = "none"
+"#,
+        )
+        .expect("disabled discovery should parse");
+        assert_eq!(
+            parsed
+                .providers
+                .get("opencode")
+                .and_then(|provider| provider.session_discovery.clone()),
+            Some(SessionDiscoveryConfig::Disabled)
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -3466,6 +3827,7 @@ oneshot_output = "stdout"
                     oneshot_output: OneshotOutput::Stdout,
                     install_hint: None,
                     forward_scroll: false,
+                    session_discovery: None,
                 },
             )]),
         };
@@ -3776,6 +4138,104 @@ args = [\"-l\"]
         assert!(reloaded.ui.auto_reopen_agents);
         assert!(!reloaded.defaults.pull_before_creating_agent_by_default);
         assert_eq!(reloaded.editor.default, "zed");
+    }
+
+    #[test]
+    fn save_config_writes_session_discovery_table() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[providers.opencode]
+command = "opencode"
+"#,
+        )
+        .expect("write");
+
+        let config = Config::default();
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = fs::read_to_string(&config_path).expect("read");
+        assert!(
+            saved.contains("[providers.opencode.session_discovery]"),
+            "session discovery table missing: {saved}"
+        );
+        let reloaded: Config = toml::from_str(&saved).expect("parse saved");
+        assert!(
+            reloaded
+                .providers
+                .get("opencode")
+                .unwrap()
+                .session_discovery
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn save_config_removes_stale_session_discovery_keys_when_strategy_changes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, render_default_config()).expect("write");
+
+        let mut config: Config = toml::from_str(&render_default_config()).expect("parse");
+        config
+            .providers
+            .commands
+            .get_mut("opencode")
+            .unwrap()
+            .session_discovery = Some(SessionDiscoveryConfig::Json(JsonSessionDiscoveryConfig {
+            roots: vec!["/tmp/sessions".to_string()],
+            ..Default::default()
+        }));
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = fs::read_to_string(&config_path).expect("read");
+        let opencode_block = saved
+            .split("[providers.opencode.session_discovery]")
+            .nth(1)
+            .expect("opencode discovery block");
+        assert!(opencode_block.contains("strategy = \"json\""));
+        assert!(opencode_block.contains("roots = [\"/tmp/sessions\"]"));
+        assert!(!opencode_block.contains("databases ="));
+        assert!(!opencode_block.contains("tables ="));
+    }
+
+    #[test]
+    fn save_config_replaces_inline_session_discovery_with_table() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[providers.opencode]
+command = "opencode"
+session_discovery = { strategy = "json", roots = ["/tmp/sessions"] }
+"#,
+        )
+        .expect("write");
+
+        let config: Config =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).expect("parse initial");
+        let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
+        save_config(&config_path, &config, &bindings).expect("save");
+
+        let saved = fs::read_to_string(&config_path).expect("read");
+        assert!(saved.contains("[providers.opencode.session_discovery]"));
+        assert!(!saved.contains("session_discovery = {"));
+        let reloaded: Config = toml::from_str(&saved).expect("parse saved");
+        assert!(matches!(
+            reloaded
+                .providers
+                .get("opencode")
+                .unwrap()
+                .session_discovery
+                .as_ref()
+                .unwrap(),
+            SessionDiscoveryConfig::Json(_)
+        ));
     }
 
     // ── expand_path tests ────────────────────────────────────────────────

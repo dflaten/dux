@@ -89,6 +89,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         }
     }
 
@@ -103,6 +104,7 @@ mod tests {
             oneshot_output: OneshotOutput::Tempfile,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         }
     }
 
@@ -176,6 +178,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         };
         let prov = create_provider("bad", config);
         let cwd = std::env::temp_dir();
@@ -200,6 +203,7 @@ mod tests {
             oneshot_output: OneshotOutput::Stdout,
             install_hint: None,
             forward_scroll: false,
+            session_discovery: None,
         };
         let prov = create_provider("custom", config);
         let cwd = std::env::temp_dir();
