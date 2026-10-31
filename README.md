@@ -80,6 +80,8 @@ resume_args = ["--continue"]
 
 Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it. Use `{provider_session_id}` for CLIs that need their own persisted session id; OpenCode uses this by default so dux can pass `--session <id>` instead of the unsafe global `--continue`.
 
+Providers that keep session ids in a local store can tell dux where to find them with `[providers.<name>.session_discovery]`. The `sqlite` strategy reads one or more database files and tables, while the `json` strategy searches directories recursively. OpenCode ships with a SQLite default that checks the current `session_v2` table and the legacy `session` table. Dux uses the discovered id for `{provider_session_id}` and auto-reopen. Set `strategy = "none"` to disable discovery for a provider.
+
 When a provider supports resume args, dux can auto-reopen agents that were still running when the app exited. A normal agent exit with status code 0 is treated as intentional and will not be reopened. The feature is off by default; enable it globally with `[ui].auto_reopen_agents = true`, opt out a project with `auto_reopen_agents = false` in its `[[projects]]` entry, or use the `toggle-project-auto-reopen-agents` and `toggle-agent-auto-reopen` palette commands for project and per-agent opt-outs.
 
 Switch providers from the command palette. dux sticks to one agent per worktree, so provider changes happen in place:
