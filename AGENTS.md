@@ -4,7 +4,10 @@
 
 - Do all code changes on a feature branch. Do not make implementation changes directly on `main`.
 - Open a pull request for every completed change set. Keep the PR focused on one coherent change.
-- Before starting work, check the current branch and create/switch to a feature branch when needed.
+- Before starting work, fetch `origin`, fast-forward `main`, and create the feature branch from that updated commit. Do not branch from stale `main` or from another feature branch unless the change is explicitly stacked.
+- If stacking is necessary, open the child PR against the parent feature branch, state the merge order in the PR body, and merge the parent first. Never merge a stacked PR and assume it landed on `main`.
+- Before opening a PR, verify its base branch: use `main` for normal changes, or the parent feature branch only for an explicit stack.
+- After a PR merges, confirm it targeted `main` and that `origin/main` contains the change before reporting it as shipped.
 - Before handing work back, report the branch name, files changed, and verification commands run.
 
 ## Dev Version
