@@ -1,35 +1,68 @@
 # dux
 
-![GitHub License](https://img.shields.io/github/license/dflaten/dux)
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-0f766e" />
+  <img alt="Language" src="https://img.shields.io/badge/language-Rust-334155" />
+  <img alt="Interface" src="https://img.shields.io/badge/interface-terminal%20UI-2563eb" />
+  <img alt="Providers" src="https://img.shields.io/badge/providers-Claude%20%2B%20Codex%20%2B%20OpenCode-7c3aed" />
+  <img alt="Validation" src="https://img.shields.io/badge/validation-cargo%20test-16a34a" />
+  <img alt="License" src="https://img.shields.io/github/license/dflaten/dux" />
+</p>
 
 <img src="assets/dux-logo.png" width="200" align="right" />
 
-This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). 
+`dux` is a terminal UI for orchestrating multiple AI coding agents, each in its own git worktree, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
 
-**dux** is a terminal UI that lets you run multiple AI coding agents side by side, each in its own git worktree, with full companion terminals, macros, commit generation, and a command palette. The original package was great but I found myself needing additional functionality in order to use this as my day to day Agent management system.
+This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). The original package was great, but I needed a few more workflow features to use it as my day-to-day agent manager. This fork is intended to be installed from source rather than through upstream release channels.
 
-Changes from the original package include: 
-
-* The ability to copy/paste from the Agent to the terminal pane with `ctrl-e`.
-* Searchable existing worktree picker for creating/reconnecting agents. 
-* Cleanup command for inactive managed worktrees.
-* Always shows the worktree diffs against base branch with easy option for rebasing.
-* Ability to queue comments on selected diff lines and send back to the Agent for reworking.
-* Resume/recover opencode sessions
-  
-This fork is intended to be installed from source rather than through upstream release channels.
+<br clear="right" />
 
 [![asciicast](assets/dux-screenshot.svg)](https://asciinema.org/a/IvqL89rXvwCzvSxQ)
 
-## Why dux?
+## Table Of Contents
 
-Most AI coding tools give you one agent in one directory. dux gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Open companion terminals next to your agents for builds, tests, or just poking around.
+- [Overview](#overview)
+- [Status](#status)
+- [Documentation](#documentation)
+- [Install](#install)
+- [Prerequisites](#prerequisites)
+- [Development Setup](#development-setup)
 
-Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, OpenCode, or others) runs like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work.
+## Overview
+
+| Icon | Item | Details |
+| --- | --- | --- |
+| 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
+| 🌿 | Worktrees | One isolated git worktree per agent, with fork and existing-worktree workflows |
+| 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
+| 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
+| 🎨 | Configuration | Fully commented config, rebindable keys, and a theme engine |
+| 🧪 | Validation | `cargo fmt`, Clippy, unit tests, and PTY integration tests |
+
+## Status
+
+`dux` currently supports macOS and Linux, with Windows users expected to run it through WSL2. The app is under active development as a personal fork.
+
+Recent fork additions include:
+
+- Copy and paste between agent and terminal panes.
+- A searchable existing-worktree picker for creating or reconnecting agents.
+- Cleanup for inactive managed worktrees.
+- Always-visible diffs against the base branch, with easy rebasing.
+- Queued comments on selected diff lines that can be sent back to an agent.
+- OpenCode session resume and discovery.
+- Cross-pane macros with auto-created targets, optional Enter submission, background delivery badges, and configurable focus.
+
+## Documentation
+
+User and setup documentation:
+
+- [User Guide](docs/user-guide.md)
+- [Configuration](docs/configuration.md)
 
 ## Install
 
-Install this fork from the repository:
+Clone the repository and install the binary from source:
 
 ```bash
 git clone https://github.com/dflaten/dux.git
@@ -45,234 +78,30 @@ Make sure `~/.local/bin` is on your `PATH`, then run:
 dux
 ```
 
-On first launch, dux creates a fully commented config file. That file is the documentation for **dux**.
+On first launch, dux creates a fully commented config file. That file is the documentation for every setting.
 
 ## Prerequisites
 
 - **`git`** — dux is built around git worktrees, so git is non-negotiable.
 - **Rust and Cargo** — required to build this fork from source.
-- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them right in the interface.
+- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them in the interface.
 
-## How It Works
+## Development Setup
 
-dux organizes work around **projects** (git repos) and **agents** (worktree sessions). When you create an agent, dux branches off a new git worktree so the agent has its own isolated copy of the code. No conflicts with your main checkout, no stepping on other agents' changes.
+Recommended local tools:
 
-Already have a Git worktree you want dux to use? The `new-agent-from-worktree` command in the palette lets you pick from existing worktrees for the selected project. If the worktree is already managed by dux, dux reuses it and reconnects like a continuable session; if it's outside dux's managed worktree directory, dux copies it into a fresh managed worktree first so the original checkout is left alone.
+- Stable Rust toolchain with Cargo
+- `git`
+- Optional: `gh` for PR tracking
 
-The interface has three panes:
-
-- **Left:** your projects and agent sessions
-- **Center:** the agent's live terminal output (or a file diff)
-- **Right:** changed files, staging, and diffs
-
-Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or git pane when you want more room. Go fullscreen with interactive mode.
-
-### Bring Any CLI
-
-Any terminal command can be a provider. The built-in defaults include Claude, Codex, and OpenCode, but adding your own is a config-only change:
-
-```toml
-[providers.my-agent]
-command = "my-cool-agent"
-args = ["--some-flag"]
-resume_args = ["--continue"]
-```
-
-Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it. Use `{provider_session_id}` for CLIs that need their own persisted session id; OpenCode uses this by default so dux can pass `--session <id>` instead of the unsafe global `--continue`.
-
-Providers that keep session ids in a local store can tell dux where to find them with `[providers.<name>.session_discovery]`. The `sqlite` strategy reads one or more database files and tables, while the `json` strategy searches directories recursively. OpenCode ships with a SQLite default that checks the current `session_v2` table and the legacy `session` table. Dux uses the discovered id for `{provider_session_id}` and auto-reopen. Set `strategy = "none"` to disable discovery for a provider.
-
-When a provider supports resume args, dux can auto-reopen agents that were still running when the app exited. A normal agent exit with status code 0 is treated as intentional and will not be reopened. The feature is off by default; enable it globally with `[ui].auto_reopen_agents = true`, opt out a project with `auto_reopen_agents = false` in its `[[projects]]` entry, or use the `toggle-project-auto-reopen-agents` and `toggle-agent-auto-reopen` palette commands for project and per-agent opt-outs.
-
-Switch providers from the command palette. dux sticks to one agent per worktree, so provider changes happen in place:
-
-- **`change-agent-provider`** swaps the *selected* worktree's provider on next launch. If the agent is still running, dux records your choice and warns you — the running agent keeps going until you exit and relaunch it, at which point it spawns with the new provider. If you've used that provider on this worktree before, dux passes its `resume_args` so you pick up the previous conversation instead of starting fresh.
-- **`change-default-provider`** picks the global fallback provider for *new* agent sessions in projects without a project-specific override. Existing agents keep their current provider; to move a running one, use `change-agent-provider` after stopping it.
-- **`change-project-default-provider`** picks the provider future agents should use for the selected project only, or lets that project inherit the global fallback again.
-
-The header shows `default provider: …` when the selected project inherits the global fallback. If a project has its own override, the header shows `project provider: …` plus `global default: …`. It also adds `current provider: …` when the selected agent is using a different one, so you always know which CLI you're talking to.
-
-Project-specific provider defaults are managed from inside dux with `change-project-default-provider`; `config.toml` only stores the global fallback.
-
-### Startup Commands
-
-Some projects need a little ceremony before an agent is useful. JavaScript projects want `npm install`, Rust projects may want a cache warmup, and some repos come with a setup script because apparently suffering builds character. Configure a project startup command and dux runs it in the new agent worktree before launching the provider.
-
-```toml
-[[projects]]
-id = "00000000-0000-0000-0000-000000000000"
-path = "$HOME/projects/web-app"
-name = "web-app"
-env = { EDITOR = "true", API_KEY = "${FOOBAR_API_KEY}" }
-startup_command = """
-npm install
-npm run build:types
-ln -sfn "$DUX_WORKTREE_PATH/.env.local" .env
-"""
-
-[startup_command_terminal]
-command = "$SHELL"
-args = ["-l", "-c"]
-```
-
-You can edit the command from the palette with `configure-startup-command`, or keep it in `config.toml` with the rest of your project intent. The multiline editor is not pretending to be fancy: dux passes the whole block as one script string to your configured shell, and shells already know that newlines separate commands. Put `npm install`, symlink setup, cache priming, or whatever tiny ritual your repo demands in there.
-
-Global env goes in the top-level `[env]` table and applies to every project:
-
-```toml
-[env]
-EDITOR = "true"
-API_KEY = "${FOOBAR_API_KEY}"
-```
-
-Project `env` values override global keys, because sometimes one repo deserves special treatment and the rest of your machine should not have to hear about it. Edit the global set from the palette with `configure-global-env`, and edit the selected project with `configure-project-env`.
-
-Project paths support `$HOME`, `${HOME}`, and `~` so the file can travel between machines without hardcoding your username like a tiny portability crime. Env values are passed to new agent PTYs, companion terminals, and startup commands. Values support the same `$VAR` and `${VAR}` expansion, so `API_KEY = "${FOOBAR_API_KEY}"` copies a secret from the parent environment while `EDITOR = "true"` can keep agents out of interactive editors. A terminal or agent may still start a shell that evaluates your profile files again; if those files reconfigure the same variables, dux cannot prevent that. Write shell defaults so they keep incoming values when present:
+Common commands:
 
 ```bash
-export VISUAL="${VISUAL:-nvim}"
-export EDITOR="${EDITOR:-$VISUAL}"
+cargo build
+cargo run
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 ```
 
-The startup command itself runs through your configured shell, so shell environment expansion works inside the command (`$HOME`, `${VAR}`, `$PATH`, `$EDITOR`, and friends). It runs with the agent worktree as the current directory, so relative paths point at the new checkout and normal shells report that through `$PWD`. dux also sets `DUX_PROJECT_PATH`, `DUX_WORKTREE_PATH`, `DUX_AGENT_ID`, `DUX_AGENT_BRANCH`, `DUX_PROVIDER`, and `DUX_STARTUP_COMMAND_LOG` for scripts that want to know where they are and who invited them.
-
-If the command fails, dux still creates the agent. The failure shows in the status line, because setup scripts are allowed to be dramatic but not allowed to block the show. Use `read-startup-command-logs` to open the latest log, and `rerun-startup-command-on-agent` when the fix is obvious and you want the machine to try again.
-
-### Macros
-
-Tired of typing the same prompt over and over? Turn it into a macro. Macros are reusable text snippets you trigger from a quick-select bar. Every macro is listed from either pane; its target decides where it runs. Run a terminal macro from the agent pane, or an agent macro from the terminal pane. If the target isn't running, dux launches it first, then runs the macro in the background and shows a session badge plus a status hint with the key to view the result.
-
-```toml
-[macros]
-"Review" = { text = "review this code for bugs and security issues", surface = "agent", submit = true }
-"Build" = { text = "cargo build --release 2>&1", surface = "terminal" }
-"Ship it" = { text = "run all tests, fix failures, then commit", surface = "both", submit = true }
-```
-
-`surface = "agent"` always sends to the agent, `surface = "terminal"` always sends to a companion terminal, and `surface = "both"` sends to whichever pane is active when the macro runs. Set `submit = true` to press Enter after sending so the prompt or command runs immediately; leave it out to inspect or edit the text before submitting.
-
-If you would rather jump to the agent or terminal pane that a macro runs in, set `macro_focus_on_launch = true` under `[ui]`.
-
-### Git Integration
-
-The right pane lists changed files, opens syntax-highlighted diffs, and keeps queued agent comments for selected diff lines until you send them to the agent. Git actions like staging, pushing, and pulling are still available from the files pane and command palette.
-
-**AI commit messages:** Stage your changes, hit a key, and dux sends the diff to your provider in oneshot mode. It drafts a commit message using Conventional Commits, you tweak it (or don't), and commit. The prompt is customizable once in `config.toml` for the whole app.
-
-**PR tracking:** With the `gh` CLI installed, dux tracks pull requests for your agent branches and shows status pills right in the interface.
-
-### Companion Terminals
-
-Each agent gets its own companion terminal: a separate shell session in the same worktree. Use it for builds, tests, git operations, or anything else you'd normally do in a terminal. You can spawn multiple companion terminals per agent.
-
-When an agent prints a command or script you want to run, select the text in the agent output and run `paste-selection-to-terminal` from the command palette. dux opens or reuses that agent's companion terminal and pastes the selection without submitting it, so you can inspect or edit before pressing Enter. The reverse works too: select terminal output and run `paste-selection-to-agent` to paste it back into the owning agent without submitting it.
-
-### Forking Sessions
-
-See an agent going down the wrong path? Fork it. dux creates a new worktree with the current files copied over so you can try a different approach without losing the original session. It's branching, but for your AI conversations.
-
-### Command Palette
-
-Press the palette key and you get fuzzy-searchable access to every action in dux, including features that don't have dedicated keybindings. Sort agents, toggle UI elements, open the resource monitor, rename sessions, edit macros, and more. If you forget a keybinding, just open the palette.
-
-### Configuration
-
-The config file at `~/.config/dux/config.toml` (Linux) or `~/.dux/config.toml` (macOS) is exhaustively commented. Every setting is explained inline, so you should never need to leave the file to understand an option. Every keybinding is rebindable. Every pane width, scrollback limit, default provider, and startup agent reopening behavior is configurable.
-
-```bash
-dux config path          # Print the config file path
-dux config diff          # Show what you've changed from defaults
-dux config diff --raw    # Unified diff against the default config
-dux config reset         # Remove config and logs (keeps agents)
-dux config reset --all   # Full factory reset
-dux config regenerate    # Preview a fresh default config
-```
-
-Override the config directory with the `DUX_HOME` environment variable.
-
-### Themes
-
-dux writes `config.toml` the first time it launches, so theme setup starts from a real, editable file instead of a guessing game. The generated config includes `[ui].theme = "dux_dark"`, plus comments with built-in theme examples. Edit that value, or use the `change-theme` command from the palette to preview and save a theme from inside the app.
-
-Custom themes live next to the config file:
-
-```text
-~/.config/dux/themes/my_theme.toml  # Linux
-~/.dux/themes/my_theme.toml         # macOS
-```
-
-Then set:
-
-```toml
-[ui]
-theme = "my_theme"
-```
-
-Theme names resolve in this order: your `themes/<name>.toml` file wins first, then the bundled `dux_dark`, then built-in [Opaline](https://github.com/hyperb1iss/opaline) themes such as `catppuccin_mocha`, `nord`, `dracula`, `gruvbox_dark`, `tokyo_night`, `solarized_dark`, `one_dark`, and `rose_pine`. If the name cannot be loaded, dux falls back to `dux_dark` and writes a warning to the log.
-
-Themes use the [Opaline](https://github.com/hyperb1iss/opaline) TOML format. A small theme only needs semantic tokens; dux derives its app-specific `dux.*` colors from those so you do not have to define every button, gutter, and diff color by hand:
-
-```toml
-[meta]
-name = "cyber_peacock"
-author = "you"
-variant = "dark"
-description = "A vivid dark theme for dux."
-
-[palette]
-base = "#101018"
-panel = "#171725"
-highlight = "#24243a"
-active = "#303050"
-text = "#f4f7ff"
-muted = "#aab2d5"
-dim = "#6f7899"
-accent = "#00d4ff"
-accent_secondary = "#ff4fd8"
-border = "#5b6ee1"
-success = "#4ade80"
-error = "#fb7185"
-warning = "#facc15"
-info = "#38bdf8"
-
-[tokens]
-"text.primary" = "text"
-"text.muted" = "muted"
-"text.dim" = "dim"
-"bg.base" = "base"
-"bg.panel" = "panel"
-"bg.highlight" = "highlight"
-"bg.active" = "active"
-"accent.primary" = "accent"
-"accent.secondary" = "accent_secondary"
-"border.focused" = "border"
-"border.unfocused" = "dim"
-success = "success"
-error = "error"
-warning = "warning"
-info = "info"
-```
-
-Want full control? Add explicit `dux.*` tokens. The bundled `assets/themes/dux_dark.toml` is the complete reference, including header chrome, overlays, hints, diffs, help, inputs, and PR colors. PR state colors intentionally default to GitHub-style green, purple, and red so merged, open, and closed states stay recognizable, but you can override `dux.pr_*` tokens too.
-
-### Keybindings
-
-All keybindings live in the `[keys]` section of the config. Key format supports single characters (`"j"`), special names (`"enter"`, `"pageup"`, `"shift-tab"`), and modifier combos (`"ctrl-d"`, `"ctrl-p"`). Each action takes an array of key combos:
-
-```toml
-[keys]
-quit = ["ctrl-q"]
-open_palette = ["ctrl-k"]
-```
-
-Press `?` in the app for the full keybinding reference. The help overlay is the authoritative source. This README intentionally doesn't list individual bindings because they're yours to change.
-
-### Logging
-
-Logs go to `dux.log` in the config directory. Control the level in your config:
-
-```toml
-[logging]
-level = "info"   # "error", "info", or "debug"
-path = "dux.log" # relative to config dir, or use an absolute path
-```
+For an interactive smoke test, run `cargo run`.
