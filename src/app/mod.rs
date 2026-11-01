@@ -179,6 +179,11 @@ pub struct App {
     /// skipped so pasted text doesn't trigger keybindings.
     pub(crate) in_bracket_paste: bool,
     pub(crate) macro_bar: Option<MacroBarState>,
+    /// Transient per-session delivery indicators for macros that target a
+    /// pane other than the one that is currently visible.
+    pub(crate) macro_deliveries: HashMap<String, MacroDelivery>,
+    /// Macros waiting for an agent launch to finish before they can be sent.
+    pub(crate) pending_macro_sends: Vec<PendingMacroSend>,
     pub(crate) sigwinch_flag: Arc<AtomicBool>,
     pub(crate) force_redraw: bool,
     pub(crate) welcome_tip_index: usize,
@@ -837,7 +842,7 @@ pub(crate) enum PromptState {
         selected: usize,
     },
     EditMacros {
-        entries: Vec<(String, String, MacroSurface)>,
+        entries: Vec<MacroEditorEntry>,
         selected: usize,
         editing: Option<MacroEditState>,
         pending_delete: Option<PendingMacroDelete>,
@@ -1171,7 +1176,41 @@ pub(crate) struct MacroEditState {
     pub(crate) name_input: TextInput,
     pub(crate) text_input: TextInput,
     pub(crate) surface: MacroSurface,
+    pub(crate) submit: bool,
     pub(crate) stage: MacroEditStage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MacroEditorEntry {
+    pub(crate) name: String,
+    pub(crate) text: String,
+    pub(crate) surface: MacroSurface,
+    pub(crate) submit: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingMacroSend {
+    pub(crate) session_id: String,
+    pub(crate) macro_name: String,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) submit: bool,
+    pub(crate) focus_on_ready: bool,
+    pub(crate) queued_at: Instant,
+    pub(crate) ready_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MacroDeliveryState {
+    Queued,
+    Sent,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MacroDelivery {
+    pub(crate) terminal_id: Option<String>,
+    pub(crate) target: SessionSurface,
+    pub(crate) state: MacroDeliveryState,
+    pub(crate) updated_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1583,6 +1622,8 @@ pub(crate) enum AgentLaunchKind {
     },
     Reconnect {
         status_message: String,
+        /// When true, switch the visible pane to the agent after launch.
+        focus: bool,
     },
     ForceReconnect {
         status_message: String,
@@ -1986,6 +2027,8 @@ impl App {
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
             macro_bar: None,
+            macro_deliveries: HashMap::new(),
+            pending_macro_sends: Vec::new(),
             sigwinch_flag,
             force_redraw: false,
             welcome_tip_index: std::time::SystemTime::now()
@@ -2039,6 +2082,8 @@ impl App {
             loop {
                 self.drain_events();
                 self.poll_pty_activity();
+                self.flush_pending_macro_sends();
+                self.expire_macro_deliveries();
                 self.tick_count = self.tick_count.wrapping_add(1);
 
                 // Check SIGWINCH — needed when bypassing crossterm's event
@@ -2416,6 +2461,9 @@ impl App {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
             Action::PasteSelectionToTerminal => self.selected_session().is_some(),
             Action::PasteSelectionToAgent => self.active_terminal_id.is_some(),
+            Action::OpenMacroBar => {
+                self.selected_session().is_some() && !self.config.macros.entries.is_empty()
+            }
             Action::RebaseCurrentBranch => self
                 .selected_session()
                 .is_some_and(|session| self.base_branch_updates.contains_key(&session.id)),
@@ -2537,6 +2585,7 @@ impl App {
             "force-reconnect-agent" => self.force_reconnect_agent(),
             "show-agent" => self.activate_center_agent(),
             "show-terminal" => self.show_or_open_first_terminal(),
+            "open-macro-bar" => self.open_macro_bar(),
             "paste-selection-to-terminal" => self.paste_selection_to_terminal(),
             "paste-selection-to-agent" => self.paste_selection_to_agent(),
             "new-terminal" => self.new_companion_terminal(),
@@ -2771,12 +2820,17 @@ impl App {
     }
 
     pub(crate) fn open_edit_macros(&mut self) {
-        let entries: Vec<(String, String, MacroSurface)> = self
+        let entries: Vec<MacroEditorEntry> = self
             .config
             .macros
             .entries
             .iter()
-            .map(|(k, v)| (k.clone(), v.text.clone(), v.surface))
+            .map(|(k, v)| MacroEditorEntry {
+                name: k.clone(),
+                text: v.text.clone(),
+                surface: v.surface,
+                submit: v.submit,
+            })
             .collect();
         // Preserve declaration order from config file (IndexMap iteration order).
         self.prompt = PromptState::EditMacros {
@@ -2787,11 +2841,10 @@ impl App {
         };
     }
 
-    /// Return macros matching `query` and the current session surface,
-    /// searching name first then text content.
-    /// If `query` is empty, returns all surface-matching macros in config order.
-    pub(crate) fn filtered_macros(&self, query: &str) -> Vec<(&str, &str)> {
-        let surface = self.session_surface;
+    /// Return every macro matching `query`, searching name first then text
+    /// content in config declaration order. `surface` is a routing target, so
+    /// the active pane does not filter the list.
+    pub(crate) fn filtered_macros(&self, query: &str) -> Vec<(&str, &crate::config::MacroEntry)> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
             return self
@@ -2799,20 +2852,16 @@ impl App {
                 .macros
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.surface.matches(surface))
-                .map(|(name, entry)| (name.as_str(), entry.text.as_str()))
+                .map(|(name, entry)| (name.as_str(), entry))
                 .collect();
         }
         let mut name_matches = Vec::new();
         let mut text_matches = Vec::new();
         for (name, entry) in &self.config.macros.entries {
-            if !entry.surface.matches(surface) {
-                continue;
-            }
             if name.to_lowercase().contains(&needle) {
-                name_matches.push((name.as_str(), entry.text.as_str()));
+                name_matches.push((name.as_str(), entry));
             } else if entry.text.to_lowercase().contains(&needle) {
-                text_matches.push((name.as_str(), entry.text.as_str()));
+                text_matches.push((name.as_str(), entry));
             }
         }
         name_matches.extend(text_matches);

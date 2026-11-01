@@ -65,9 +65,9 @@ impl MacroSurface {
     /// Human-readable label for UI display.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Agent => "agent only",
-            Self::Terminal => "terminal only",
-            Self::Both => "agent + terminal",
+            Self::Agent => "agent",
+            Self::Terminal => "terminal",
+            Self::Both => "active pane",
         }
     }
 
@@ -88,15 +88,6 @@ impl MacroSurface {
             Self::Terminal => Self::Agent,
         }
     }
-
-    /// Whether this surface matches the given session surface.
-    pub fn matches(self, session: crate::model::SessionSurface) -> bool {
-        match self {
-            Self::Both => true,
-            Self::Agent => session == crate::model::SessionSurface::Agent,
-            Self::Terminal => session == crate::model::SessionSurface::Terminal,
-        }
-    }
 }
 
 /// A single text macro entry with surface restriction.
@@ -104,10 +95,14 @@ impl MacroSurface {
 pub struct MacroEntry {
     pub text: String,
     pub surface: MacroSurface,
+    /// When true, press Enter after sending the macro text so the agent or
+    /// terminal runs it immediately.
+    #[serde(default)]
+    pub submit: bool,
 }
 
 /// Text macros: a map from name to entry.
-/// Each entry is triggered from the macro bar (Ctrl+\).
+/// Each entry is triggered from the macro bar and routed by its surface.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MacrosConfig {
@@ -280,6 +275,7 @@ pub struct UiConfig {
     pub auto_reopen_agents: bool,
     pub deleted_agent_retention_days: u16,
     pub pr_banner_position: String,
+    pub macro_focus_on_launch: bool,
     pub theme: String,
 }
 
@@ -312,6 +308,7 @@ impl Default for Config {
                 auto_reopen_agents: false,
                 deleted_agent_retention_days: 30,
                 pr_banner_position: "bottom".to_string(),
+                macro_focus_on_launch: false,
                 theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
             },
             editor: EditorConfig::default(),
@@ -489,6 +486,7 @@ impl Default for UiConfig {
             auto_reopen_agents: false,
             deleted_agent_retention_days: 30,
             pr_banner_position: "bottom".to_string(),
+            macro_focus_on_launch: false,
             theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
         }
     }
@@ -1090,6 +1088,15 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.ui.pr_banner_position.clone()),
         },
         ConfigEntry::Field {
+            key: "macro_focus_on_launch",
+            comment: Some(CommentSource::Static(
+                "# When true, jump to the agent or terminal pane after a macro runs in it.\n\
+                 # When false, macros run in the background and dux shows a session badge\n\
+                 # plus a status hint with the key to view the target pane.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.macro_focus_on_launch),
+        },
+        ConfigEntry::Field {
             key: "theme",
             comment: Some(CommentSource::Static(
                 "# Visual theme for the dux interface.\n# Built-in options include \"dux_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to dux_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",
@@ -1332,6 +1339,12 @@ pub fn save_config(
         "ui",
         "pr_banner_position",
         &config.ui.pr_banner_position,
+    );
+    patch_table_bool(
+        &mut doc,
+        "ui",
+        "macro_focus_on_launch",
+        config.ui.macro_focus_on_launch,
     );
     patch_table_str(&mut doc, "ui", "theme", &config.ui.theme);
 
@@ -1634,6 +1647,9 @@ fn patch_macros(doc: &mut DocumentMut, macros: &MacrosConfig) {
             "surface",
             Value::String(Formatted::new(surface_str.to_string())),
         );
+        if entry.submit {
+            inline.insert("submit", Value::Boolean(Formatted::new(true)));
+        }
         table[name] = toml_edit::value(Value::InlineTable(inline));
     }
 }
@@ -1759,17 +1775,20 @@ fn render_macros_config(
     let _ = writeln!(
         out,
         "# Text macros: press {macro_key} to open the macro bar and select one to send.\n\
-         # Each entry is a name mapped to its text and a surface restriction.\n\
-         # surface = \"agent\"    — only shown when the agent pane is focused.\n\
-         # surface = \"terminal\" — only shown when the terminal pane is focused.\n\
-         # surface = \"both\"     — shown on both surfaces.\n\
+         # Each macro runs in the agent or the companion terminal, and dux creates\n\
+         # the target first when it is not already running. Each entry is a name\n\
+         # mapped to its text and a routing target.\n\
+         # surface = \"agent\"    — always send to the agent, launching it if needed.\n\
+         # surface = \"terminal\" — always send to a companion terminal, opening one if needed.\n\
+         # surface = \"both\"     — send to whichever pane is active when the macro runs.\n\
+         # submit = true        — press Enter after sending so the text runs immediately.\n\
+         #                        Omit or set false to leave the text unsubmitted.\n\
          # Newlines in text values are translated to Alt+Enter (ESC + CR) so\n\
-         # multi-line macros are entered as a single prompt; press Enter yourself\n\
-         # to submit afterwards.",
+         # multi-line macros are entered as a single prompt.",
     );
     if macros.entries.is_empty() {
         out.push_str(
-            "# \"Review\" = { text = \"review this code for bugs\", surface = \"agent\" }\n\
+            "# \"Review\" = { text = \"review this code for bugs\", surface = \"agent\", submit = true }\n\
              # \"Build\" = { text = \"cargo build --release\", surface = \"terminal\" }\n",
         );
     } else {
@@ -1781,12 +1800,14 @@ fn render_macros_config(
                 MacroSurface::Terminal => "terminal",
                 MacroSurface::Both => "both",
             };
+            let submit = if entry.submit { ", submit = true" } else { "" };
             let _ = writeln!(
                 out,
-                "\"{}\" = {{ text = \"{}\", surface = \"{}\" }}",
+                "\"{}\" = {{ text = \"{}\", surface = \"{}\"{} }}",
                 escape_toml_string(name),
                 text,
-                surface
+                surface,
+                submit
             );
         }
     }
@@ -3961,6 +3982,7 @@ strategy = "none"
             MacroEntry {
                 text: "z".into(),
                 surface: MacroSurface::Agent,
+                submit: false,
             },
         );
         config.entries.insert(
@@ -3968,6 +3990,7 @@ strategy = "none"
             MacroEntry {
                 text: "a".into(),
                 surface: MacroSurface::Agent,
+                submit: false,
             },
         );
         config.entries.insert(
@@ -3975,6 +3998,7 @@ strategy = "none"
             MacroEntry {
                 text: "m".into(),
                 surface: MacroSurface::Agent,
+                submit: false,
             },
         );
         let names: Vec<&str> = config.entries.keys().map(|s| s.as_str()).collect();
@@ -3984,17 +4008,6 @@ strategy = "none"
     #[test]
     fn macros_surface_default_is_agent() {
         assert_eq!(MacroSurface::default(), MacroSurface::Agent);
-    }
-
-    #[test]
-    fn macros_surface_matches() {
-        use crate::model::SessionSurface;
-        assert!(MacroSurface::Both.matches(SessionSurface::Agent));
-        assert!(MacroSurface::Both.matches(SessionSurface::Terminal));
-        assert!(MacroSurface::Agent.matches(SessionSurface::Agent));
-        assert!(!MacroSurface::Agent.matches(SessionSurface::Terminal));
-        assert!(MacroSurface::Terminal.matches(SessionSurface::Terminal));
-        assert!(!MacroSurface::Terminal.matches(SessionSurface::Agent));
     }
 
     #[test]
@@ -4012,12 +4025,42 @@ strategy = "none"
     }
 
     #[test]
+    fn macros_config_entry_defaults_submit_to_false() {
+        let toml_str = r#"
+"Review" = { text = "review this code", surface = "agent" }
+"#;
+        let config: MacrosConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.entries["Review"].submit);
+    }
+
+    #[test]
+    fn macros_config_entry_parses_submit() {
+        let toml_str = r#"
+"Review" = { text = "review this code", surface = "agent", submit = true }
+"#;
+        let config: MacrosConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.entries["Review"].submit);
+    }
+
+    #[test]
+    fn macros_config_entry_submit_survives_serialize_round_trip() {
+        let toml_str = r#"
+"Review" = { text = "review this code", surface = "agent", submit = true }
+"#;
+        let config: MacrosConfig = toml::from_str(toml_str).unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let round_tripped: MacrosConfig = toml::from_str(&serialized).unwrap();
+        assert!(round_tripped.entries["Review"].submit);
+    }
+
+    #[test]
     fn render_macros_config_empty() {
         let config = Config::default();
         let rendered = render_config_default(&config);
         assert!(rendered.contains("[macros]"));
         assert!(rendered.contains("# \"Review\" = { text = \"review this code"));
         assert!(rendered.contains("surface = \"agent\""));
+        assert!(rendered.contains("submit = true"));
     }
 
     #[test]
@@ -4028,6 +4071,7 @@ strategy = "none"
             MacroEntry {
                 text: "hello world".to_string(),
                 surface: MacroSurface::Agent,
+                submit: false,
             },
         );
         config.macros.entries.insert(
@@ -4035,11 +4079,55 @@ strategy = "none"
             MacroEntry {
                 text: "foo bar".to_string(),
                 surface: MacroSurface::Terminal,
+                submit: true,
             },
         );
         let rendered = render_config_default(&config);
         assert!(rendered.contains("\"Review\" = { text = \"hello world\", surface = \"agent\" }"));
-        assert!(rendered.contains("\"Test\" = { text = \"foo bar\", surface = \"terminal\" }"));
+        assert!(
+            rendered.contains(
+                "\"Test\" = { text = \"foo bar\", surface = \"terminal\", submit = true }"
+            )
+        );
+    }
+
+    #[test]
+    fn patch_macros_writes_and_removes_submit() {
+        let mut config = Config::default();
+        config.macros.entries.insert(
+            "Review".to_string(),
+            MacroEntry {
+                text: "review".to_string(),
+                surface: MacroSurface::Agent,
+                submit: true,
+            },
+        );
+        let mut doc: DocumentMut = "[macros]\n".parse().expect("doc");
+        patch_macros(&mut doc, &config.macros);
+        let rendered = doc.to_string();
+        assert!(
+            rendered.contains("Review = { text = \"review\", surface = \"agent\", submit = true }")
+        );
+
+        config.macros.entries["Review"].submit = false;
+        patch_macros(&mut doc, &config.macros);
+        let rendered = doc.to_string();
+        assert_eq!(
+            rendered,
+            "[macros]\nReview = { text = \"review\", surface = \"agent\" }\n"
+        );
+    }
+
+    #[test]
+    fn macro_focus_on_launch_defaults_to_false() {
+        assert!(!Config::default().ui.macro_focus_on_launch);
+        assert!(!UiConfig::default().macro_focus_on_launch);
+    }
+
+    #[test]
+    fn render_ui_config_documents_macro_focus_on_launch() {
+        let rendered = render_config_default(&Config::default());
+        assert!(rendered.contains("macro_focus_on_launch = false"));
     }
 
     #[test]
@@ -4050,6 +4138,7 @@ strategy = "none"
             MacroEntry {
                 text: "line1\nline2".to_string(),
                 surface: MacroSurface::Both,
+                submit: false,
             },
         );
         let rendered = render_config_default(&config);

@@ -1,0 +1,154 @@
+# dux User Guide
+
+[Back to README](../README.md)
+
+## Table Of Contents
+
+- [Why dux?](#why-dux)
+- [How It Works](#how-it-works)
+- [Bring Any CLI](#bring-any-cli)
+- [Startup Commands](#startup-commands)
+- [Macros](#macros)
+- [Git Integration](#git-integration)
+- [Companion Terminals](#companion-terminals)
+- [Forking Sessions](#forking-sessions)
+- [Command Palette](#command-palette)
+- [Logging](#logging)
+
+## Why dux?
+
+Most AI coding tools give you one agent in one directory. dux gives you **unlimited agents across unlimited worktrees**, all visible at once. Spawn five agents on five branches and let them work in parallel. Fork a session to try a different approach without losing the original. Open companion terminals next to your agents for builds, tests, or just poking around.
+
+Every agent runs through a PTY, the same pseudo-terminal your shell uses. That means the CLI tool (Claude, Codex, OpenCode, or others) runs like it would in your regular terminal. Your MCP servers, hooks, skills, slash commands, and permission dialogs all work.
+
+## How It Works
+
+dux organizes work around **projects** (git repos) and **agents** (worktree sessions). When you create an agent, dux branches off a new git worktree so the agent has its own isolated copy of the code. No conflicts with your main checkout, no stepping on other agents' changes.
+
+Already have a Git worktree you want dux to use? The `new-agent-from-worktree` command in the palette lets you pick from existing worktrees for the selected project. If the worktree is already managed by dux, dux reuses it and reconnects like a continuable session; if it's outside dux's managed worktree directory, dux copies it into a fresh managed worktree first so the original checkout is left alone.
+
+The interface has three panes:
+
+- **Left:** your projects and agent sessions
+- **Center:** the agent's live terminal output (or a file diff)
+- **Right:** changed files, staging, and diffs
+
+Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or git pane when you want more room. Go fullscreen with interactive mode.
+
+## Bring Any CLI
+
+Any terminal command can be a provider. The built-in defaults include Claude, Codex, and OpenCode, but adding your own is a config-only change:
+
+```toml
+[providers.my-agent]
+command = "my-cool-agent"
+args = ["--some-flag"]
+resume_args = ["--continue"]
+```
+
+Set `resume_args` and dux can reconnect to detached or crashed sessions. Omit it if your CLI doesn't support resuming; dux will just relaunch it. Use `{provider_session_id}` for CLIs that need their own persisted session id; OpenCode uses this by default so dux can pass `--session <id>` instead of the unsafe global `--continue`.
+
+Providers that keep session ids in a local store can tell dux where to find them with `[providers.<name>.session_discovery]`. The `sqlite` strategy reads one or more database files and tables, while the `json` strategy searches directories recursively. OpenCode ships with a SQLite default that checks the current `session_v2` table and the legacy `session` table. Dux uses the discovered id for `{provider_session_id}` and auto-reopen. Set `strategy = "none"` to disable discovery for a provider.
+
+When a provider supports resume args, dux can auto-reopen agents that were still running when the app exited. A normal agent exit with status code 0 is treated as intentional and will not be reopened. The feature is off by default; enable it globally with `[ui].auto_reopen_agents = true`, opt out a project with `auto_reopen_agents = false` in its `[[projects]]` entry, or use the `toggle-project-auto-reopen-agents` and `toggle-agent-auto-reopen` palette commands for project and per-agent opt-outs.
+
+Switch providers from the command palette. dux sticks to one agent per worktree, so provider changes happen in place:
+
+- **`change-agent-provider`** swaps the *selected* worktree's provider on next launch. If the agent is still running, dux records your choice and warns you — the running agent keeps going until you exit and relaunch it, at which point it spawns with the new provider. If you've used that provider on this worktree before, dux passes its `resume_args` so you pick up the previous conversation instead of starting fresh.
+- **`change-default-provider`** picks the global fallback provider for *new* agent sessions in projects without a project-specific override. Existing agents keep their current provider; to move a running one, use `change-agent-provider` after stopping it.
+- **`change-project-default-provider`** picks the provider future agents should use for the selected project only, or lets that project inherit the global fallback again.
+
+The header shows `default provider: …` when the selected project inherits the global fallback. If a project has its own override, the header shows `project provider: …` plus `global default: …`. It also adds `current provider: …` when the selected agent is using a different one, so you always know which CLI you're talking to.
+
+Project-specific provider defaults are managed from inside dux with `change-project-default-provider`; `config.toml` only stores the global fallback.
+
+## Startup Commands
+
+Some projects need a little ceremony before an agent is useful. JavaScript projects want `npm install`, Rust projects may want a cache warmup, and some repos come with a setup script because apparently suffering builds character. Configure a project startup command and dux runs it in the new agent worktree before launching the provider.
+
+```toml
+[[projects]]
+id = "00000000-0000-0000-0000-000000000000"
+path = "$HOME/projects/web-app"
+name = "web-app"
+env = { EDITOR = "true", API_KEY = "${FOOBAR_API_KEY}" }
+startup_command = """
+npm install
+npm run build:types
+ln -sfn "$DUX_WORKTREE_PATH/.env.local" .env
+"""
+
+[startup_command_terminal]
+command = "$SHELL"
+args = ["-l", "-c"]
+```
+
+You can edit the command from the palette with `configure-startup-command`, or keep it in `config.toml` with the rest of your project intent. The multiline editor is not pretending to be fancy: dux passes the whole block as one script string to your configured shell, and shells already know that newlines separate commands. Put `npm install`, symlink setup, cache priming, or whatever tiny ritual your repo demands in there.
+
+Global env goes in the top-level `[env]` table and applies to every project:
+
+```toml
+[env]
+EDITOR = "true"
+API_KEY = "${FOOBAR_API_KEY}"
+```
+
+Project `env` values override global keys, because sometimes one repo deserves special treatment and the rest of your machine should not have to hear about it. Edit the global set from the palette with `configure-global-env`, and edit the selected project with `configure-project-env`.
+
+Project paths support `$HOME`, `${HOME}`, and `~` so the file can travel between machines without hardcoding your username like a tiny portability crime. Env values are passed to new agent PTYs, companion terminals, and startup commands. Values support the same `$VAR` and `${VAR}` expansion, so `API_KEY = "${FOOBAR_API_KEY}"` copies a secret from the parent environment while `EDITOR = "true"` can keep agents out of interactive editors. A terminal or agent may still start a shell that evaluates your profile files again; if those files reconfigure the same variables, dux cannot prevent that. Write shell defaults so they keep incoming values when present:
+
+```bash
+export VISUAL="${VISUAL:-nvim}"
+export EDITOR="${EDITOR:-$VISUAL}"
+```
+
+The startup command itself runs through your configured shell, so shell environment expansion works inside the command (`$HOME`, `${VAR}`, `$PATH`, `$EDITOR`, and friends). It runs with the agent worktree as the current directory, so relative paths point at the new checkout and normal shells report that through `$PWD`. dux also sets `DUX_PROJECT_PATH`, `DUX_WORKTREE_PATH`, `DUX_AGENT_ID`, `DUX_AGENT_BRANCH`, `DUX_PROVIDER`, and `DUX_STARTUP_COMMAND_LOG` for scripts that want to know where they are and who invited them.
+
+If the command fails, dux still creates the agent. The failure shows in the status line, because setup scripts are allowed to be dramatic but not allowed to block the show. Use `read-startup-command-logs` to open the latest log, and `rerun-startup-command-on-agent` when the fix is obvious and you want the machine to try again.
+
+## Macros
+
+Tired of typing the same prompt over and over? Turn it into a macro. Macros are reusable text snippets you trigger from a quick-select bar. Every macro is listed from either pane; its target decides where it runs. Run a terminal macro from the agent pane, or an agent macro from the terminal pane. If the target isn't running, dux launches it first, then runs the macro in the background and shows a session badge plus a status hint with the key to view the result.
+
+```toml
+[macros]
+"Review" = { text = "review this code for bugs and security issues", surface = "agent", submit = true }
+"Build" = { text = "cargo build --release 2>&1", surface = "terminal" }
+"Ship it" = { text = "run all tests, fix failures, then commit", surface = "both", submit = true }
+```
+
+`surface = "agent"` always sends to the agent, `surface = "terminal"` always sends to a companion terminal, and `surface = "both"` sends to whichever pane is active when the macro runs. Set `submit = true` to press Enter after sending so the prompt or command runs immediately; leave it out to inspect or edit the text before submitting.
+
+If you would rather jump to the agent or terminal pane that a macro runs in, set `macro_focus_on_launch = true` under `[ui]`.
+
+## Git Integration
+
+The right pane lists changed files, opens syntax-highlighted diffs, and keeps queued agent comments for selected diff lines until you send them to the agent. Git actions like staging, pushing, and pulling are still available from the files pane and command palette.
+
+**AI commit messages:** Stage your changes, hit a key, and dux sends the diff to your provider in oneshot mode. It drafts a commit message using Conventional Commits, you tweak it (or don't), and commit. The prompt is customizable once in `config.toml` for the whole app.
+
+**PR tracking:** With the `gh` CLI installed, dux tracks pull requests for your agent branches and shows status pills right in the interface.
+
+## Companion Terminals
+
+Each agent gets its own companion terminal: a separate shell session in the same worktree. Use it for builds, tests, git operations, or anything else you'd normally do in a terminal. You can spawn multiple companion terminals per agent.
+
+When an agent prints a command or script you want to run, select the text in the agent output and run `paste-selection-to-terminal` from the command palette. dux opens or reuses that agent's companion terminal and pastes the selection without submitting it, so you can inspect or edit before pressing Enter. The reverse works too: select terminal output and run `paste-selection-to-agent` to paste it back into the owning agent without submitting it.
+
+## Forking Sessions
+
+See an agent going down the wrong path? Fork it. dux creates a new worktree with the current files copied over so you can try a different approach without losing the original session. It's branching, but for your AI conversations.
+
+## Command Palette
+
+Press the palette key and you get fuzzy-searchable access to every action in dux, including features that don't have dedicated keybindings. Sort agents, toggle UI elements, open the resource monitor, rename sessions, edit macros, and more. If you forget a keybinding, just open the palette.
+
+## Logging
+
+Logs go to `dux.log` in the config directory. Control the level in your config:
+
+```toml
+[logging]
+level = "info"   # "error", "info", or "debug"
+path = "dux.log" # relative to config dir, or use an absolute path
+```
