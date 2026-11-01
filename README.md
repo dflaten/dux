@@ -51,8 +51,7 @@ Recent fork additions include:
 - Always-visible diffs against the base branch, with easy rebasing.
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.
-- Cross-pane macros that run in the agent or companion terminal, launching the target when it is missing.
-- Per-macro Enter submission, background delivery badges, and configurable macro focus.
+- Cross-pane macros with auto-created targets, optional Enter submission, background delivery badges, and configurable focus.
 
 ## Documentation
 
