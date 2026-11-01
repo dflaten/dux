@@ -351,7 +351,9 @@ impl Action {
             }
             Action::NewTerminal => "Spawn a new companion terminal for the selected agent.",
             Action::ExitInteractive => "Exit interactive mode (stop forwarding keys to agent).",
-            Action::OpenMacroBar => "Open the macro command bar to send text macros.",
+            Action::OpenMacroBar => {
+                "Open the macro bar to run a macro in the agent or companion terminal."
+            }
             Action::PasteSelectionToTerminal => {
                 "Paste selected text into the opposite agent or terminal pane without submitting it."
             }
@@ -1038,13 +1040,16 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     BindingDef {
         action: Action::OpenMacroBar,
         default_keys: &[key!(ctrl - '\\')],
-        scopes: &[BindingScope::Interactive],
+        scopes: &[BindingScope::Interactive, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Agent pane",
-            description: "Open the macro command bar to send text macros",
+            description: "Open the macro bar to run a macro in the agent or companion terminal",
         }),
         hint_contexts: &[],
-        palette: None,
+        palette: Some(PaletteEntry {
+            name: "open-macro-bar",
+            description: "Open the macro bar to run a macro",
+        }),
     },
     BindingDef {
         action: Action::PasteSelectionToTerminal,

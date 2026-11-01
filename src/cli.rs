@@ -256,6 +256,12 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         &defaults.ui.pr_banner_position,
         &current.ui.pr_banner_position,
     );
+    diff_bool(
+        &mut changes,
+        "ui.macro_focus_on_launch",
+        defaults.ui.macro_focus_on_launch,
+        current.ui.macro_focus_on_launch,
+    );
     diff_str(
         &mut changes,
         "ui.theme",

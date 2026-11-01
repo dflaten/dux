@@ -678,9 +678,9 @@ impl App {
 
         // Collect terminal display info for rendering.
         // Show the foreground command if one is running, otherwise the session label.
-        let terminal_render_data: Vec<(String, Option<String>)> = terminal_items
+        let terminal_render_data: Vec<(String, String, Option<String>)> = terminal_items
             .iter()
-            .map(|(_, t)| (t.label.clone(), t.foreground_cmd.clone()))
+            .map(|(id, t)| ((*id).clone(), t.label.clone(), t.foreground_cmd.clone()))
             .collect();
 
         let session_counts: HashMap<String, usize> = {
@@ -829,6 +829,10 @@ impl App {
                             self.companion_terminal_status(&session.id),
                             &self.theme,
                         ))
+                        .chain(macro_delivery_row_badge(
+                            self.macro_deliveries.get(&session.id),
+                            &self.theme,
+                        ))
                         .collect::<Vec<_>>(),
                     ))
                 }
@@ -868,7 +872,7 @@ impl App {
                 .inner(term_area);
             let term_items: Vec<ListItem> = terminal_render_data
                 .iter()
-                .map(|(label, fg_cmd)| {
+                .map(|(id, label, fg_cmd)| {
                     let color = self.theme.session_active;
                     let mut spans = vec![Span::styled("● ", Style::default().fg(color))];
                     if let Some(cmd) = fg_cmd {
@@ -879,6 +883,18 @@ impl App {
                         ));
                     } else {
                         spans.push(Span::styled(label.clone(), Style::default().fg(color)));
+                    }
+                    if let Some(delivery) = self
+                        .macro_deliveries
+                        .values()
+                        .find(|delivery| delivery.terminal_id.as_deref() == Some(id.as_str()))
+                    {
+                        let (icon, badge_color) =
+                            macro_delivery_state_badge(delivery.state, &self.theme);
+                        spans.push(Span::styled(
+                            format!(" {icon} macro"),
+                            Style::default().fg(badge_color),
+                        ));
                     }
                     ListItem::new(Line::from(spans))
                 })
@@ -6370,7 +6386,7 @@ impl App {
 
         // Pre-compute the popup layout so we can set the display width for
         // soft-wrapping before taking the immutable borrow on self.prompt.
-        let popup = centered_rect_exact(64, 20, frame.area());
+        let popup = centered_rect_exact(72, 20, frame.area());
         {
             // Temporarily borrow prompt mutably to set the text input's
             // viewport to match the available inner area after all borders,
@@ -6410,11 +6426,20 @@ impl App {
 
             match edit_state.stage {
                 MacroEditStage::EditName => {
-                    let [label_area, input_area, _, surface_area, _, hint_area] = Layout::default()
+                    let [
+                        label_area,
+                        input_area,
+                        _,
+                        surface_area,
+                        submit_area,
+                        _,
+                        hint_area,
+                    ] = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
                             Constraint::Length(1),
                             Constraint::Length(3),
+                            Constraint::Length(1),
                             Constraint::Length(1),
                             Constraint::Length(1),
                             Constraint::Min(1),
@@ -6430,15 +6455,15 @@ impl App {
 
                     self.render_single_line_input(&edit_state.name_input, input_area, frame);
 
-                    // Surface radio buttons
+                    // Destination radio buttons
                     let current = edit_state.surface;
                     let options = [
                         (MacroSurface::Agent, "Agent"),
                         (MacroSurface::Terminal, "Terminal"),
-                        (MacroSurface::Both, "Both"),
+                        (MacroSurface::Both, "Active pane"),
                     ];
                     let mut radio_spans: Vec<Span> = vec![Span::styled(
-                        " Surface:  ",
+                        " Target:   ",
                         Style::default().fg(self.theme.input_label_fg),
                     )];
                     for (i, (variant, label)) in options.iter().enumerate() {
@@ -6457,30 +6482,47 @@ impl App {
                     Paragraph::new(Line::from(radio_spans))
                         .render(surface_area, frame.buffer_mut());
 
+                    let submit_marker = if edit_state.submit { "[x]" } else { "[ ]" };
+                    let submit_style = if edit_state.submit {
+                        Style::default().fg(self.theme.status_busy_fg)
+                    } else {
+                        Style::default().fg(self.theme.hint_desc_fg)
+                    };
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            " Enter after sending: ",
+                            Style::default().fg(self.theme.input_label_fg),
+                        ),
+                        Span::styled(submit_marker, submit_style),
+                    ]))
+                    .render(submit_area, frame.buffer_mut());
+
                     let hints = self.edit_macro_hints(&[
                         ("Enter", "next"),
-                        ("Tab/Shift-Tab", "surface"),
+                        ("Tab/Shift-Tab", "target"),
+                        ("Ctrl-R", "auto-Enter"),
                         ("Esc", "cancel"),
                     ]);
                     Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
                 }
                 MacroEditStage::EditText => {
-                    let [label_area, bordered_area, hint_area] = Layout::default()
+                    let [label_area, bordered_area, submit_area, hint_area] = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
                             Constraint::Length(1),
                             Constraint::Min(3),
                             Constraint::Length(1),
+                            Constraint::Length(1),
                         ])
                         .areas(inner);
 
                     let surface_desc = match edit_state.surface {
-                        MacroSurface::Agent => "agent macro",
-                        MacroSurface::Terminal => "terminal macro",
-                        MacroSurface::Both => "agent + terminal macro",
+                        MacroSurface::Agent => "agent",
+                        MacroSurface::Terminal => "terminal",
+                        MacroSurface::Both => "active pane",
                     };
                     Paragraph::new(Line::from(Span::styled(
-                        format!(" Text for the {surface_desc}:"),
+                        format!(" Text for the {surface_desc} macro:"),
                         Style::default().fg(self.theme.input_label_fg),
                     )))
                     .render(label_area, frame.buffer_mut());
@@ -6495,8 +6537,26 @@ impl App {
 
                     self.render_multiline_input(&edit_state.text_input, text_inner, frame);
 
-                    let hints =
-                        self.edit_macro_hints(&[("Enter", "newline"), ("Esc", "save & close")]);
+                    let submit_marker = if edit_state.submit { "[x]" } else { "[ ]" };
+                    let submit_style = if edit_state.submit {
+                        Style::default().fg(self.theme.status_busy_fg)
+                    } else {
+                        Style::default().fg(self.theme.hint_desc_fg)
+                    };
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            " Enter after sending: ",
+                            Style::default().fg(self.theme.input_label_fg),
+                        ),
+                        Span::styled(submit_marker, submit_style),
+                    ]))
+                    .render(submit_area, frame.buffer_mut());
+
+                    let hints = self.edit_macro_hints(&[
+                        ("Enter", "newline"),
+                        ("Ctrl-R", "auto-Enter"),
+                        ("Esc", "save & close"),
+                    ]);
                     Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
                 }
             }
@@ -6535,23 +6595,27 @@ impl App {
 
                 let items: Vec<ListItem> = entries
                     .iter()
-                    .map(|(name, text, surface)| {
-                        let surface_label = format!(" ({})", surface.label());
+                    .map(|entry| {
+                        let surface_label = format!(" ({})", entry.surface.label());
+                        let submit_label = if entry.submit { " ⏎" } else { "" };
                         let mut spans = vec![
                             Span::styled(
-                                format!(" {name}"),
+                                format!(" {}", entry.name),
                                 Style::default().fg(self.theme.input_label_fg),
                             ),
                             Span::styled(
-                                surface_label.clone(),
+                                format!("{surface_label}{submit_label}"),
                                 Style::default().fg(self.theme.hint_dim_desc_fg),
                             ),
                             Span::styled(" — ", Style::default().fg(self.theme.input_label_fg)),
                         ];
-                        let text_preview = text.replace('\n', "↵");
-                        // " " + name + " (label)" + " — "
-                        let prefix_len =
-                            1 + display_width(name) + display_width(&surface_label) + 3;
+                        let text_preview = entry.text.replace('\n', "↵");
+                        // " " + name + " (label)" + submit marker + " — "
+                        let prefix_len = 1
+                            + display_width(&entry.name)
+                            + display_width(&surface_label)
+                            + display_width(submit_label)
+                            + 3;
                         let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
                         let truncated = if display_width(&text_preview) > max_len {
                             truncate_to_width(&text_preview, max_len)
@@ -7074,7 +7138,8 @@ impl App {
             .max()
             .unwrap_or(0);
         let inner_w = list_area.width.saturating_sub(3) as usize; // borders + padding
-        let gap = 2usize;
+        let target_col = 6usize;
+        let prefix_len = name_col + 2 + target_col + 1 + 2;
 
         let items: Vec<ListItem> = if filtered.is_empty() {
             let msg = "No matching macros.";
@@ -7085,7 +7150,7 @@ impl App {
         } else {
             filtered
                 .iter()
-                .map(|&(name, text)| {
+                .map(|&(name, entry)| {
                     let name_padded = format!(
                         "{name}{}",
                         " ".repeat(name_col.saturating_sub(display_width(name)))
@@ -7096,8 +7161,21 @@ impl App {
                             .fg(self.theme.help_section_header_fg)
                             .add_modifier(Modifier::BOLD),
                     )];
-                    let text_preview = text.replace('\n', "↵");
-                    let desc_avail = inner_w.saturating_sub(name_col + gap);
+                    let target = match entry.surface {
+                        MacroSurface::Agent => "agent",
+                        MacroSurface::Terminal => "term",
+                        MacroSurface::Both => "active",
+                    };
+                    spans.push(Span::styled(
+                        format!("  {target:<target_col$}"),
+                        Style::default().fg(self.theme.provider_label_fg),
+                    ));
+                    spans.push(Span::styled(
+                        if entry.submit { "⏎" } else { " " },
+                        Style::default().fg(self.theme.status_busy_fg),
+                    ));
+                    let text_preview = entry.text.replace('\n', "↵");
+                    let desc_avail = inner_w.saturating_sub(prefix_len);
                     let desc_display = if display_width(&text_preview) > desc_avail {
                         format!("  {}", truncate_to_width(&text_preview, desc_avail))
                     } else {
@@ -7521,6 +7599,36 @@ fn companion_terminal_status_color(theme: &Theme, status: CompanionTerminalStatu
         CompanionTerminalStatus::Running => theme.session_active,
         CompanionTerminalStatus::Exited => theme.session_detached,
     }
+}
+
+fn macro_delivery_state_badge(
+    state: MacroDeliveryState,
+    theme: &crate::theme::Theme,
+) -> (&'static str, Color) {
+    match state {
+        MacroDeliveryState::Queued => ("⟳", theme.status_busy_fg),
+        MacroDeliveryState::Sent => ("✓", theme.hint_dim_desc_fg),
+    }
+}
+
+fn macro_delivery_row_badge(
+    delivery: Option<&MacroDelivery>,
+    theme: &crate::theme::Theme,
+) -> Vec<Span<'static>> {
+    let Some(delivery) = delivery else {
+        return Vec::new();
+    };
+    let (icon, color) = macro_delivery_state_badge(delivery.state, theme);
+    let target = match delivery.target {
+        SessionSurface::Agent => "agent",
+        SessionSurface::Terminal => "term",
+    };
+    vec![
+        Span::raw(" "),
+        Span::styled("[", Style::default().fg(theme.provider_label_fg)),
+        Span::styled(format!("{icon} macro→{target}"), Style::default().fg(color)),
+        Span::styled("]", Style::default().fg(theme.provider_label_fg)),
+    ]
 }
 
 fn companion_terminal_row_badge(

@@ -140,16 +140,18 @@ If the command fails, dux still creates the agent. The failure shows in the stat
 
 ### Macros
 
-Tired of typing the same prompt over and over? Turn it into a macro. Macros are reusable text snippets you trigger from a quick-select bar. Search by name, hit enter, and the text gets sent to the active pane.
+Tired of typing the same prompt over and over? Turn it into a macro. Macros are reusable text snippets you trigger from a quick-select bar. Every macro is listed from either pane; its target decides where it runs. Run a terminal macro from the agent pane, or an agent macro from the terminal pane. If the target isn't running, dux launches it first, then runs the macro in the background and shows a session badge plus a status hint with the key to view the result.
 
 ```toml
 [macros]
-"Review" = { text = "review this code for bugs and security issues", surface = "agent" }
+"Review" = { text = "review this code for bugs and security issues", surface = "agent", submit = true }
 "Build" = { text = "cargo build --release 2>&1", surface = "terminal" }
-"Ship it" = { text = "run all tests, fix failures, then commit", surface = "agent" }
+"Ship it" = { text = "run all tests, fix failures, then commit", surface = "both", submit = true }
 ```
 
-Each macro can be scoped to the agent pane, the companion terminal, or both.
+`surface = "agent"` always sends to the agent, `surface = "terminal"` always sends to a companion terminal, and `surface = "both"` sends to whichever pane is active when the macro runs. Set `submit = true` to press Enter after sending so the prompt or command runs immediately; leave it out to inspect or edit the text before submitting.
+
+If you would rather jump to the agent or terminal pane that a macro runs in, set `macro_focus_on_launch = true` under `[ui]`.
 
 ### Git Integration
 

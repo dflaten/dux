@@ -1,5 +1,15 @@
 use super::*;
 
+const MACRO_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const MACRO_AGENT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MACRO_DELIVERY_BADGE_TTL: Duration = Duration::from_secs(3);
+
+enum PendingMacroOutcome {
+    Keep,
+    Send,
+    Fail(String),
+}
+
 impl App {
     fn is_current_watched_worktree(&self, watched: &WatchedWorktree) -> bool {
         self.watched_worktree
@@ -1416,8 +1426,18 @@ impl App {
         self.mark_session_provider_started(&session.id);
 
         match request.kind {
-            AgentLaunchKind::Reconnect { status_message }
-            | AgentLaunchKind::ForceReconnect { status_message } => {
+            AgentLaunchKind::Reconnect {
+                status_message,
+                focus,
+            } => {
+                if focus {
+                    self.show_agent_surface();
+                    self.input_target = InputTarget::Agent;
+                    self.fullscreen_overlay = FullscreenOverlay::Agent;
+                }
+                self.set_info(status_message);
+            }
+            AgentLaunchKind::ForceReconnect { status_message } => {
                 self.show_agent_surface();
                 self.input_target = InputTarget::Agent;
                 self.fullscreen_overlay = FullscreenOverlay::Agent;
@@ -1436,6 +1456,148 @@ impl App {
             AgentLaunchKind::StartupAutoReopen => {}
             AgentLaunchKind::Create { .. } => unreachable!("create launch handled above"),
         }
+        // Any launch kind can complete while a macro is queued for the session.
+        self.mark_pending_macros_ready(&session.id);
+    }
+
+    fn mark_pending_macros_ready(&mut self, session_id: &str) {
+        let now = Instant::now();
+        for pending in &mut self.pending_macro_sends {
+            if pending.session_id == session_id && pending.ready_at.is_none() {
+                pending.ready_at = Some(now);
+            }
+        }
+    }
+
+    fn pending_macro_outcome(&self, pending: &PendingMacroSend) -> PendingMacroOutcome {
+        let Some(provider) = self.providers.get(&pending.session_id) else {
+            if pending.ready_at.is_some() {
+                return PendingMacroOutcome::Fail(
+                    "the agent exited before the macro could be sent".to_string(),
+                );
+            }
+            if pending.queued_at.elapsed() >= MACRO_AGENT_LAUNCH_TIMEOUT {
+                return PendingMacroOutcome::Fail("the agent did not start".to_string());
+            }
+            return PendingMacroOutcome::Keep;
+        };
+        let Some(ready_at) = pending.ready_at else {
+            if pending.queued_at.elapsed() >= MACRO_AGENT_LAUNCH_TIMEOUT {
+                return PendingMacroOutcome::Fail("the agent did not start".to_string());
+            }
+            return PendingMacroOutcome::Keep;
+        };
+        if provider.is_exited() {
+            return PendingMacroOutcome::Fail(
+                "the agent exited before the macro could be sent".to_string(),
+            );
+        }
+        if provider.has_output() {
+            PendingMacroOutcome::Send
+        } else if ready_at.elapsed() >= MACRO_AGENT_READY_TIMEOUT {
+            PendingMacroOutcome::Fail(
+                "the agent did not become ready before the macro timeout".to_string(),
+            )
+        } else {
+            PendingMacroOutcome::Keep
+        }
+    }
+
+    /// Send macros whose agent launch has finished and whose PTY is ready.
+    pub(crate) fn flush_pending_macro_sends(&mut self) {
+        let pending = std::mem::take(&mut self.pending_macro_sends);
+        let mut keep = Vec::new();
+        for item in pending {
+            match self.pending_macro_outcome(&item) {
+                PendingMacroOutcome::Keep => keep.push(item),
+                PendingMacroOutcome::Fail(reason) => {
+                    self.fail_pending_macro(&item.session_id, &item.macro_name, &reason);
+                }
+                PendingMacroOutcome::Send => {
+                    let result = match self.providers.get(&item.session_id) {
+                        Some(provider) => provider
+                            .write_bytes(&item.payload)
+                            .map_err(|err| err.to_string()),
+                        None => Err("the agent is no longer running".to_string()),
+                    };
+                    match result {
+                        Ok(()) => self.finish_pending_macro_success(item),
+                        Err(err) => {
+                            self.fail_pending_macro(
+                                &item.session_id,
+                                &item.macro_name,
+                                &format!("could not write to the agent: {err}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_macro_sends = keep;
+    }
+
+    fn finish_pending_macro_success(&mut self, pending: PendingMacroSend) {
+        let branch_name = self
+            .sessions
+            .iter()
+            .find(|session| session.id == pending.session_id)
+            .map(|session| session.branch_name.clone())
+            .unwrap_or_else(|| pending.session_id.clone());
+        self.record_macro_delivery(
+            &pending.session_id,
+            None,
+            SessionSurface::Agent,
+            MacroDeliveryState::Sent,
+        );
+        if pending.focus_on_ready {
+            self.focus_agent_surface_for_macro();
+        }
+        let mut message = if pending.submit {
+            format!(
+                "Sent macro \"{}\" to agent \"{branch_name}\" and pressed Enter.",
+                pending.macro_name
+            )
+        } else {
+            format!(
+                "Sent macro \"{}\" to agent \"{branch_name}\".",
+                pending.macro_name
+            )
+        };
+        message.push_str(&self.macro_view_hint(SessionSurface::Agent));
+        self.set_info(message);
+    }
+
+    fn fail_pending_macro(&mut self, session_id: &str, macro_name: &str, reason: &str) {
+        let branch_name = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.branch_name.clone())
+            .unwrap_or_else(|| session_id.to_string());
+        self.macro_deliveries.remove(session_id);
+        self.set_error(format!(
+            "Could not run macro \"{macro_name}\" in agent \"{branch_name}\": {reason}."
+        ));
+    }
+
+    fn take_pending_macros_for_session(&mut self, session_id: &str) -> Vec<PendingMacroSend> {
+        let mut taken = Vec::new();
+        self.pending_macro_sends.retain(|pending| {
+            if pending.session_id == session_id {
+                taken.push(pending.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
+    pub(crate) fn expire_macro_deliveries(&mut self) {
+        self.macro_deliveries.retain(|_, delivery| {
+            delivery.state == MacroDeliveryState::Queued
+                || delivery.updated_at.elapsed() < MACRO_DELIVERY_BADGE_TTL
+        });
     }
 
     fn spawn_provider_session_id_discovery(
@@ -1535,6 +1697,31 @@ impl App {
         let AgentLaunchFailedData { request, message } = data;
         let session = request.session;
         self.agent_launches_in_flight.remove(&session.id);
+
+        let pending = self.take_pending_macros_for_session(&session.id);
+        if let Some(first) = pending.first() {
+            self.macro_deliveries.remove(&session.id);
+            let extra = if pending.len() > 1 {
+                format!(" ({} queued macros were dropped.)", pending.len())
+            } else {
+                String::new()
+            };
+            self.set_error(format!(
+                "Could not run macro \"{}\" in agent \"{}\": agent launch failed: {message}.{extra}",
+                first.macro_name, session.branch_name
+            ));
+            if matches!(request.kind, AgentLaunchKind::Create { .. }) {
+                self.create_agent_in_flight = false;
+            }
+            if matches!(request.kind, AgentLaunchKind::ResumeFallback { .. }) {
+                logger::error(&format!(
+                    "fallback PTY spawn failed for {}: {}",
+                    session.id, message
+                ));
+                self.mark_session_status(&session.id, SessionStatus::Detached);
+            }
+            return;
+        }
 
         match request.kind {
             AgentLaunchKind::Create { .. } => {
@@ -3929,6 +4116,7 @@ mod tests {
             env: Vec::new(),
             kind: AgentLaunchKind::Reconnect {
                 status_message: "reconnect".to_string(),
+                focus: true,
             },
         };
 
@@ -3967,6 +4155,7 @@ mod tests {
             env: Vec::new(),
             kind: AgentLaunchKind::Reconnect {
                 status_message: "reconnect".to_string(),
+                focus: true,
             },
         };
 

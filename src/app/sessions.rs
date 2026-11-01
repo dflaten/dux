@@ -604,14 +604,10 @@ impl App {
         self.fullscreen_overlay = FullscreenOverlay::Terminal;
     }
 
-    /// Always spawns a new companion terminal for the selected session.
-    pub(crate) fn show_companion_terminal(&mut self) -> Result<()> {
-        let Some(session) = self.selected_session().cloned() else {
-            self.set_error("Select an agent session first.");
-            return Ok(());
-        };
-
-        let client = self.spawn_companion_terminal_for_session(&session)?;
+    /// Spawn a new companion terminal for `session`, register it, and make it
+    /// the active terminal. Returns the new terminal id.
+    fn insert_companion_terminal_for_session(&mut self, session: &AgentSession) -> Result<String> {
+        let client = self.spawn_companion_terminal_for_session(session)?;
         let terminal_id = self.next_terminal_id();
         let count = self.session_terminal_count(&session.id) + 1;
         let label = if count == 1 {
@@ -635,7 +631,61 @@ impl App {
                 client,
             },
         );
-        self.active_terminal_id = Some(terminal_id);
+        self.active_terminal_id = Some(terminal_id.clone());
+        Ok(terminal_id)
+    }
+
+    fn first_terminal_id_for_session(&self, session_id: &str) -> Option<String> {
+        self.companion_terminals
+            .iter()
+            .filter(|(_, t)| t.session_id == session_id)
+            .min_by_key(|(id, _)| {
+                id.strip_prefix("term-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(u64::MAX)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Ensure a companion terminal exists for `session`, reusing the active
+    /// terminal or the first existing one. When `focus` is true, open the
+    /// terminal overlay; otherwise keep the current view.
+    pub(crate) fn ensure_terminal_for_session(
+        &mut self,
+        session: &AgentSession,
+        focus: bool,
+    ) -> Result<String> {
+        let active_matches = self.active_terminal_id.as_ref().is_some_and(|id| {
+            self.companion_terminals
+                .get(id)
+                .is_some_and(|terminal| terminal.session_id == session.id)
+        });
+        let terminal_id = if active_matches {
+            self.active_terminal_id
+                .clone()
+                .expect("active terminal checked")
+        } else if let Some(id) = self.first_terminal_id_for_session(&session.id) {
+            self.active_terminal_id = Some(id.clone());
+            id
+        } else {
+            self.insert_companion_terminal_for_session(session)?
+        };
+        if focus {
+            self.terminal_return_to_list = false;
+            self.show_companion_terminal_surface();
+            self.input_target = InputTarget::Terminal;
+        }
+        Ok(terminal_id)
+    }
+
+    /// Always spawns a new companion terminal for the selected session.
+    pub(crate) fn show_companion_terminal(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select an agent session first.");
+            return Ok(());
+        };
+
+        self.insert_companion_terminal_for_session(&session)?;
         self.terminal_return_to_list = true;
         self.show_companion_terminal_surface();
         self.input_target = InputTarget::Terminal;
@@ -654,18 +704,12 @@ impl App {
             return Ok(());
         };
 
-        let first = self
-            .companion_terminals
-            .iter()
-            .filter(|(_, t)| t.session_id == session.id)
-            .min_by_key(|(id, _)| {
-                id.strip_prefix("term-")
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(u64::MAX)
-            })
-            .map(|(id, t)| (id.clone(), t.label.clone()));
-
-        if let Some((terminal_id, label)) = first {
+        if let Some(terminal_id) = self.first_terminal_id_for_session(&session.id) {
+            let label = self
+                .companion_terminals
+                .get(&terminal_id)
+                .map(|terminal| terminal.label.clone())
+                .unwrap_or_else(|| session.branch_name.clone());
             self.active_terminal_id = Some(terminal_id);
             self.terminal_return_to_list = false;
             self.show_companion_terminal_surface();
@@ -693,28 +737,7 @@ impl App {
             return Ok(());
         };
 
-        let client = self.spawn_companion_terminal_for_session(&session)?;
-        let terminal_id = self.next_terminal_id();
-        let count = self.session_terminal_count(&session.id) + 1;
-        let base = session
-            .title
-            .clone()
-            .unwrap_or_else(|| session.branch_name.clone());
-        let label = if count == 1 {
-            base
-        } else {
-            format!("{base} ({count})")
-        };
-        self.companion_terminals.insert(
-            terminal_id.clone(),
-            CompanionTerminal {
-                session_id: session.id.clone(),
-                label,
-                foreground_cmd: None,
-                client,
-            },
-        );
-        self.active_terminal_id = Some(terminal_id);
+        self.insert_companion_terminal_for_session(&session)?;
         self.terminal_return_to_list = true;
         self.show_companion_terminal_surface();
         self.input_target = InputTarget::Terminal;
@@ -2367,18 +2390,52 @@ impl App {
             ));
             return Ok(());
         }
+        let branch_name = session.branch_name.clone();
+        if self.launch_reconnect_for_session(session, true)? {
+            self.set_busy(format!("Launching agent \"{}\"...", branch_name));
+        }
+        Ok(())
+    }
+
+    /// Launch the provider for an existing session, resuming its prior
+    /// conversation when the provider supports it. Returns whether the launch
+    /// was dispatched. When `focus` is false the agent starts in the
+    /// background and the current view is left alone.
+    pub(crate) fn launch_reconnect_for_session(
+        &mut self,
+        session: AgentSession,
+        focus: bool,
+    ) -> Result<bool> {
         if !Path::new(&session.worktree_path).exists() {
             self.set_error(format!(
                 "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
                 session.branch_name
             ));
-            return Ok(());
+            return Ok(false);
         }
         let detached_label =
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
 
         let use_resume = self.should_resume_session(&session);
-        let proj_name = self.project_name_for_session(&session);
+        let msg = self.reconnect_status_message(&session, use_resume, detached_label.as_deref());
+        let request = self.agent_launch_request(
+            session,
+            use_resume,
+            AgentLaunchKind::Reconnect {
+                status_message: msg,
+                focus,
+            },
+        );
+        Ok(self.dispatch_agent_launch(request))
+    }
+
+    fn reconnect_status_message(
+        &self,
+        session: &AgentSession,
+        use_resume: bool,
+        detached_label: Option<&str>,
+    ) -> String {
+        let proj_name = self.project_name_for_session(session);
         let mut msg = if use_resume {
             format!(
                 "Resumed {} agent \"{}\" in project \"{}\".",
@@ -2394,7 +2451,7 @@ impl App {
                 proj_name
             )
         };
-        if let Some(detached) = &detached_label {
+        if let Some(detached) = detached_label {
             msg.push_str(&format!(
                 " Agent \"{}\" was detached to avoid worktree conflicts.",
                 detached,
@@ -2414,18 +2471,7 @@ impl App {
                 project.default_provider.as_str(),
             ));
         }
-        let branch_name = session.branch_name.clone();
-        let request = self.agent_launch_request(
-            session,
-            use_resume,
-            AgentLaunchKind::Reconnect {
-                status_message: msg,
-            },
-        );
-        if self.dispatch_agent_launch(request) {
-            self.set_busy(format!("Launching agent \"{}\"...", branch_name));
-        }
-        Ok(())
+        msg
     }
 
     pub(crate) fn open_diff_for_selected_file(&mut self) -> Result<()> {
@@ -3233,6 +3279,8 @@ mod tests {
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
             macro_bar: None,
+            macro_deliveries: std::collections::HashMap::new(),
+            pending_macro_sends: Vec::new(),
             sigwinch_flag: Arc::new(AtomicBool::new(false)),
             force_redraw: false,
             welcome_tip_index: 0,

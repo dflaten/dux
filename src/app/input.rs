@@ -30,11 +30,12 @@ const LOADING_INPUT_BUF_MAX: usize = 64;
 /// Build the byte payload for a macro send. Newlines are translated to
 /// Alt+Enter (ESC followed by CR) so that multi-line macros are entered
 /// as a single multi-line prompt rather than submitting at each newline.
-/// Handles `\r\n`, `\n`, and bare `\r` uniformly.
-pub(crate) fn macro_payload_bytes(text: &str) -> Vec<u8> {
+/// When `submit` is true, a bare Enter (CR) is appended so the target runs
+/// the text immediately. Handles `\r\n`, `\n`, and bare `\r` uniformly.
+pub(crate) fn macro_payload_bytes(text: &str, submit: bool) -> Vec<u8> {
     const ALT_ENTER: &[u8] = b"\x1b\r";
     let bytes = text.as_bytes();
-    let mut payload = Vec::with_capacity(bytes.len());
+    let mut payload = Vec::with_capacity(bytes.len() + usize::from(submit));
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
@@ -51,6 +52,9 @@ pub(crate) fn macro_payload_bytes(text: &str) -> Vec<u8> {
                 i += 1;
             }
         }
+    }
+    if submit {
+        payload.push(b'\r');
     }
     payload
 }
@@ -904,6 +908,7 @@ impl App {
                 Action::SendDiffComments if in_diff => self.send_queued_diff_comments(),
                 Action::FocusAgent if !in_diff => self.activate_center_agent()?,
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
+                Action::OpenMacroBar => self.open_macro_bar()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
                 Action::PasteSelectionToTerminal if !in_diff => {
                     self.paste_selection_to_opposite_surface()?
@@ -1517,16 +1522,16 @@ impl App {
                 } else {
                     return Ok(false);
                 };
-                let filtered = self.filtered_macros(&query);
-                if let Some(&(name, text)) = filtered.get(selected) {
-                    if let Some(provider) = self.selected_terminal_surface_client() {
-                        let payload = macro_payload_bytes(text);
-                        let _ = provider.write_bytes(&payload);
-                    }
-                    let name = name.to_string();
-                    self.set_info(format!("Sent macro \"{name}\"."));
-                }
+                let selection = {
+                    let filtered = self.filtered_macros(&query);
+                    filtered
+                        .get(selected)
+                        .map(|(name, entry)| ((*name).to_string(), (*entry).clone()))
+                };
                 self.close_macro_bar();
+                if let Some((name, entry)) = selection {
+                    self.run_macro(name, entry);
+                }
             }
             KeyCode::Up => {
                 if let Some(bar) = &mut self.macro_bar {
@@ -1549,7 +1554,7 @@ impl App {
                     let query = bar.input.text.clone();
                     let selected = bar.selected;
                     let filtered = self.filtered_macros(&query);
-                    if let Some(&(name, _)) = filtered.get(selected) {
+                    if let Some((name, _)) = filtered.get(selected) {
                         let name = name.to_string();
                         if let Some(bar) = &mut self.macro_bar {
                             bar.input.set_text(name);
@@ -1568,6 +1573,267 @@ impl App {
             }
         }
         Ok(false)
+    }
+
+    /// Open the macro command bar. Reused by the interactive PTY byte path
+    /// and the non-interactive center-pane binding/palette command.
+    pub(crate) fn open_macro_bar(&mut self) -> Result<()> {
+        if self.selected_session().is_none() {
+            self.set_error("Select an agent session first.");
+            return Ok(());
+        }
+        if self.config.macros.entries.is_empty() {
+            self.set_info("No macros defined. Use edit-macros to create one.");
+            self.raw_input_buf.clear();
+            self.raw_input_parser.clear();
+            return Ok(());
+        }
+        let previous_input_target = self.input_target;
+        self.macro_bar = Some(MacroBarState {
+            input: TextInput::new(),
+            selected: 0,
+            previous_input_target,
+        });
+        self.input_target = InputTarget::None;
+        self.terminal_selection = None;
+        self.raw_input_buf.clear();
+        self.raw_input_parser.clear();
+        Ok(())
+    }
+
+    fn run_macro(&mut self, name: String, entry: crate::config::MacroEntry) {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select an agent session first.");
+            return;
+        };
+        let target = match entry.surface {
+            MacroSurface::Agent => SessionSurface::Agent,
+            MacroSurface::Terminal => SessionSurface::Terminal,
+            MacroSurface::Both => self.session_surface,
+        };
+        let payload = macro_payload_bytes(&entry.text, entry.submit);
+        match target {
+            SessionSurface::Agent => {
+                self.send_macro_to_agent(&session, &name, payload, entry.submit);
+            }
+            SessionSurface::Terminal => {
+                self.send_macro_to_terminal(&session, &name, payload, entry.submit);
+            }
+        }
+    }
+
+    fn send_macro_to_terminal(
+        &mut self,
+        session: &AgentSession,
+        macro_name: &str,
+        payload: Vec<u8>,
+        submit: bool,
+    ) {
+        let focus = self.config.ui.macro_focus_on_launch;
+        let session = session.clone();
+        let terminal_id = match self.ensure_terminal_for_session(&session, focus) {
+            Ok(id) => id,
+            Err(err) => {
+                self.set_error(format!(
+                    "Could not run macro \"{macro_name}\": failed to open a terminal for agent \"{}\": {err:#}",
+                    session.branch_name
+                ));
+                return;
+            }
+        };
+        let write_result = match self.companion_terminals.get(&terminal_id) {
+            Some(terminal) => terminal
+                .client
+                .write_bytes(&payload)
+                .map_err(|e| e.to_string()),
+            None => Err("companion terminal is no longer available".to_string()),
+        };
+        match write_result {
+            Ok(()) => {
+                self.record_macro_delivery(
+                    &session.id,
+                    Some(terminal_id),
+                    SessionSurface::Terminal,
+                    MacroDeliveryState::Sent,
+                );
+                let mut message = if submit {
+                    format!(
+                        "Sent macro \"{macro_name}\" to the terminal for agent \"{}\" and pressed Enter.",
+                        session.branch_name
+                    )
+                } else {
+                    format!(
+                        "Sent macro \"{macro_name}\" to the terminal for agent \"{}\".",
+                        session.branch_name
+                    )
+                };
+                message.push_str(&self.macro_view_hint(SessionSurface::Terminal));
+                self.set_info(message);
+            }
+            Err(err) => {
+                self.macro_deliveries.remove(&session.id);
+                self.set_error(format!(
+                    "Could not run macro \"{macro_name}\" in the terminal for agent \"{}\": {err}",
+                    session.branch_name
+                ));
+            }
+        }
+    }
+
+    fn send_macro_to_agent(
+        &mut self,
+        session: &AgentSession,
+        macro_name: &str,
+        payload: Vec<u8>,
+        submit: bool,
+    ) {
+        let focus = self.config.ui.macro_focus_on_launch;
+        let session = session.clone();
+
+        if self.providers.contains_key(&session.id) {
+            if focus {
+                self.focus_agent_surface_for_macro();
+            }
+            let write_result = match self.providers.get(&session.id) {
+                Some(provider) => provider.write_bytes(&payload).map_err(|e| e.to_string()),
+                None => Err("agent is no longer running".to_string()),
+            };
+            match write_result {
+                Ok(()) => {
+                    self.record_macro_delivery(
+                        &session.id,
+                        None,
+                        SessionSurface::Agent,
+                        MacroDeliveryState::Sent,
+                    );
+                    let mut message = if submit {
+                        format!(
+                            "Sent macro \"{macro_name}\" to agent \"{}\" and pressed Enter.",
+                            session.branch_name
+                        )
+                    } else {
+                        format!(
+                            "Sent macro \"{macro_name}\" to agent \"{}\".",
+                            session.branch_name
+                        )
+                    };
+                    message.push_str(&self.macro_view_hint(SessionSurface::Agent));
+                    self.set_info(message);
+                }
+                Err(err) => {
+                    self.macro_deliveries.remove(&session.id);
+                    self.set_error(format!(
+                        "Could not run macro \"{macro_name}\" in agent \"{}\": {err}",
+                        session.branch_name
+                    ));
+                }
+            }
+            return;
+        }
+
+        if !self.provider_is_available(&session.provider) {
+            self.set_error(format!(
+                "Could not run macro \"{macro_name}\": agent \"{}\" uses provider \"{}\", which isn't configured.",
+                session.branch_name,
+                session.provider.as_str()
+            ));
+            return;
+        }
+        if !Path::new(&session.worktree_path).exists() {
+            self.set_error(format!(
+                "Could not run macro \"{macro_name}\": the worktree for agent \"{}\" no longer exists.",
+                session.branch_name
+            ));
+            return;
+        }
+
+        self.pending_macro_sends.push(PendingMacroSend {
+            session_id: session.id.clone(),
+            macro_name: macro_name.to_string(),
+            payload,
+            submit,
+            focus_on_ready: focus,
+            queued_at: Instant::now(),
+            ready_at: None,
+        });
+        self.record_macro_delivery(
+            &session.id,
+            None,
+            SessionSurface::Agent,
+            MacroDeliveryState::Queued,
+        );
+
+        if self.agent_launches_in_flight.contains(&session.id) {
+            self.set_busy(format!(
+                "Agent \"{}\" is already starting. Macro \"{macro_name}\" will run when it is ready.",
+                session.branch_name
+            ));
+            return;
+        }
+
+        match self.launch_reconnect_for_session(session.clone(), focus) {
+            Ok(true) => {
+                self.set_busy(format!(
+                    "Launching agent \"{}\" to run macro \"{macro_name}\"...",
+                    session.branch_name
+                ));
+            }
+            Ok(false) => {
+                self.pending_macro_sends.pop();
+                self.macro_deliveries.remove(&session.id);
+                self.set_error(format!(
+                    "Could not run macro \"{macro_name}\": agent \"{}\" could not be launched.",
+                    session.branch_name
+                ));
+            }
+            Err(err) => {
+                self.pending_macro_sends.pop();
+                self.macro_deliveries.remove(&session.id);
+                self.set_error(format!(
+                    "Could not run macro \"{macro_name}\": failed to launch agent \"{}\": {err:#}",
+                    session.branch_name
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn focus_agent_surface_for_macro(&mut self) {
+        self.show_agent_surface();
+        self.input_target = InputTarget::Agent;
+        self.fullscreen_overlay = FullscreenOverlay::Agent;
+    }
+
+    pub(crate) fn macro_view_hint(&self, target: SessionSurface) -> String {
+        if self.session_surface == target {
+            return String::new();
+        }
+        let key = match target {
+            SessionSurface::Agent => self.bindings.label_for(Action::FocusAgent),
+            SessionSurface::Terminal => self.bindings.label_for(Action::ShowTerminal),
+        };
+        if key.is_empty() {
+            String::new()
+        } else {
+            format!(" Press {key} to view it.")
+        }
+    }
+
+    pub(crate) fn record_macro_delivery(
+        &mut self,
+        session_id: &str,
+        terminal_id: Option<String>,
+        target: SessionSurface,
+        state: MacroDeliveryState,
+    ) {
+        self.macro_deliveries.insert(
+            session_id.to_string(),
+            MacroDelivery {
+                terminal_id,
+                target,
+                state,
+                updated_at: Instant::now(),
+            },
+        );
     }
 
     fn close_macro_bar(&mut self) {
@@ -2139,21 +2405,12 @@ impl App {
                         continue;
                     }
                     if self.filtered_macros("").is_empty() {
-                        self.set_info("No macros defined for this surface.");
+                        self.set_info("No macros defined. Use edit-macros to create one.");
                         self.raw_input_buf.clear();
                         self.raw_input_parser.clear();
                         return Ok(false);
                     }
-                    let prev = self.input_target;
-                    self.macro_bar = Some(MacroBarState {
-                        input: TextInput::new(),
-                        selected: 0,
-                        previous_input_target: prev,
-                    });
-                    self.input_target = InputTarget::None;
-                    self.terminal_selection = None;
-                    self.raw_input_buf.clear();
-                    self.raw_input_parser.clear();
+                    self.open_macro_bar()?;
                     return Ok(false);
                 }
                 SeqAction::Intercept(Action::PasteSelectionToTerminal, _, _) => {
@@ -4037,6 +4294,10 @@ impl App {
         };
 
         if let Some(edit_state) = editing {
+            if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                edit_state.submit = !edit_state.submit;
+                return Ok(false);
+            }
             match edit_state.stage {
                 MacroEditStage::EditName => {
                     if key.code == KeyCode::Esc {
@@ -4054,7 +4315,8 @@ impl App {
                     if key.code == KeyCode::Enter && !edit_state.name_input.is_empty() {
                         let name = edit_state.name_input.text.clone();
                         // For new macros, check for duplicate names
-                        if edit_state.id.is_none() && entries.iter().any(|(n, _, _)| *n == name) {
+                        if edit_state.id.is_none() && entries.iter().any(|entry| entry.name == name)
+                        {
                             self.set_warning(format!(
                                 "Name \"{name}\" is already in use. Choose another."
                             ));
@@ -4071,6 +4333,7 @@ impl App {
                         let name = edit_state.name_input.text.clone();
                         let text = edit_state.text_input.text.clone();
                         let surface = edit_state.surface;
+                        let submit = edit_state.submit;
                         let old_id = edit_state.id.clone();
 
                         if text.is_empty() {
@@ -4092,6 +4355,7 @@ impl App {
                             crate::config::MacroEntry {
                                 text: text.clone(),
                                 surface,
+                                submit,
                             },
                         );
 
@@ -4107,18 +4371,29 @@ impl App {
                         // Update entries list
                         if let Some(old_name) = old_id {
                             if let Some(existing) =
-                                entries.iter_mut().find(|(n, _, _)| *n == old_name)
+                                entries.iter_mut().find(|entry| entry.name == old_name)
                             {
-                                existing.0 = name.clone();
-                                existing.1 = text;
-                                existing.2 = surface;
+                                existing.name = name.clone();
+                                existing.text = text;
+                                existing.surface = surface;
+                                existing.submit = submit;
                             } else {
-                                entries.push((name.clone(), text, surface));
+                                entries.push(MacroEditorEntry {
+                                    name: name.clone(),
+                                    text,
+                                    surface,
+                                    submit,
+                                });
                             }
                         } else {
-                            entries.push((name.clone(), text, surface));
+                            entries.push(MacroEditorEntry {
+                                name: name.clone(),
+                                text,
+                                surface,
+                                submit,
+                            });
                         }
-                        entries.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
+                        entries.sort_by(|a, b| a.name.cmp(&b.name));
 
                         // Persist
                         if let Err(err) = crate::config::save_config(
@@ -4156,15 +4431,17 @@ impl App {
             }
             KeyCode::Enter => {
                 // Edit selected macro
-                if let Some((name, text, surface)) = entries.get(*selected) {
-                    let name = name.clone();
-                    let text = text.clone();
-                    let surface = *surface;
+                if let Some(entry) = entries.get(*selected) {
+                    let name = entry.name.clone();
+                    let text = entry.text.clone();
+                    let surface = entry.surface;
+                    let submit = entry.submit;
                     *editing = Some(MacroEditState {
                         id: Some(name.clone()),
                         name_input: TextInput::with_text(name),
                         text_input: TextInput::with_text(text).with_multiline(8),
                         surface,
+                        submit,
                         stage: MacroEditStage::EditName,
                     });
                 }
@@ -4176,13 +4453,14 @@ impl App {
                     name_input: TextInput::new(),
                     text_input: TextInput::new().with_multiline(8),
                     surface: MacroSurface::default(),
+                    submit: false,
                     stage: MacroEditStage::EditName,
                 });
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 // Stage confirmation for deleting the selected macro.
-                if let Some((name, _, _)) = entries.get(*selected) {
-                    let name = name.clone();
+                if let Some(entry) = entries.get(*selected) {
+                    let name = entry.name.clone();
                     let PromptState::EditMacros { pending_delete, .. } = &mut self.prompt else {
                         return Ok(false);
                     };
@@ -4249,7 +4527,7 @@ impl App {
         else {
             return false;
         };
-        entries.retain(|(n, _, _)| n != &name);
+        entries.retain(|entry| entry.name != name);
         if *selected > 0 && *selected >= entries.len() {
             *selected = entries.len().saturating_sub(1);
         }
@@ -7381,12 +7659,13 @@ mod tests {
         CreateAgentBranchInspection, CreateAgentRequest, DeleteAgentFocus, DiffSelectionState,
         FocusPane, FullscreenOverlay, InputTarget, KillRunningAction, KillRunningFocus,
         KillRunningFooterAction, KillRunningPrompt, KillableRuntime, KillableRuntimeKind, LeftItem,
-        LeftSection, MacroBarState, MouseClickTarget, MouseLayoutState, NameNewAgentFocus,
-        NonDefaultBranchAction, OverlayCheckbox, OverlayCheckboxId, OverlayMouseLayout,
-        OverlayMouseLayoutState, PickProjectWorktreePrompt, ProcessInfo, ProjectWorktreeEntry,
-        PromptState, PullTarget, QueuedDiffComment, ResolvedPullRequest, ResourceStats,
-        RightSection, RuntimeTargetId, StartupCommandLogPrompt, TermGridPos, TerminalSelection,
-        TextInput, WatchedWorktree, WorkerEvent, WorktreeCleanupCandidate,
+        LeftSection, MacroBarState, MacroDeliveryState, MouseClickTarget, MouseLayoutState,
+        NameNewAgentFocus, NonDefaultBranchAction, OverlayCheckbox, OverlayCheckboxId,
+        OverlayMouseLayout, OverlayMouseLayoutState, PendingMacroSend, PickProjectWorktreePrompt,
+        ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget, QueuedDiffComment,
+        ResolvedPullRequest, ResourceStats, RightSection, RuntimeTargetId, StartupCommandLogPrompt,
+        TermGridPos, TerminalSelection, TextInput, WatchedWorktree, WorkerEvent,
+        WorktreeCleanupCandidate,
     };
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
@@ -7659,6 +7938,8 @@ mod tests {
             loading_input_buf: Vec::new(),
             in_bracket_paste: false,
             macro_bar: None,
+            macro_deliveries: std::collections::HashMap::new(),
+            pending_macro_sends: Vec::new(),
             sigwinch_flag: Arc::new(AtomicBool::new(false)),
             force_redraw: false,
             welcome_tip_index: 0,
@@ -12234,6 +12515,7 @@ cyan = "#00ffff"
             false,
             AgentLaunchKind::Reconnect {
                 status_message: "ignored".to_string(),
+                focus: true,
             },
         );
 
@@ -14458,6 +14740,7 @@ cyan = "#00ffff"
             crate::config::MacroEntry {
                 text: "hello".to_string(),
                 surface: crate::config::MacroSurface::Agent,
+                submit: false,
             },
         );
 
@@ -15509,6 +15792,7 @@ cyan = "#00ffff"
             crate::config::MacroEntry {
                 text: "hello".to_string(),
                 surface: crate::config::MacroSurface::Agent,
+                submit: false,
             },
         );
         app.config.macros.entries.insert(
@@ -15516,6 +15800,7 @@ cyan = "#00ffff"
             crate::config::MacroEntry {
                 text: "goodbye".to_string(),
                 surface: crate::config::MacroSurface::Agent,
+                submit: false,
             },
         );
         app.open_edit_macros();
@@ -15619,7 +15904,7 @@ cyan = "#00ffff"
 
         if let PromptState::EditMacros { entries, .. } = &app.prompt {
             assert!(
-                entries.iter().all(|(n, _, _)| n != "greet"),
+                entries.iter().all(|entry| entry.name != "greet"),
                 "EditMacros snapshot should reflect the deletion"
             );
         } else {
@@ -16058,6 +16343,480 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn macro_bar_lists_macros_for_both_targets() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "agent-one".to_string(),
+            crate::config::MacroEntry {
+                text: "agent text".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+        app.config.macros.entries.insert(
+            "term-one".to_string(),
+            crate::config::MacroEntry {
+                text: "terminal text".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+
+        app.session_surface = crate::model::SessionSurface::Agent;
+        let agent_names: Vec<&str> = app
+            .filtered_macros("")
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(agent_names, vec!["agent-one", "term-one"]);
+
+        app.session_surface = crate::model::SessionSurface::Terminal;
+        let terminal_names: Vec<&str> = app
+            .filtered_macros("")
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(terminal_names, vec!["agent-one", "term-one"]);
+    }
+
+    #[test]
+    fn terminal_macro_from_agent_surface_creates_terminal_in_background() {
+        let mut app = test_app(default_bindings());
+        app.config.terminal.command = "sh".to_string();
+        app.config.terminal.args =
+            vec!["-c".to_string(), "stty raw -echo; exec cat -v".to_string()];
+        app.input_target = InputTarget::Agent;
+        app.session_surface = crate::model::SessionSurface::Agent;
+        app.config.macros.entries.insert(
+            "term".to_string(),
+            crate::config::MacroEntry {
+                text: "hello-terminal".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+
+        app.open_macro_bar().expect("open macro bar");
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run macro");
+
+        assert_eq!(
+            app.companion_terminals.len(),
+            1,
+            "terminal should be created"
+        );
+        assert_eq!(
+            app.session_surface,
+            crate::model::SessionSurface::Agent,
+            "background delivery must not switch away from the agent pane"
+        );
+        let delivery = app
+            .macro_deliveries
+            .get("session-1")
+            .expect("delivery indicator");
+        assert_eq!(delivery.target, crate::model::SessionSurface::Terminal);
+        assert_eq!(delivery.state, MacroDeliveryState::Sent);
+        assert!(app.status.message().contains("to the terminal"));
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let terminal_id = app.active_terminal_id.clone().expect("active terminal");
+        let snapshot = app
+            .companion_terminals
+            .get(&terminal_id)
+            .expect("terminal")
+            .client
+            .snapshot();
+        let rendered: String = snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("hello-terminal"),
+            "terminal snapshot should contain macro text; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_macro_focuses_terminal_when_configured() {
+        let mut app = test_app(default_bindings());
+        app.config.terminal.command = "sh".to_string();
+        app.config.terminal.args =
+            vec!["-c".to_string(), "stty raw -echo; exec cat -v".to_string()];
+        app.config.ui.macro_focus_on_launch = true;
+        app.input_target = InputTarget::Agent;
+        app.session_surface = crate::model::SessionSurface::Agent;
+        app.config.macros.entries.insert(
+            "term".to_string(),
+            crate::config::MacroEntry {
+                text: "focus-me".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+
+        app.open_macro_bar().expect("open macro bar");
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run macro");
+
+        assert_eq!(
+            app.session_surface,
+            crate::model::SessionSurface::Terminal,
+            "focus_on_launch should switch to the created terminal"
+        );
+        assert_eq!(app.input_target, InputTarget::Terminal);
+    }
+
+    #[test]
+    fn macro_bar_opens_from_non_interactive_center() {
+        let mut app = test_app(default_bindings());
+        app.focus = FocusPane::Center;
+        app.input_target = InputTarget::None;
+        app.config.macros.entries.insert(
+            "term".to_string(),
+            crate::config::MacroEntry {
+                text: "hello".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+            .expect("open macro bar");
+
+        assert!(
+            app.macro_bar.is_some(),
+            "Center-scoped macro binding should open the bar without a live PTY"
+        );
+    }
+
+    #[test]
+    fn open_macro_bar_palette_command_opens_bar() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "agent".to_string(),
+            crate::config::MacroEntry {
+                text: "hello".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+
+        app.execute_command("open-macro-bar".to_string())
+            .expect("palette command");
+
+        assert!(app.macro_bar.is_some());
+    }
+
+    #[test]
+    fn agent_macro_from_terminal_surface_sends_to_agent_in_background() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id, client);
+        app.input_target = InputTarget::Terminal;
+        app.session_surface = crate::model::SessionSurface::Terminal;
+        app.config.macros.entries.insert(
+            "agent".to_string(),
+            crate::config::MacroEntry {
+                text: "hello-agent".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        app.open_macro_bar().expect("open macro bar");
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run macro");
+
+        assert_eq!(
+            app.session_surface,
+            crate::model::SessionSurface::Terminal,
+            "background delivery must not switch away from the terminal pane"
+        );
+        let delivery = app
+            .macro_deliveries
+            .get("session-1")
+            .expect("delivery indicator");
+        assert_eq!(delivery.target, crate::model::SessionSurface::Agent);
+        assert_eq!(delivery.state, MacroDeliveryState::Sent);
+        assert!(app.status.message().contains("to agent"));
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let provider = app.providers.values().next().expect("provider");
+        let snapshot = provider.snapshot();
+        let rendered: String = snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("hello-agent"),
+            "agent snapshot should contain macro text; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn agent_macro_queues_while_agent_is_launching() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        app.agent_launches_in_flight.insert(session_id);
+        app.input_target = InputTarget::Terminal;
+        app.session_surface = crate::model::SessionSurface::Terminal;
+        app.config.macros.entries.insert(
+            "agent".to_string(),
+            crate::config::MacroEntry {
+                text: "queued".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: true,
+            },
+        );
+
+        app.open_macro_bar().expect("open macro bar");
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run macro");
+
+        assert_eq!(app.pending_macro_sends.len(), 1);
+        assert_eq!(app.pending_macro_sends[0].macro_name, "agent");
+        assert!(app.pending_macro_sends[0].submit);
+        let delivery = app
+            .macro_deliveries
+            .get("session-1")
+            .expect("delivery indicator");
+        assert_eq!(delivery.state, MacroDeliveryState::Queued);
+        assert!(app.status.message().contains("already starting"));
+    }
+
+    #[test]
+    fn pending_macro_sends_after_agent_is_ready() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf ready; stty raw -echo; exec cat -v".to_string(),
+            ],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id.clone(), client);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(11);
+        app.pending_macro_sends.push(PendingMacroSend {
+            session_id,
+            macro_name: "queued".to_string(),
+            payload: b"queued-text\r".to_vec(),
+            submit: true,
+            focus_on_ready: false,
+            queued_at: old,
+            ready_at: Some(old),
+        });
+
+        app.flush_pending_macro_sends();
+
+        assert!(app.pending_macro_sends.is_empty());
+        let delivery = app
+            .macro_deliveries
+            .get("session-1")
+            .expect("delivery indicator");
+        assert_eq!(delivery.state, MacroDeliveryState::Sent);
+        assert!(app.status.message().contains("pressed Enter"));
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let provider = app.providers.values().next().expect("provider");
+        let snapshot = provider.snapshot();
+        let rendered: String = snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("queued-text"),
+            "agent snapshot should contain queued macro text; got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn pending_macro_fails_when_agent_disappears() {
+        let mut app = test_app(default_bindings());
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(11);
+        app.pending_macro_sends.push(PendingMacroSend {
+            session_id: "session-1".to_string(),
+            macro_name: "lost".to_string(),
+            payload: b"lost\r".to_vec(),
+            submit: true,
+            focus_on_ready: false,
+            queued_at: old,
+            ready_at: Some(old),
+        });
+
+        app.flush_pending_macro_sends();
+
+        assert!(app.pending_macro_sends.is_empty());
+        assert!(!app.macro_deliveries.contains_key("session-1"));
+        assert!(
+            app.status
+                .message()
+                .contains("Could not run macro \"lost\"")
+        );
+    }
+
+    #[test]
+    fn macro_editor_defaults_submit_to_false_and_persists_toggle() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.clear();
+        app.open_edit_macros();
+
+        // New macro
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .expect("new macro");
+        if let PromptState::EditMacros {
+            editing: Some(state),
+            ..
+        } = &app.prompt
+        {
+            assert!(!state.submit, "new macros default to no Enter");
+        } else {
+            panic!("expected macro editor");
+        }
+
+        for ch in "Run".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type name");
+        }
+        // Toggle in the name stage.
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("toggle submit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("next stage");
+        for ch in "do it".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type text");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("save macro");
+
+        assert!(
+            app.config.macros.entries["Run"].submit,
+            "editor should persist the submit flag"
+        );
+        if let PromptState::EditMacros { entries, .. } = &app.prompt {
+            assert!(entries[0].submit, "editor snapshot should retain submit");
+        } else {
+            panic!("expected macro editor after save");
+        }
+
+        // Re-open the saved macro and toggle it back off in the text stage.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("edit macro");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("next stage");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("toggle submit off");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("save macro");
+        assert!(!app.config.macros.entries["Run"].submit);
+    }
+
+    #[test]
+    fn pending_macro_fails_when_agent_never_becomes_ready() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "exec sleep 30".to_string()],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id.clone(), client);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(11);
+        app.pending_macro_sends.push(PendingMacroSend {
+            session_id,
+            macro_name: "slow".to_string(),
+            payload: b"slow\r".to_vec(),
+            submit: true,
+            focus_on_ready: false,
+            queued_at: old,
+            ready_at: Some(old),
+        });
+
+        app.flush_pending_macro_sends();
+
+        assert!(app.pending_macro_sends.is_empty());
+        assert!(app.status.message().contains("did not become ready"));
+    }
+
+    #[test]
+    fn macro_bar_enter_appends_enter_when_submit_enabled() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "stty raw -echo; exec cat -v".to_string()],
+            std::path::Path::new("."),
+            5,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id, client);
+        app.input_target = InputTarget::Agent;
+        app.session_surface = crate::model::SessionSurface::Agent;
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        app.config.macros.entries.insert(
+            "run".to_string(),
+            crate::config::MacroEntry {
+                text: "run-me".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: true,
+            },
+        );
+        app.macro_bar = Some(MacroBarState {
+            input: TextInput::new(),
+            selected: 0,
+            previous_input_target: InputTarget::Agent,
+        });
+
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("handle enter");
+        assert!(app.status.message().contains("pressed Enter"));
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let provider = app.providers.values().next().expect("provider");
+        let snapshot = provider.snapshot();
+        let rendered: String = snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(
+            rendered.contains("run-me^M"),
+            "cat -v should show the macro text followed by CR; got: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn macro_bar_enter_sends_text_without_bracket_paste_wrapping() {
         // Spawn a PTY running `cat -v` in raw mode. `-v` renders control
         // bytes as printable caret notation (`^[` for ESC), and raw mode
@@ -16089,6 +16848,7 @@ cyan = "#00ffff"
             crate::config::MacroEntry {
                 text: "hello-macro".to_string(),
                 surface: crate::config::MacroSurface::Agent,
+                submit: false,
             },
         );
 
@@ -16102,7 +16862,11 @@ cyan = "#00ffff"
             .expect("handle enter");
 
         assert!(app.macro_bar.is_none(), "macro bar closes after send");
-        assert_eq!(app.status.message(), "Sent macro \"greet\".");
+        let branch = app.sessions[0].branch_name.clone();
+        assert_eq!(
+            app.status.message(),
+            format!("Sent macro \"greet\" to agent \"{branch}\".")
+        );
 
         // Wait for cat to echo the bytes back into the embedded terminal.
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -16129,28 +16893,48 @@ cyan = "#00ffff"
         use crate::app::input::macro_payload_bytes;
 
         // Plain text with no newlines passes through byte-for-byte.
-        assert_eq!(macro_payload_bytes("hello").as_slice(), b"hello");
+        assert_eq!(macro_payload_bytes("hello", false).as_slice(), b"hello");
 
         // Bare LF (\n) becomes ESC + CR.
-        assert_eq!(macro_payload_bytes("a\nb").as_slice(), b"a\x1b\rb");
+        assert_eq!(macro_payload_bytes("a\nb", false).as_slice(), b"a\x1b\rb");
 
         // Bare CR (\r) becomes ESC + CR.
-        assert_eq!(macro_payload_bytes("a\rb").as_slice(), b"a\x1b\rb");
+        assert_eq!(macro_payload_bytes("a\rb", false).as_slice(), b"a\x1b\rb");
 
         // CRLF collapses to a single ESC + CR (not two).
-        assert_eq!(macro_payload_bytes("a\r\nb").as_slice(), b"a\x1b\rb");
+        assert_eq!(macro_payload_bytes("a\r\nb", false).as_slice(), b"a\x1b\rb");
 
         // Multiple newlines each become their own ESC + CR.
         assert_eq!(
-            macro_payload_bytes("a\nb\nc").as_slice(),
+            macro_payload_bytes("a\nb\nc", false).as_slice(),
             b"a\x1b\rb\x1b\rc"
         );
 
         // Trailing and leading newlines are also translated.
-        assert_eq!(macro_payload_bytes("\na\n").as_slice(), b"\x1b\ra\x1b\r");
+        assert_eq!(
+            macro_payload_bytes("\na\n", false).as_slice(),
+            b"\x1b\ra\x1b\r"
+        );
 
         // Empty input yields empty payload.
-        assert!(macro_payload_bytes("").is_empty());
+        assert!(macro_payload_bytes("", false).is_empty());
+    }
+
+    #[test]
+    fn macro_payload_appends_enter_when_submit_is_enabled() {
+        use crate::app::input::macro_payload_bytes;
+
+        // Plain text gets exactly one trailing CR.
+        assert_eq!(macro_payload_bytes("hello", true).as_slice(), b"hello\r");
+
+        // Multi-line text keeps Alt+Enter between lines, then submits once.
+        assert_eq!(macro_payload_bytes("a\nb", true).as_slice(), b"a\x1b\rb\r");
+
+        // A trailing newline becomes Alt+Enter followed by the submit CR.
+        assert_eq!(macro_payload_bytes("a\n", true).as_slice(), b"a\x1b\r\r");
+
+        // Empty text with submit still presses Enter.
+        assert_eq!(macro_payload_bytes("", true).as_slice(), b"\r");
     }
 
     #[test]
@@ -16183,6 +16967,7 @@ cyan = "#00ffff"
             crate::config::MacroEntry {
                 text: "first\nsecond".to_string(),
                 surface: crate::config::MacroSurface::Agent,
+                submit: false,
             },
         );
 
@@ -16195,7 +16980,11 @@ cyan = "#00ffff"
         app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("handle enter");
 
-        assert_eq!(app.status.message(), "Sent macro \"multi\".");
+        let branch = app.sessions[0].branch_name.clone();
+        assert_eq!(
+            app.status.message(),
+            format!("Sent macro \"multi\" to agent \"{branch}\".")
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(300));
 
