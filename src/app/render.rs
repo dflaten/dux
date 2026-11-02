@@ -6653,14 +6653,13 @@ impl App {
                     ])
                     .areas(inner);
 
-                const TARGET_COL: usize = 10; // longest target + submit marker + gap
                 let name_col = entries
                     .iter()
                     .map(|entry| display_width(&entry.name))
                     .max()
                     .unwrap_or(0)
                     .min(24);
-                let prefix_width = 1 + name_col + 2 + TARGET_COL;
+                let prefix_width = 1 + name_col + 2 + MACRO_TARGET_COL;
                 let description_width = (list_area.width as usize).saturating_sub(prefix_width);
 
                 let header = Line::from(vec![
@@ -6672,7 +6671,7 @@ impl App {
                     ),
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        pad_to_display_width("Target", TARGET_COL),
+                        pad_to_display_width("Target", MACRO_TARGET_COL),
                         Style::default()
                             .fg(self.theme.hint_dim_key_fg)
                             .add_modifier(Modifier::BOLD),
@@ -6690,11 +6689,7 @@ impl App {
                     .iter()
                     .map(|entry| {
                         let name = pad_to_display_width(&entry.name, name_col);
-                        let target = format!(
-                            "{:<8}{} ",
-                            entry.surface.short_label(),
-                            if entry.submit { "⏎" } else { " " }
-                        );
+                        let target = macro_target_cell(entry.surface, entry.submit);
                         let description = macro_description_line(&entry.description, &entry.text);
                         let has_description = !entry.description.trim().is_empty();
                         let mut spans = vec![
@@ -7236,14 +7231,13 @@ impl App {
         .render(separator_area, frame.buffer_mut());
 
         // Shared column geometry for the header and rows.
-        const TARGET_COL: usize = 10; // longest target + submit marker + gap
         let name_col = filtered
             .iter()
             .map(|(name, _)| display_width(name))
             .max()
             .unwrap_or(0)
             .min(24);
-        let prefix_width = 1 + name_col + 2 + TARGET_COL;
+        let prefix_width = 1 + name_col + 2 + MACRO_TARGET_COL;
         let description_width = (header_area.width as usize).saturating_sub(prefix_width);
 
         let header = Line::from(vec![
@@ -7255,7 +7249,7 @@ impl App {
             ),
             Span::styled("  ", Style::default()),
             Span::styled(
-                pad_to_display_width("Target", TARGET_COL),
+                pad_to_display_width("Target", MACRO_TARGET_COL),
                 Style::default()
                     .fg(self.theme.hint_dim_key_fg)
                     .add_modifier(Modifier::BOLD),
@@ -7290,14 +7284,14 @@ impl App {
                         ),
                         Span::styled("  ", Style::default()),
                         Span::styled(
-                            pad_to_display_width(entry.surface.short_label(), 8),
+                            macro_target_label(entry.surface),
                             Style::default().fg(self.theme.hint_key_fg),
                         ),
                         Span::styled(
-                            if entry.submit { "⏎" } else { " " },
+                            macro_submit_marker(entry.submit),
                             Style::default().fg(self.theme.status_busy_fg),
                         ),
-                        Span::styled(" ", Style::default()),
+                        Span::styled(" ".repeat(MACRO_TARGET_DESCRIPTION_GAP), Style::default()),
                     ];
                     if description_width > 0 {
                         let style = if has_description {
@@ -8088,6 +8082,37 @@ fn pad_to_display_width(text: &str, width: usize) -> String {
     format!("{clipped}{}", " ".repeat(padding))
 }
 
+/// Width of the longest macro surface label (`terminal`).
+const MACRO_TARGET_LABEL_WIDTH: usize = 8;
+/// Blank columns between the target column and the description. The extra
+/// space keeps the optional submit marker (`⏎`) from crowding the description.
+const MACRO_TARGET_DESCRIPTION_GAP: usize = 3;
+/// Total width reserved for the target column, including the submit marker and
+/// the gap before the description.
+const MACRO_TARGET_COL: usize = MACRO_TARGET_LABEL_WIDTH + 1 + MACRO_TARGET_DESCRIPTION_GAP;
+
+/// Padded target label shared by the macro editor and the macro bar so both
+/// tables line up.
+fn macro_target_label(surface: MacroSurface) -> String {
+    pad_to_display_width(surface.short_label(), MACRO_TARGET_LABEL_WIDTH)
+}
+
+/// The optional marker shown when a macro presses Enter after sending.
+fn macro_submit_marker(submit: bool) -> &'static str {
+    if submit { "⏎" } else { " " }
+}
+
+/// Full target cell for a macro row, including the padded label, submit
+/// marker, and the gap before the description column.
+fn macro_target_cell(surface: MacroSurface, submit: bool) -> String {
+    format!(
+        "{}{}{}",
+        macro_target_label(surface),
+        macro_submit_marker(submit),
+        " ".repeat(MACRO_TARGET_DESCRIPTION_GAP)
+    )
+}
+
 /// The short line shown beside a macro name. Falls back to a one-line text
 /// preview for macros configured before descriptions were introduced.
 fn macro_description_line(description: &str, text: &str) -> String {
@@ -8754,6 +8779,24 @@ mod tests {
 
         let padded = pad_to_display_width("日本", 4);
         assert_eq!(display_width(&padded), 4);
+    }
+
+    #[test]
+    fn macro_target_cell_keeps_space_before_description() {
+        for surface in [
+            MacroSurface::Agent,
+            MacroSurface::Terminal,
+            MacroSurface::Both,
+        ] {
+            for submit in [false, true] {
+                let cell = macro_target_cell(surface, submit);
+
+                assert_eq!(display_width(&cell), MACRO_TARGET_COL);
+            }
+
+            // The submit marker must not touch the description column.
+            assert!(macro_target_cell(surface, true).ends_with("   "));
+        }
     }
 
     #[test]
