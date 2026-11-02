@@ -1527,12 +1527,6 @@ impl App {
             }
         }
 
-        // Macro bar overlays the hint area when active.
-        if self.macro_bar.is_some() {
-            self.render_macro_bar(frame, inner);
-            return;
-        }
-
         // Hint bar with top border.
         if hint_area.height > 0 {
             // Pre-compute all key labels so they outlive the Span borrows.
@@ -6386,7 +6380,7 @@ impl App {
 
         // Pre-compute the popup layout so we can set the display width for
         // soft-wrapping before taking the immutable borrow on self.prompt.
-        let popup = centered_rect_exact(72, 20, frame.area());
+        let popup = centered_rect_exact(80, 24, frame.area());
         {
             // Temporarily borrow prompt mutably to set the text input's
             // viewport to match the available inner area after all borders,
@@ -6395,7 +6389,7 @@ impl App {
                 editing: Some(edit_state),
                 ..
             } = &mut self.prompt
-                && edit_state.stage == MacroEditStage::EditText
+                && edit_state.stage == MacroEditStage::Text
             {
                 sync_macro_text_input_layout(&mut edit_state.text_input, popup);
             }
@@ -6425,10 +6419,10 @@ impl App {
             outer.render(popup, frame.buffer_mut());
 
             match edit_state.stage {
-                MacroEditStage::EditName => {
+                MacroEditStage::Name => {
                     let [
-                        label_area,
-                        input_area,
+                        name_label_area,
+                        name_input_area,
                         _,
                         surface_area,
                         submit_area,
@@ -6451,9 +6445,9 @@ impl App {
                         " Name (identifies this macro):",
                         Style::default().fg(self.theme.input_label_fg),
                     )))
-                    .render(label_area, frame.buffer_mut());
+                    .render(name_label_area, frame.buffer_mut());
 
-                    self.render_single_line_input(&edit_state.name_input, input_area, frame);
+                    self.render_single_line_input(&edit_state.name_input, name_input_area, frame);
 
                     // Destination radio buttons
                     let current = edit_state.surface;
@@ -6505,7 +6499,68 @@ impl App {
                     ]);
                     Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
                 }
-                MacroEditStage::EditText => {
+                MacroEditStage::Description => {
+                    let [
+                        label_area,
+                        input_area,
+                        help_area,
+                        summary_area,
+                        _,
+                        hint_area,
+                    ] = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1),
+                            Constraint::Length(3),
+                            Constraint::Length(1),
+                            Constraint::Length(1),
+                            Constraint::Min(1),
+                            Constraint::Length(1),
+                        ])
+                        .areas(inner);
+
+                    Paragraph::new(Line::from(Span::styled(
+                        " Description (optional, shown in the macro list):",
+                        Style::default().fg(self.theme.input_label_fg),
+                    )))
+                    .render(label_area, frame.buffer_mut());
+
+                    self.render_single_line_input(&edit_state.description_input, input_area, frame);
+
+                    Paragraph::new(Line::from(Span::styled(
+                        " Keep it short. This is what the macro bar shows so you can pick the right one.",
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    )))
+                    .render(help_area, frame.buffer_mut());
+
+                    let submit_marker = if edit_state.submit { "[x]" } else { "[ ]" };
+                    let submit_style = if edit_state.submit {
+                        Style::default().fg(self.theme.status_busy_fg)
+                    } else {
+                        Style::default().fg(self.theme.hint_desc_fg)
+                    };
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(" Target: ", Style::default().fg(self.theme.input_label_fg)),
+                        Span::styled(
+                            edit_state.surface.short_label(),
+                            Style::default().fg(self.theme.hint_desc_fg),
+                        ),
+                        Span::styled(
+                            "    Enter after sending: ",
+                            Style::default().fg(self.theme.input_label_fg),
+                        ),
+                        Span::styled(submit_marker, submit_style),
+                    ]))
+                    .render(summary_area, frame.buffer_mut());
+
+                    let hints = self.edit_macro_hints(&[
+                        ("Enter", "next"),
+                        ("Ctrl-R", "auto-Enter"),
+                        ("Esc", "back"),
+                    ]);
+                    Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+                }
+                MacroEditStage::Text => {
                     let [label_area, bordered_area, submit_area, hint_area] = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
@@ -6562,7 +6617,8 @@ impl App {
             }
         } else {
             // ── List view ──
-            let outer = self.themed_overlay_block("Text Macros");
+            let title = format!(" Text Macros · {} ", entries.len());
+            let outer = self.themed_overlay_block(&title);
             let inner = outer.inner(popup);
             outer.render(popup, frame.buffer_mut());
 
@@ -6588,44 +6644,74 @@ impl App {
                 let hints = self.edit_macro_hints(&[("n", "new"), ("Esc", "close")]);
                 Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
             } else {
-                let [list_area, hint_area] = Layout::default()
+                let [header_area, list_area, hint_area] = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
                     .areas(inner);
+
+                const TARGET_COL: usize = 10; // longest target + submit marker + gap
+                let name_col = entries
+                    .iter()
+                    .map(|entry| display_width(&entry.name))
+                    .max()
+                    .unwrap_or(0)
+                    .min(24);
+                let prefix_width = 1 + name_col + 2 + TARGET_COL;
+                let description_width = (list_area.width as usize).saturating_sub(prefix_width);
+
+                let header = Line::from(vec![
+                    Span::styled(
+                        format!(" {}", pad_to_display_width("Name", name_col)),
+                        Style::default()
+                            .fg(self.theme.hint_dim_desc_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        pad_to_display_width("Target", TARGET_COL),
+                        Style::default()
+                            .fg(self.theme.hint_dim_desc_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_to_width("Description", description_width),
+                        Style::default()
+                            .fg(self.theme.hint_dim_desc_fg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                Paragraph::new(header).render(header_area, frame.buffer_mut());
 
                 let items: Vec<ListItem> = entries
                     .iter()
                     .map(|entry| {
-                        let surface_label = format!(" ({})", entry.surface.label());
-                        let submit_label = if entry.submit { " ⏎" } else { "" };
+                        let name = pad_to_display_width(&entry.name, name_col);
+                        let target = format!(
+                            "{:<8}{} ",
+                            entry.surface.short_label(),
+                            if entry.submit { "⏎" } else { " " }
+                        );
+                        let description = macro_description_line(&entry.description, &entry.text);
                         let mut spans = vec![
                             Span::styled(
-                                format!(" {}", entry.name),
-                                Style::default().fg(self.theme.input_label_fg),
+                                format!(" {name}"),
+                                Style::default()
+                                    .fg(self.theme.input_label_fg)
+                                    .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                format!("{surface_label}{submit_label}"),
-                                Style::default().fg(self.theme.hint_dim_desc_fg),
-                            ),
-                            Span::styled(" — ", Style::default().fg(self.theme.input_label_fg)),
+                            Span::styled("  ", Style::default()),
+                            Span::styled(target, Style::default().fg(self.theme.provider_label_fg)),
                         ];
-                        let text_preview = entry.text.replace('\n', "↵");
-                        // " " + name + " (label)" + submit marker + " — "
-                        let prefix_len = 1
-                            + display_width(&entry.name)
-                            + display_width(&surface_label)
-                            + display_width(submit_label)
-                            + 3;
-                        let max_len = (list_area.width as usize).saturating_sub(prefix_len + 2);
-                        let truncated = if display_width(&text_preview) > max_len {
-                            truncate_to_width(&text_preview, max_len)
-                        } else {
-                            text_preview
-                        };
-                        spans.push(Span::styled(
-                            truncated,
-                            Style::default().fg(self.theme.hint_desc_fg),
-                        ));
+                        if description_width > 0 {
+                            spans.push(Span::styled(
+                                truncate_to_width(&description, description_width),
+                                Style::default().fg(self.theme.hint_desc_fg),
+                            ));
+                        }
                         ListItem::new(Line::from(spans))
                     })
                     .collect();
@@ -6827,6 +6913,10 @@ impl App {
                 return;
             }
             FullscreenOverlay::None => {}
+        }
+        if self.macro_bar.is_some() {
+            self.render_macro_bar(frame);
+            return;
         }
         if !matches!(self.prompt, PromptState::None) {
             self.render_prompt(frame);
@@ -7055,7 +7145,7 @@ impl App {
         }
     }
 
-    fn render_macro_bar(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_macro_bar(&mut self, frame: &mut Frame) {
         let (query, selected, cursor, cursor_fg, cursor_bg) = {
             let Some(bar) = &self.macro_bar else {
                 return;
@@ -7070,35 +7160,20 @@ impl App {
         };
 
         let filtered = self.filtered_macros(&query);
-
-        // Compute total height: input block (3) + list block (variable).
-        // The list block shares borders with the input block (no top border).
-        let list_content_h = (filtered.len() as u16).clamp(1, 8);
-        // list block = content + bottom border (1). Left/right borders are sides.
-        let list_block_h = list_content_h + 1; // +1 for bottom border
-        let input_block_h: u16 = 3; // top border + input + bottom border (shared with list top)
-        let total_h = (input_block_h + list_block_h).min(area.height);
-
-        if area.height < 4 {
+        let area = frame.area();
+        if area.width < 20 || area.height < 8 {
             return;
         }
 
-        // Bottom-anchor the bar.
-        let bar_area = Rect::new(
-            area.x,
-            area.y + area.height.saturating_sub(total_h),
-            area.width,
-            total_h,
-        );
+        // One popup: input row, divider, column header, list, and a border.
+        let list_rows = (filtered.len() as u16).clamp(1, 10);
+        let width = area.width.saturating_sub(4).clamp(20, 84);
+        let height = (list_rows + 5).min(area.height);
+        let bar_area = centered_rect_exact(width, height, area);
+
+        self.render_dim_overlay(frame);
         self.clear_overlay_area(frame, bar_area);
 
-        // Split into input area (top) and list area (bottom).
-        let [input_area, list_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(input_block_h), Constraint::Min(1)])
-            .areas(bar_area);
-
-        // ── Input block (top, with title and hint badges) ──
         let mut bottom_spans = vec![Span::raw(" ")];
         for (key, desc) in &[("Enter", "send"), ("Tab", "complete"), ("Esc", "cancel")] {
             let badge = self.theme.key_badge_default(key);
@@ -7113,99 +7188,133 @@ impl App {
             ));
         }
 
-        let input_block = self
-            .themed_overlay_block("Macros")
+        let title = format!(" Macros · {} ", filtered.len());
+        let block = self
+            .themed_overlay_block(&title)
             .title_bottom(Line::from(bottom_spans));
-        let input_inner = input_block.inner(input_area);
+        let inner = block.inner(bar_area);
+        block.render(bar_area, frame.buffer_mut());
+
+        let [input_area, separator_area, header_area, list_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .areas(inner);
+
+        // Search input.
+        let input_prefix = "› ";
         Paragraph::new(render_single_line_cursor_input(
-            "", &query, cursor, cursor_fg, cursor_bg,
+            input_prefix,
+            &query,
+            cursor,
+            cursor_fg,
+            cursor_bg,
         ))
-        .block(input_block)
         .render(input_area, frame.buffer_mut());
 
-        // Place hardware cursor inside the input.
-        let cursor_col = query[..cursor].chars().count();
-        let cx = input_inner.x + cursor_col as u16;
-        let cy = input_inner.y;
-        if cx < input_inner.x + input_inner.width && cy < input_inner.y + input_inner.height {
+        let cursor_col = input_prefix.chars().count() + query[..cursor].chars().count();
+        let cx = input_area.x + cursor_col as u16;
+        let cy = input_area.y;
+        if cx < input_area.x + input_area.width && cy < input_area.y + input_area.height {
             frame.set_cursor_position((cx, cy));
         }
 
-        // ── List block (bottom, connected borders) ──
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(separator_area.width as usize),
+            Style::default().fg(self.theme.overlay_border),
+        )))
+        .render(separator_area, frame.buffer_mut());
+
+        // Shared column geometry for the header and rows.
+        const TARGET_COL: usize = 10; // longest target + submit marker + gap
         let name_col = filtered
             .iter()
-            .map(|&(name, _)| display_width(name))
+            .map(|(name, _)| display_width(name))
             .max()
-            .unwrap_or(0);
-        let inner_w = list_area.width.saturating_sub(3) as usize; // borders + padding
-        let target_col = 6usize;
-        let prefix_len = name_col + 2 + target_col + 1 + 2;
+            .unwrap_or(0)
+            .min(24);
+        let prefix_width = 1 + name_col + 2 + TARGET_COL;
+        let description_width = (header_area.width as usize).saturating_sub(prefix_width);
+
+        let header = Line::from(vec![
+            Span::styled(
+                format!(" {}", pad_to_display_width("Name", name_col)),
+                Style::default()
+                    .fg(self.theme.hint_dim_desc_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                pad_to_display_width("Target", TARGET_COL),
+                Style::default()
+                    .fg(self.theme.hint_dim_desc_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_to_width("Description", description_width),
+                Style::default()
+                    .fg(self.theme.hint_dim_desc_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        Paragraph::new(header).render(header_area, frame.buffer_mut());
 
         let items: Vec<ListItem> = if filtered.is_empty() {
-            let msg = "No matching macros.";
-            vec![ListItem::new(Span::styled(
-                msg,
+            vec![ListItem::new(Line::from(Span::styled(
+                " No matching macros.",
                 Style::default().fg(self.theme.hint_desc_fg),
-            ))]
+            )))]
         } else {
             filtered
                 .iter()
                 .map(|&(name, entry)| {
-                    let name_padded = format!(
-                        "{name}{}",
-                        " ".repeat(name_col.saturating_sub(display_width(name)))
-                    );
-                    let mut spans = vec![Span::styled(
-                        name_padded,
-                        Style::default()
-                            .fg(self.theme.help_section_header_fg)
-                            .add_modifier(Modifier::BOLD),
-                    )];
-                    let target = match entry.surface {
-                        MacroSurface::Agent => "agent",
-                        MacroSurface::Terminal => "term",
-                        MacroSurface::Both => "active",
-                    };
-                    spans.push(Span::styled(
-                        format!("  {target:<target_col$}"),
-                        Style::default().fg(self.theme.provider_label_fg),
-                    ));
-                    spans.push(Span::styled(
-                        if entry.submit { "⏎" } else { " " },
-                        Style::default().fg(self.theme.status_busy_fg),
-                    ));
-                    let text_preview = entry.text.replace('\n', "↵");
-                    let desc_avail = inner_w.saturating_sub(prefix_len);
-                    let desc_display = if display_width(&text_preview) > desc_avail {
-                        format!("  {}", truncate_to_width(&text_preview, desc_avail))
-                    } else {
-                        format!(
-                            "  {text_preview}{}",
-                            " ".repeat(desc_avail.saturating_sub(display_width(&text_preview)))
-                        )
-                    };
-                    spans.push(Span::styled(
-                        desc_display,
-                        Style::default().fg(self.theme.hint_desc_fg),
-                    ));
+                    let name = pad_to_display_width(name, name_col);
+                    let description = macro_description_line(&entry.description, &entry.text);
+                    let has_description = !entry.description.trim().is_empty();
+                    let mut spans = vec![
+                        Span::styled(
+                            format!(" {name}"),
+                            Style::default()
+                                .fg(self.theme.help_section_header_fg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(
+                            pad_to_display_width(entry.surface.short_label(), 8),
+                            Style::default().fg(self.theme.provider_label_fg),
+                        ),
+                        Span::styled(
+                            if entry.submit { "⏎" } else { " " },
+                            Style::default().fg(self.theme.status_busy_fg),
+                        ),
+                        Span::styled(" ", Style::default()),
+                    ];
+                    if description_width > 0 {
+                        let style = if has_description {
+                            Style::default().fg(self.theme.hint_desc_fg)
+                        } else {
+                            Style::default().fg(self.theme.hint_dim_desc_fg)
+                        };
+                        spans.push(Span::styled(
+                            truncate_to_width(&description, description_width),
+                            style,
+                        ));
+                    }
                     ListItem::new(Line::from(spans))
                 })
                 .collect()
         };
 
-        let list_block = Block::default()
-            .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(self.theme.overlay_border))
-            .style(Style::default().bg(self.theme.overlay_bg));
         let mut list_state = ListState::default();
         if !filtered.is_empty() {
             list_state.select(Some(selected));
         }
         StatefulWidget::render(
-            List::new(items)
-                .block(list_block)
-                .highlight_style(self.theme.selection_style()),
+            List::new(items).highlight_style(self.theme.selection_style()),
             list_area,
             frame.buffer_mut(),
             &mut list_state,
@@ -7965,6 +8074,25 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Pad `text` with spaces to exactly `width` display columns. Text that is
+/// wider than the column is truncated with an ellipsis.
+fn pad_to_display_width(text: &str, width: usize) -> String {
+    let clipped = truncate_to_width(text, width);
+    let padding = width.saturating_sub(display_width(&clipped));
+    format!("{clipped}{}", " ".repeat(padding))
+}
+
+/// The short line shown beside a macro name. Falls back to a one-line text
+/// preview for macros configured before descriptions were introduced.
+fn macro_description_line(description: &str, text: &str) -> String {
+    let description = description.trim();
+    if description.is_empty() {
+        text.replace('\n', "↵")
+    } else {
+        description.replace('\n', " ")
+    }
+}
+
 fn truncate_to_width(text: &str, max_width: usize) -> String {
     if display_width(text) <= max_width {
         return text.to_string();
@@ -8611,6 +8739,36 @@ mod tests {
 
         assert_eq!(result, "ab…");
         assert!(display_width(&result) <= 4);
+    }
+
+    #[test]
+    fn pad_to_display_width_pads_and_truncates() {
+        assert_eq!(pad_to_display_width("abc", 6), "abc   ");
+        assert_eq!(pad_to_display_width("abcdef", 4), "abc…");
+
+        let padded = pad_to_display_width("日本", 4);
+        assert_eq!(display_width(&padded), 4);
+    }
+
+    #[test]
+    fn macro_description_line_prefers_description() {
+        assert_eq!(
+            macro_description_line("Review the diff", "some long text"),
+            "Review the diff"
+        );
+        assert_eq!(
+            macro_description_line("  Review\nthe diff  ", "unused"),
+            "Review the diff"
+        );
+    }
+
+    #[test]
+    fn macro_description_line_falls_back_to_text_preview() {
+        assert_eq!(
+            macro_description_line("", "first line\nsecond line"),
+            "first line↵second line"
+        );
+        assert_eq!(macro_description_line("   ", "prompt text"), "prompt text");
     }
 
     #[test]

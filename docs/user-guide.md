@@ -112,10 +112,12 @@ Tired of typing the same prompt over and over? Turn it into a macro. Macros are 
 
 ```toml
 [macros]
-"Review" = { text = "review this code for bugs and security issues", surface = "agent", submit = true }
-"Build" = { text = "cargo build --release 2>&1", surface = "terminal" }
-"Ship it" = { text = "run all tests, fix failures, then commit", surface = "both", submit = true }
+"Review" = { text = "review this code for bugs and security issues", description = "Hunt for bugs in the current diff", surface = "agent", submit = true }
+"Build" = { text = "cargo build --release 2>&1", description = "Compile the release binary", surface = "terminal" }
+"Ship it" = { text = "run all tests, fix failures, then commit", description = "Test, fix, and commit", surface = "both", submit = true }
 ```
+
+`description` is an optional one-line summary shown beside the macro name in the macro bar and editor. It makes a long list scannable; macros without one fall back to a preview of their text.
 
 `surface = "agent"` always sends to the agent, `surface = "terminal"` always sends to a companion terminal, and `surface = "both"` sends to whichever pane is active when the macro runs. Set `submit = true` to press Enter after sending so the prompt or command runs immediately; leave it out to inspect or edit the text before submitting.
 

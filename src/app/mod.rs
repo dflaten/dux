@@ -1174,6 +1174,7 @@ pub(crate) struct MacroBarState {
 pub(crate) struct MacroEditState {
     pub(crate) id: Option<String>,
     pub(crate) name_input: TextInput,
+    pub(crate) description_input: TextInput,
     pub(crate) text_input: TextInput,
     pub(crate) surface: MacroSurface,
     pub(crate) submit: bool,
@@ -1183,6 +1184,7 @@ pub(crate) struct MacroEditState {
 #[derive(Clone, Debug)]
 pub(crate) struct MacroEditorEntry {
     pub(crate) name: String,
+    pub(crate) description: String,
     pub(crate) text: String,
     pub(crate) surface: MacroSurface,
     pub(crate) submit: bool,
@@ -1215,8 +1217,9 @@ pub(crate) struct MacroDelivery {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MacroEditStage {
-    EditName,
-    EditText,
+    Name,
+    Description,
+    Text,
 }
 
 #[derive(Clone, Debug)]
@@ -2827,6 +2830,7 @@ impl App {
             .iter()
             .map(|(k, v)| MacroEditorEntry {
                 name: k.clone(),
+                description: v.description.clone(),
                 text: v.text.clone(),
                 surface: v.surface,
                 submit: v.submit,
@@ -2841,9 +2845,10 @@ impl App {
         };
     }
 
-    /// Return every macro matching `query`, searching name first then text
-    /// content in config declaration order. `surface` is a routing target, so
-    /// the active pane does not filter the list.
+    /// Return every macro matching `query`, searching name first, then the
+    /// short description, then the full text in config declaration order.
+    /// `surface` is a routing target, so the active pane does not filter the
+    /// list.
     pub(crate) fn filtered_macros(&self, query: &str) -> Vec<(&str, &crate::config::MacroEntry)> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -2856,14 +2861,18 @@ impl App {
                 .collect();
         }
         let mut name_matches = Vec::new();
+        let mut description_matches = Vec::new();
         let mut text_matches = Vec::new();
         for (name, entry) in &self.config.macros.entries {
             if name.to_lowercase().contains(&needle) {
                 name_matches.push((name.as_str(), entry));
+            } else if entry.description.to_lowercase().contains(&needle) {
+                description_matches.push((name.as_str(), entry));
             } else if entry.text.to_lowercase().contains(&needle) {
                 text_matches.push((name.as_str(), entry));
             }
         }
+        name_matches.extend(description_matches);
         name_matches.extend(text_matches);
         name_matches
     }

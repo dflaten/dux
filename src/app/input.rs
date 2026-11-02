@@ -4299,7 +4299,7 @@ impl App {
                 return Ok(false);
             }
             match edit_state.stage {
-                MacroEditStage::EditName => {
+                MacroEditStage::Name => {
                     if key.code == KeyCode::Esc {
                         *editing = None;
                         return Ok(false);
@@ -4322,15 +4322,27 @@ impl App {
                             ));
                             return Ok(false);
                         }
-                        edit_state.stage = MacroEditStage::EditText;
+                        edit_state.stage = MacroEditStage::Description;
                         return Ok(false);
                     }
                     edit_state.name_input.handle_key(key);
                 }
-                MacroEditStage::EditText => {
+                MacroEditStage::Description => {
+                    if key.code == KeyCode::Esc {
+                        edit_state.stage = MacroEditStage::Name;
+                        return Ok(false);
+                    }
+                    if key.code == KeyCode::Enter {
+                        edit_state.stage = MacroEditStage::Text;
+                        return Ok(false);
+                    }
+                    edit_state.description_input.handle_key(key);
+                }
+                MacroEditStage::Text => {
                     if key.code == KeyCode::Esc {
                         // Save the macro
                         let name = edit_state.name_input.text.clone();
+                        let description = edit_state.description_input.text.trim().to_string();
                         let text = edit_state.text_input.text.clone();
                         let surface = edit_state.surface;
                         let submit = edit_state.submit;
@@ -4354,6 +4366,7 @@ impl App {
                             name.clone(),
                             crate::config::MacroEntry {
                                 text: text.clone(),
+                                description: description.clone(),
                                 surface,
                                 submit,
                             },
@@ -4374,12 +4387,14 @@ impl App {
                                 entries.iter_mut().find(|entry| entry.name == old_name)
                             {
                                 existing.name = name.clone();
+                                existing.description = description;
                                 existing.text = text;
                                 existing.surface = surface;
                                 existing.submit = submit;
                             } else {
                                 entries.push(MacroEditorEntry {
                                     name: name.clone(),
+                                    description,
                                     text,
                                     surface,
                                     submit,
@@ -4388,6 +4403,7 @@ impl App {
                         } else {
                             entries.push(MacroEditorEntry {
                                 name: name.clone(),
+                                description,
                                 text,
                                 surface,
                                 submit,
@@ -4433,16 +4449,18 @@ impl App {
                 // Edit selected macro
                 if let Some(entry) = entries.get(*selected) {
                     let name = entry.name.clone();
+                    let description = entry.description.clone();
                     let text = entry.text.clone();
                     let surface = entry.surface;
                     let submit = entry.submit;
                     *editing = Some(MacroEditState {
                         id: Some(name.clone()),
                         name_input: TextInput::with_text(name),
+                        description_input: TextInput::with_text(description),
                         text_input: TextInput::with_text(text).with_multiline(8),
                         surface,
                         submit,
-                        stage: MacroEditStage::EditName,
+                        stage: MacroEditStage::Name,
                     });
                 }
             }
@@ -4451,10 +4469,11 @@ impl App {
                 *editing = Some(MacroEditState {
                     id: None,
                     name_input: TextInput::new(),
+                    description_input: TextInput::new(),
                     text_input: TextInput::new().with_multiline(8),
                     surface: MacroSurface::default(),
                     submit: false,
-                    stage: MacroEditStage::EditName,
+                    stage: MacroEditStage::Name,
                 });
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -14739,6 +14758,7 @@ cyan = "#00ffff"
             "test".to_string(),
             crate::config::MacroEntry {
                 text: "hello".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -15791,6 +15811,7 @@ cyan = "#00ffff"
             "greet".to_string(),
             crate::config::MacroEntry {
                 text: "hello".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -15799,6 +15820,7 @@ cyan = "#00ffff"
             "farewell".to_string(),
             crate::config::MacroEntry {
                 text: "goodbye".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -16343,12 +16365,47 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn filtered_macros_matches_description_before_text() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "description-hit".to_string(),
+            crate::config::MacroEntry {
+                text: "unrelated body".to_string(),
+                description: "runs the checks".to_string(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+        app.config.macros.entries.insert(
+            "text-hit".to_string(),
+            crate::config::MacroEntry {
+                text: "runs the checks".to_string(),
+                description: String::new(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+
+        let names: Vec<&str> = app
+            .filtered_macros("checks")
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["description-hit", "text-hit"],
+            "description matches should rank above text-only matches"
+        );
+    }
+
+    #[test]
     fn macro_bar_lists_macros_for_both_targets() {
         let mut app = test_app(default_bindings());
         app.config.macros.entries.insert(
             "agent-one".to_string(),
             crate::config::MacroEntry {
                 text: "agent text".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -16357,6 +16414,7 @@ cyan = "#00ffff"
             "term-one".to_string(),
             crate::config::MacroEntry {
                 text: "terminal text".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Terminal,
                 submit: false,
             },
@@ -16391,6 +16449,7 @@ cyan = "#00ffff"
             "term".to_string(),
             crate::config::MacroEntry {
                 text: "hello-terminal".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Terminal,
                 submit: false,
             },
@@ -16450,6 +16509,7 @@ cyan = "#00ffff"
             "term".to_string(),
             crate::config::MacroEntry {
                 text: "focus-me".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Terminal,
                 submit: false,
             },
@@ -16476,6 +16536,7 @@ cyan = "#00ffff"
             "term".to_string(),
             crate::config::MacroEntry {
                 text: "hello".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Terminal,
                 submit: false,
             },
@@ -16497,6 +16558,7 @@ cyan = "#00ffff"
             "agent".to_string(),
             crate::config::MacroEntry {
                 text: "hello".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -16528,6 +16590,7 @@ cyan = "#00ffff"
             "agent".to_string(),
             crate::config::MacroEntry {
                 text: "hello-agent".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -16576,6 +16639,7 @@ cyan = "#00ffff"
             "agent".to_string(),
             crate::config::MacroEntry {
                 text: "queued".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: true,
             },
@@ -16703,6 +16767,12 @@ cyan = "#00ffff"
             .expect("toggle submit");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("next stage");
+        for ch in "runs the build".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .expect("type description");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("next stage");
         for ch in "do it".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .expect("type text");
@@ -16714,8 +16784,16 @@ cyan = "#00ffff"
             app.config.macros.entries["Run"].submit,
             "editor should persist the submit flag"
         );
+        assert_eq!(
+            app.config.macros.entries["Run"].description, "runs the build",
+            "editor should persist the description"
+        );
         if let PromptState::EditMacros { entries, .. } = &app.prompt {
             assert!(entries[0].submit, "editor snapshot should retain submit");
+            assert_eq!(
+                entries[0].description, "runs the build",
+                "editor snapshot should retain the description"
+            );
         } else {
             panic!("expected macro editor after save");
         }
@@ -16723,6 +16801,8 @@ cyan = "#00ffff"
         // Re-open the saved macro and toggle it back off in the text stage.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("edit macro");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("next stage");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .expect("next stage");
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
@@ -16788,6 +16868,7 @@ cyan = "#00ffff"
             "run".to_string(),
             crate::config::MacroEntry {
                 text: "run-me".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: true,
             },
@@ -16847,6 +16928,7 @@ cyan = "#00ffff"
             "greet".to_string(),
             crate::config::MacroEntry {
                 text: "hello-macro".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },
@@ -16966,6 +17048,7 @@ cyan = "#00ffff"
             "multi".to_string(),
             crate::config::MacroEntry {
                 text: "first\nsecond".to_string(),
+                description: String::new(),
                 surface: crate::config::MacroSurface::Agent,
                 submit: false,
             },

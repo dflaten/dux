@@ -62,12 +62,12 @@ pub enum MacroSurface {
 }
 
 impl MacroSurface {
-    /// Human-readable label for UI display.
-    pub fn label(self) -> &'static str {
+    /// Compact label for the macro bar and editor columns.
+    pub fn short_label(self) -> &'static str {
         match self {
             Self::Agent => "agent",
             Self::Terminal => "terminal",
-            Self::Both => "active pane",
+            Self::Both => "active",
         }
     }
 
@@ -94,6 +94,10 @@ impl MacroSurface {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MacroEntry {
     pub text: String,
+    /// Optional one-line summary shown in the macro bar and editor so the
+    /// macro's purpose is obvious without reading its full text.
+    #[serde(default)]
+    pub description: String,
     pub surface: MacroSurface,
     /// When true, press Enter after sending the macro text so the agent or
     /// terminal runs it immediately.
@@ -1638,6 +1642,12 @@ fn patch_macros(doc: &mut DocumentMut, macros: &MacrosConfig) {
     for (name, entry) in &macros.entries {
         let mut inline = InlineTable::new();
         inline.insert("text", Value::String(Formatted::new(entry.text.clone())));
+        if !entry.description.is_empty() {
+            inline.insert(
+                "description",
+                Value::String(Formatted::new(entry.description.clone())),
+            );
+        }
         let surface_str = match entry.surface {
             MacroSurface::Agent => "agent",
             MacroSurface::Terminal => "terminal",
@@ -1777,7 +1787,9 @@ fn render_macros_config(
         "# Text macros: press {macro_key} to open the macro bar and select one to send.\n\
          # Each macro runs in the agent or the companion terminal, and dux creates\n\
          # the target first when it is not already running. Each entry is a name\n\
-         # mapped to its text and a routing target.\n\
+         # mapped to its text, an optional description, and a routing target.\n\
+         # description = \"...\"  — optional one-line summary shown in the macro bar and\n\
+         #                        editor so you can see what a macro does at a glance.\n\
          # surface = \"agent\"    — always send to the agent, launching it if needed.\n\
          # surface = \"terminal\" — always send to a companion terminal, opening one if needed.\n\
          # surface = \"both\"     — send to whichever pane is active when the macro runs.\n\
@@ -1788,13 +1800,21 @@ fn render_macros_config(
     );
     if macros.entries.is_empty() {
         out.push_str(
-            "# \"Review\" = { text = \"review this code for bugs\", surface = \"agent\", submit = true }\n\
-             # \"Build\" = { text = \"cargo build --release\", surface = \"terminal\" }\n",
+            "# \"Review\" = { text = \"review this code for bugs\", description = \"Review the current diff\", surface = \"agent\", submit = true }\n\
+             # \"Build\" = { text = \"cargo build --release\", description = \"Compile a release binary\", surface = \"terminal\" }\n",
         );
     } else {
         out.push('\n');
         for (name, entry) in &macros.entries {
             let text = escape_toml_string(&entry.text);
+            let description = if entry.description.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", description = \"{}\"",
+                    escape_toml_string(&entry.description)
+                )
+            };
             let surface = match entry.surface {
                 MacroSurface::Agent => "agent",
                 MacroSurface::Terminal => "terminal",
@@ -1803,9 +1823,10 @@ fn render_macros_config(
             let submit = if entry.submit { ", submit = true" } else { "" };
             let _ = writeln!(
                 out,
-                "\"{}\" = {{ text = \"{}\", surface = \"{}\"{} }}",
+                "\"{}\" = {{ text = \"{}\"{}, surface = \"{}\"{} }}",
                 escape_toml_string(name),
                 text,
+                description,
                 surface,
                 submit
             );
@@ -3981,6 +4002,7 @@ strategy = "none"
             "Zulu".into(),
             MacroEntry {
                 text: "z".into(),
+                description: String::new(),
                 surface: MacroSurface::Agent,
                 submit: false,
             },
@@ -3989,6 +4011,7 @@ strategy = "none"
             "Alpha".into(),
             MacroEntry {
                 text: "a".into(),
+                description: String::new(),
                 surface: MacroSurface::Agent,
                 submit: false,
             },
@@ -3997,6 +4020,7 @@ strategy = "none"
             "Mike".into(),
             MacroEntry {
                 text: "m".into(),
+                description: String::new(),
                 surface: MacroSurface::Agent,
                 submit: false,
             },
@@ -4031,6 +4055,31 @@ strategy = "none"
 "#;
         let config: MacrosConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.entries["Review"].submit);
+    }
+
+    #[test]
+    fn macros_config_entry_defaults_description_to_empty() {
+        let toml_str = r#"
+"Review" = { text = "review this code", surface = "agent" }
+"#;
+        let config: MacrosConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.entries["Review"].description.is_empty());
+    }
+
+    #[test]
+    fn macros_config_entry_parses_description() {
+        let toml_str = r#"
+"Review" = { text = "review this code", description = "Check the diff", surface = "agent" }
+"#;
+        let config: MacrosConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.entries["Review"].description, "Check the diff");
+    }
+
+    #[test]
+    fn macros_surface_short_labels_are_compact() {
+        assert_eq!(MacroSurface::Agent.short_label(), "agent");
+        assert_eq!(MacroSurface::Terminal.short_label(), "terminal");
+        assert_eq!(MacroSurface::Both.short_label(), "active");
     }
 
     #[test]
@@ -4070,6 +4119,7 @@ strategy = "none"
             "Review".to_string(),
             MacroEntry {
                 text: "hello world".to_string(),
+                description: "Greet the agent".to_string(),
                 surface: MacroSurface::Agent,
                 submit: false,
             },
@@ -4078,16 +4128,47 @@ strategy = "none"
             "Test".to_string(),
             MacroEntry {
                 text: "foo bar".to_string(),
+                description: String::new(),
                 surface: MacroSurface::Terminal,
                 submit: true,
             },
         );
         let rendered = render_config_default(&config);
-        assert!(rendered.contains("\"Review\" = { text = \"hello world\", surface = \"agent\" }"));
+        assert!(rendered.contains(
+            "\"Review\" = { text = \"hello world\", description = \"Greet the agent\", surface = \"agent\" }"
+        ));
         assert!(
             rendered.contains(
                 "\"Test\" = { text = \"foo bar\", surface = \"terminal\", submit = true }"
             )
+        );
+    }
+
+    #[test]
+    fn patch_macros_writes_and_removes_description() {
+        let mut config = Config::default();
+        config.macros.entries.insert(
+            "Review".to_string(),
+            MacroEntry {
+                text: "review".to_string(),
+                description: "Check the diff".to_string(),
+                surface: MacroSurface::Agent,
+                submit: false,
+            },
+        );
+        let mut doc: DocumentMut = "[macros]\n".parse().expect("doc");
+        patch_macros(&mut doc, &config.macros);
+        let rendered = doc.to_string();
+        assert!(rendered.contains(
+            "Review = { text = \"review\", description = \"Check the diff\", surface = \"agent\" }"
+        ));
+
+        config.macros.entries["Review"].description.clear();
+        patch_macros(&mut doc, &config.macros);
+        let rendered = doc.to_string();
+        assert_eq!(
+            rendered,
+            "[macros]\nReview = { text = \"review\", surface = \"agent\" }\n"
         );
     }
 
@@ -4098,6 +4179,7 @@ strategy = "none"
             "Review".to_string(),
             MacroEntry {
                 text: "review".to_string(),
+                description: String::new(),
                 surface: MacroSurface::Agent,
                 submit: true,
             },
@@ -4137,6 +4219,7 @@ strategy = "none"
             "Multi".to_string(),
             MacroEntry {
                 text: "line1\nline2".to_string(),
+                description: String::new(),
                 surface: MacroSurface::Both,
                 submit: false,
             },
