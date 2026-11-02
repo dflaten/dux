@@ -16586,6 +16586,66 @@ cyan = "#00ffff"
         assert_eq!(app.input_target, InputTarget::Terminal);
     }
 
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        let area = *buffer.area();
+        let mut row = String::new();
+        for x in area.left()..area.right() {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        row
+    }
+
+    fn row_col_for(row: &str, needle: &str) -> u16 {
+        let index = row.find(needle).expect("needle should appear in row");
+        row[..index].chars().count() as u16
+    }
+
+    #[test]
+    fn macro_bar_colors_target_and_description_differently() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "First macro".to_string(),
+            crate::config::MacroEntry {
+                text: "first".to_string(),
+                description: String::new(),
+                surface: crate::config::MacroSurface::Agent,
+                submit: false,
+            },
+        );
+        app.config.macros.entries.insert(
+            "Second macro".to_string(),
+            crate::config::MacroEntry {
+                text: "second".to_string(),
+                description: "Shows up in the picker".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+        app.open_macro_bar().expect("open macro bar");
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("draw macro bar");
+
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        let (y, row) = (area.top()..area.bottom())
+            .find_map(|y| {
+                let row = row_text(buffer, y);
+                row.contains("Shows up in the picker").then_some((y, row))
+            })
+            .expect("description row should be rendered");
+
+        let target_x = area.left() + row_col_for(&row, "terminal");
+        let description_x = area.left() + row_col_for(&row, "Shows up");
+
+        assert_eq!(buffer[(target_x, y)].fg, app.theme.hint_key_fg);
+        assert_eq!(buffer[(description_x, y)].fg, app.theme.hint_desc_fg);
+        assert_ne!(buffer[(target_x, y)].fg, buffer[(description_x, y)].fg);
+    }
+
     #[test]
     fn macro_bar_renders_a_visible_centered_popup() {
         let mut app = test_app(default_bindings());

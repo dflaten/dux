@@ -6674,7 +6674,7 @@ impl App {
                     Span::styled(
                         pad_to_display_width("Target", TARGET_COL),
                         Style::default()
-                            .fg(self.theme.hint_dim_desc_fg)
+                            .fg(self.theme.hint_dim_key_fg)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -6696,6 +6696,7 @@ impl App {
                             if entry.submit { "⏎" } else { " " }
                         );
                         let description = macro_description_line(&entry.description, &entry.text);
+                        let has_description = !entry.description.trim().is_empty();
                         let mut spans = vec![
                             Span::styled(
                                 format!(" {name}"),
@@ -6704,12 +6705,17 @@ impl App {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled("  ", Style::default()),
-                            Span::styled(target, Style::default().fg(self.theme.provider_label_fg)),
+                            Span::styled(target, Style::default().fg(self.theme.hint_key_fg)),
                         ];
                         if description_width > 0 {
+                            let style = if has_description {
+                                Style::default().fg(self.theme.hint_desc_fg)
+                            } else {
+                                Style::default().fg(self.theme.hint_dim_desc_fg)
+                            };
                             spans.push(Span::styled(
                                 truncate_to_width(&description, description_width),
-                                Style::default().fg(self.theme.hint_desc_fg),
+                                style,
                             ));
                         }
                         ListItem::new(Line::from(spans))
@@ -7251,7 +7257,7 @@ impl App {
             Span::styled(
                 pad_to_display_width("Target", TARGET_COL),
                 Style::default()
-                    .fg(self.theme.hint_dim_desc_fg)
+                    .fg(self.theme.hint_dim_key_fg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -7285,7 +7291,7 @@ impl App {
                         Span::styled("  ", Style::default()),
                         Span::styled(
                             pad_to_display_width(entry.surface.short_label(), 8),
-                            Style::default().fg(self.theme.provider_label_fg),
+                            Style::default().fg(self.theme.hint_key_fg),
                         ),
                         Span::styled(
                             if entry.submit { "⏎" } else { " " },
