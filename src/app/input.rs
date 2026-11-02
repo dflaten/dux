@@ -610,6 +610,9 @@ impl App {
                     };
                     self.set_info("Command palette opened.");
                 }
+                Action::OpenMacroBar => {
+                    self.open_macro_bar()?;
+                }
                 Action::RebaseCurrentBranch => {
                     self.rebase_selected_session_onto_base();
                 }
@@ -908,7 +911,6 @@ impl App {
                 Action::SendDiffComments if in_diff => self.send_queued_diff_comments(),
                 Action::FocusAgent if !in_diff => self.activate_center_agent()?,
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
-                Action::OpenMacroBar => self.open_macro_bar()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
                 Action::PasteSelectionToTerminal if !in_diff => {
                     self.paste_selection_to_opposite_surface()?
@@ -16525,6 +16527,32 @@ cyan = "#00ffff"
             "focus_on_launch should switch to the created terminal"
         );
         assert_eq!(app.input_target, InputTarget::Terminal);
+    }
+
+    #[test]
+    fn macro_bar_binding_opens_from_any_pane() {
+        for focus in [FocusPane::Left, FocusPane::Center, FocusPane::Files] {
+            let mut app = test_app(default_bindings());
+            app.focus = focus;
+            app.input_target = InputTarget::None;
+            app.config.macros.entries.insert(
+                "term".to_string(),
+                crate::config::MacroEntry {
+                    text: "hello".to_string(),
+                    description: String::new(),
+                    surface: crate::config::MacroSurface::Terminal,
+                    submit: false,
+                },
+            );
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+                .expect("open macro bar");
+
+            assert!(
+                app.macro_bar.is_some(),
+                "macro bar should open while the {focus:?} pane is focused"
+            );
+        }
     }
 
     #[test]

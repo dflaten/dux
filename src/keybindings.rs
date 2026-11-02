@@ -1040,7 +1040,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
     BindingDef {
         action: Action::OpenMacroBar,
         default_keys: &[key!(ctrl - '\\')],
-        scopes: &[BindingScope::Interactive, BindingScope::Center],
+        scopes: &[BindingScope::Interactive, BindingScope::Global],
         help: Some(HelpEntry {
             section: "Agent pane",
             description: "Open the macro bar to run a macro in the agent or companion terminal",
@@ -2502,6 +2502,16 @@ mod tests {
         assert_eq!(
             bindings.lookup(&key, BindingScope::Global),
             Some(Action::RebaseCurrentBranch)
+        );
+    }
+
+    #[test]
+    fn open_macro_bar_resolves_in_global_scope() {
+        let bindings = default_bindings();
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(
+            bindings.lookup(&key, BindingScope::Global),
+            Some(Action::OpenMacroBar)
         );
     }
 
