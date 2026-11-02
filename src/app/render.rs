@@ -6899,6 +6899,10 @@ impl App {
     }
 
     fn render_overlay(&mut self, frame: &mut Frame) {
+        if self.macro_bar.is_some() {
+            self.render_macro_bar(frame);
+            return;
+        }
         match self.fullscreen_overlay {
             FullscreenOverlay::Agent => {
                 self.render_fullscreen_agent(frame);
@@ -6913,10 +6917,6 @@ impl App {
                 return;
             }
             FullscreenOverlay::None => {}
-        }
-        if self.macro_bar.is_some() {
-            self.render_macro_bar(frame);
-            return;
         }
         if !matches!(self.prompt, PromptState::None) {
             self.render_prompt(frame);

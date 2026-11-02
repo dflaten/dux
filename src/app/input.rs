@@ -16530,6 +16530,72 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn macro_bar_renders_a_visible_centered_popup() {
+        let mut app = test_app(default_bindings());
+        app.config.macros.entries.insert(
+            "Visible macro".to_string(),
+            crate::config::MacroEntry {
+                text: "hello".to_string(),
+                description: "Shows up in the picker".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+        app.open_macro_bar().expect("open macro bar");
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("draw macro bar");
+
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Macros"), "macro bar title should be visible");
+        assert!(
+            text.contains("Visible macro"),
+            "macro entry should be visible"
+        );
+        assert!(
+            text.contains("Shows up in the picker"),
+            "macro description should be visible"
+        );
+    }
+
+    #[test]
+    fn macro_bar_renders_above_fullscreen_agent() {
+        let mut app = test_app(default_bindings());
+        app.fullscreen_overlay = FullscreenOverlay::Agent;
+        app.config.macros.entries.insert(
+            "Visible macro".to_string(),
+            crate::config::MacroEntry {
+                text: "hello".to_string(),
+                description: "Shows up in the picker".to_string(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+        app.open_macro_bar().expect("open macro bar");
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("draw macro bar");
+
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            text.contains("Macros"),
+            "macro bar should render on top of the fullscreen agent"
+        );
+        assert!(
+            text.contains("Visible macro"),
+            "macro entry should be visible above the fullscreen agent"
+        );
+    }
+
+    #[test]
     fn macro_bar_binding_opens_from_any_pane() {
         for focus in [FocusPane::Left, FocusPane::Center, FocusPane::Files] {
             let mut app = test_app(default_bindings());
