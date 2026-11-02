@@ -2506,6 +2506,17 @@ mod tests {
     }
 
     #[test]
+    fn open_macro_bar_is_center_scoped() {
+        let bindings = default_bindings();
+        let key = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(
+            bindings.lookup(&key, BindingScope::Center),
+            Some(Action::OpenMacroBar)
+        );
+        assert_eq!(bindings.lookup(&key, BindingScope::Global), None);
+    }
+
+    #[test]
     fn lookup_ctrl_close_bracket_matches() {
         let bindings = default_bindings();
         // Crossterm delivers Ctrl+] as Char('5') + CONTROL (byte 0x1D maps
