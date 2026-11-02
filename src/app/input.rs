@@ -610,9 +610,6 @@ impl App {
                     };
                     self.set_info("Command palette opened.");
                 }
-                Action::OpenMacroBar => {
-                    self.open_macro_bar()?;
-                }
                 Action::RebaseCurrentBranch => {
                     self.rebase_selected_session_onto_base();
                 }
@@ -911,6 +908,7 @@ impl App {
                 Action::SendDiffComments if in_diff => self.send_queued_diff_comments(),
                 Action::FocusAgent if !in_diff => self.activate_center_agent()?,
                 Action::ExitInteractive if !in_diff => self.activate_center_agent()?,
+                Action::OpenMacroBar => self.open_macro_bar()?,
                 Action::ShowTerminal if !in_diff => self.show_or_open_first_terminal()?,
                 Action::PasteSelectionToTerminal if !in_diff => {
                     self.paste_selection_to_opposite_surface()?
@@ -1806,7 +1804,9 @@ impl App {
     }
 
     pub(crate) fn macro_view_hint(&self, target: SessionSurface) -> String {
-        if self.session_surface == target {
+        let target_visible =
+            matches!(self.center_mode, CenterMode::Agent) && self.session_surface == target;
+        if target_visible {
             return String::new();
         }
         let key = match target {
@@ -16440,6 +16440,63 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn macro_hint_points_to_target_when_center_shows_a_diff() {
+        let mut app = test_app(default_bindings());
+        app.session_surface = crate::model::SessionSurface::Agent;
+        app.center_mode = CenterMode::Diff {
+            lines: std::sync::Arc::new(Vec::new()),
+            meta: std::sync::Arc::new(Vec::new()),
+            scroll: 0,
+            gutter_width: 0,
+            worktree_path: ".".to_string(),
+            rel_path: "file.rs".to_string(),
+            base_ref: "HEAD".to_string(),
+        };
+
+        let hint = app.macro_view_hint(crate::model::SessionSurface::Agent);
+        assert!(
+            hint.contains("view it"),
+            "background delivery should point at the hidden agent pane; got: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_macro_via_palette_runs_while_left_pane_focused() {
+        let mut app = test_app(default_bindings());
+        app.config.terminal.command = "sh".to_string();
+        app.config.terminal.args =
+            vec!["-c".to_string(), "stty raw -echo; exec cat -v".to_string()];
+        app.focus = FocusPane::Left;
+        app.input_target = InputTarget::None;
+        app.session_surface = crate::model::SessionSurface::Agent;
+        app.config.macros.entries.insert(
+            "term".to_string(),
+            crate::config::MacroEntry {
+                text: "hello-from-left".to_string(),
+                description: String::new(),
+                surface: crate::config::MacroSurface::Terminal,
+                submit: false,
+            },
+        );
+
+        // The palette command is intentionally available from any pane.
+        app.open_macro_bar().expect("open macro bar");
+        app.handle_macro_bar_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("run macro");
+
+        assert_eq!(
+            app.companion_terminals.len(),
+            1,
+            "terminal should be created for a palette-launched macro"
+        );
+        assert!(
+            app.status.message().contains("to the terminal"),
+            "macro should report delivery; got: {}",
+            app.status.message()
+        );
+    }
+
+    #[test]
     fn terminal_macro_from_agent_surface_creates_terminal_in_background() {
         let mut app = test_app(default_bindings());
         app.config.terminal.command = "sh".to_string();
@@ -16596,8 +16653,12 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn macro_bar_binding_opens_from_any_pane() {
-        for focus in [FocusPane::Left, FocusPane::Center, FocusPane::Files] {
+    fn macro_bar_binding_is_scoped_to_the_center_pane() {
+        for (focus, should_open) in [
+            (FocusPane::Left, false),
+            (FocusPane::Center, true),
+            (FocusPane::Files, false),
+        ] {
             let mut app = test_app(default_bindings());
             app.focus = focus;
             app.input_target = InputTarget::None;
@@ -16612,11 +16673,12 @@ cyan = "#00ffff"
             );
 
             app.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
-                .expect("open macro bar");
+                .expect("handle macro shortcut");
 
-            assert!(
+            assert_eq!(
                 app.macro_bar.is_some(),
-                "macro bar should open while the {focus:?} pane is focused"
+                should_open,
+                "macro bar open state for {focus:?} focus"
             );
         }
     }
