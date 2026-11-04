@@ -1026,6 +1026,13 @@ impl App {
         self.sessions
             .retain(|session| !session_ids.contains(&session.id));
 
+        // Other removals in the same cleanup batch may still be in flight, so
+        // the batch-complete path may not run for a while. Rebuild the
+        // left-pane cache now — it holds session indices, and rendering a
+        // stale entry after the sessions vector shrank would index out of
+        // bounds. `rebuild_left_items` also clamps the selection.
+        self.rebuild_left_items();
+
         if branch_already_deleted {
             self.set_info(format!(
                 "Removed inactive worktree for project \"{}\". Branch \"{}\" was already gone.",
@@ -3733,6 +3740,54 @@ mod tests {
         assert_eq!(
             app.status.message(),
             "Worktree cleanup complete. Removed 1 worktree(s)."
+        );
+    }
+
+    /// Each completed cleanup removes its sessions from `self.sessions`, but
+    /// the remaining removals in the batch may still be running. The left-pane
+    /// cache must be rebuilt immediately so the next render cannot index past
+    /// the shortened session list.
+    #[test]
+    fn finish_worktree_cleanup_rebuilds_left_items_before_batch_finishes() {
+        let project = make_project("project-1", "codex");
+        let sessions = (0..3)
+            .map(|index| {
+                make_session(
+                    &format!("old-{index}"),
+                    "codex",
+                    &format!("/tmp/wt/old-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = test_app_with_sessions(sessions, vec![project]);
+
+        let candidate = WorktreeCleanupCandidate {
+            session_ids: vec!["old-2".to_string()],
+            project_id: "project-1".to_string(),
+            project_name: "demo".to_string(),
+            branch_name: "branch-old-2".to_string(),
+            worktree_path: "/tmp/wt/old-2".to_string(),
+            last_commit_at: Utc::now() - chrono::Duration::days(15),
+        };
+
+        // Pretend another removal in the same batch is still in flight, so
+        // the batch-complete path does not rebuild the cache yet.
+        app.worktree_cleanup_pending = 2;
+        app.finish_worktree_cleanup(candidate, false)
+            .expect("finish cleanup");
+
+        assert_eq!(app.sessions.len(), 2);
+        for item in app.left_items() {
+            if let LeftItem::Session(index) = item {
+                assert!(
+                    app.sessions.get(*index).is_some(),
+                    "left-pane cache points at removed session index {index}",
+                );
+            }
+        }
+        assert!(
+            app.selected_left < app.left_items().len(),
+            "selection must stay within the rebuilt left list",
         );
     }
 
