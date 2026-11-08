@@ -473,6 +473,13 @@ impl App {
                         );
                         self.sessions.push(session);
                         self.update_branch_sync_sessions();
+                        // When the recovery prompt is open the restored agent
+                        // is selected and reconnected right after this, so it
+                        // must not stay hidden by a filter. Restores that
+                        // deliberately leave the view alone keep the filter.
+                        if recovery_prompt_is_open {
+                            self.reset_left_search_state();
+                        }
                         self.rebuild_left_items();
                         if recovery_prompt_is_open {
                             if let Some(index) = self.left_items().iter().position(|item| {
@@ -1131,9 +1138,22 @@ impl App {
                 project_id,
                 project_name,
             } => {
+                // Capture the selection before the project list shrinks; the
+                // cached item indices become stale once the vector changes.
+                let selected_before = self.selected_left_target();
+                let removed_was_selected = self.selection_belongs_to_project(&project_id);
+                let previous_target = if self.left_search_is_filtering() && removed_was_selected {
+                    self.previous_left_target()
+                } else {
+                    None
+                };
                 self.projects.retain(|project| project.id != project_id);
                 self.rebuild_left_items();
-                self.selected_left = self.selected_left.saturating_sub(1);
+                self.restore_selection_after_removal(
+                    selected_before,
+                    removed_was_selected,
+                    previous_target,
+                );
                 // Selection moved to a different item; refresh the right-pane
                 // file lists so they match the new selection instead of the
                 // removed project's stale changes.
@@ -1150,9 +1170,20 @@ impl App {
                 project_id,
                 project_name,
             } => {
+                let selected_before = self.selected_left_target();
+                let removed_was_selected = self.selection_belongs_to_project(&project_id);
+                let previous_target = if self.left_search_is_filtering() && removed_was_selected {
+                    self.previous_left_target()
+                } else {
+                    None
+                };
                 self.projects.retain(|project| project.id != project_id);
                 self.rebuild_left_items();
-                self.selected_left = self.selected_left.saturating_sub(1);
+                self.restore_selection_after_removal(
+                    selected_before,
+                    removed_was_selected,
+                    previous_target,
+                );
                 self.reload_changed_files();
                 if let Err(err) = self.persist_config_projects_from_runtime() {
                     self.set_error(format!(
@@ -1400,6 +1431,9 @@ impl App {
                 );
             }
             self.update_branch_sync_sessions();
+            // A newly created agent must be visible and selected, so drop any
+            // sidebar filter that would hide it.
+            self.reset_left_search_state();
             self.rebuild_left_items();
             self.selected_left = self
                 .left_items()

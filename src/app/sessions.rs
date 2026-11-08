@@ -223,6 +223,10 @@ impl App {
             return Ok(());
         }
 
+        // The new agent rarely matches the active sidebar filter, so drop the
+        // filter to keep the new agent visible.
+        self.clear_left_search();
+
         if project.is_scratch() {
             return self.open_name_new_agent_prompt(CreateAgentRequest::Scratch {
                 project,
@@ -565,6 +569,9 @@ impl App {
         }
         self.update_branch_sync_sessions();
         self.update_pr_sync_sessions();
+        // The converted agent is selected right after this, so it must not
+        // stay hidden by a filter.
+        self.reset_left_search_state();
         self.rebuild_left_items();
         if let Some(index) = self.left_items().iter().position(|item| {
             matches!(item, LeftItem::Session(session_index) if self.sessions[*session_index].id == session_id)
@@ -1415,6 +1422,9 @@ impl App {
             self.clear_companion_terminals_for_session(session_id);
         }
 
+        // Capture the selected row before the session list shrinks; the
+        // cached item indices become stale as soon as the vector changes.
+        let previous_target = self.selected_left_target();
         self.sessions
             .retain(|session| !session_ids.contains(&session.id));
 
@@ -1424,6 +1434,9 @@ impl App {
         // stale entry after the sessions vector shrank would index out of
         // bounds. `rebuild_left_items` also clamps the selection.
         self.rebuild_left_items();
+        if let Some(target) = previous_target {
+            self.select_left_target(&target);
+        }
 
         if candidate.project_id == SCRATCH_PROJECT_ID {
             self.set_info(format!(
@@ -1687,22 +1700,40 @@ impl App {
         self.last_pty_activity.remove(&session.id);
         self.resume_fallback_candidates.remove(&session.id);
         self.clear_companion_terminals_for_session(&session.id);
+        // Capture the selection before the session list shrinks; the cached
+        // item indices become stale as soon as the vector changes.
+        let selected_before = self.selected_left_target();
+        let deleted_was_selected = matches!(
+            &selected_before,
+            Some(LeftSelectionTarget::Session(id)) if id == &session.id
+        );
+        let previous_target = if deleted_was_selected {
+            self.previous_left_target()
+        } else {
+            None
+        };
         self.sessions.retain(|candidate| candidate.id != session.id);
         self.update_branch_sync_sessions();
-        let project_still_has_sessions = self
-            .sessions
-            .iter()
-            .any(|candidate| candidate.project_id == session.project_id);
         self.rebuild_left_items();
-        if project_still_has_sessions {
-            self.selected_left = self.selected_left.saturating_sub(1);
-            self.ensure_selectable_left_item();
-        } else if let Some(project_index) = self.left_items().iter().position(|item| match item {
-            LeftItem::Project(index) => self.projects[*index].id == session.project_id,
-            LeftItem::ScratchHeader => session.project_id == SCRATCH_PROJECT_ID,
-            _ => false,
-        }) {
-            self.selected_left = project_index;
+        if deleted_was_selected {
+            if let Some(target) = previous_target
+                && self.select_left_target(&target)
+            {
+                // Cursor stays on the row above the deleted agent.
+            } else {
+                // Fall back to the project header (or the scratch header when
+                // the project is gone entirely).
+                let project_target = if session.project_id == SCRATCH_PROJECT_ID {
+                    LeftSelectionTarget::Scratch
+                } else {
+                    LeftSelectionTarget::Project(session.project_id.clone())
+                };
+                if !self.select_left_target(&project_target) {
+                    self.ensure_selectable_left_item();
+                }
+            }
+        } else if let Some(target) = selected_before {
+            self.select_left_target(&target);
         }
         self.reload_changed_files();
 
@@ -3736,6 +3767,9 @@ mod tests {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
+            left_search: TextInput::new(),
+            left_search_active: false,
+            left_search_origin: None,
             commit_input: TextInput::new()
                 .with_multiline(4)
                 .with_placeholder("Type your commit message\u{2026}"),

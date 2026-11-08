@@ -9,6 +9,7 @@ pub enum Action {
     MoveUp,
     // Projects pane
     ToggleProject,
+    SearchProjects,
     NewAgent,
     NewScratchAgent,
     ConvertScratchToProject,
@@ -214,6 +215,7 @@ impl Action {
             Action::MoveDown => "move_down",
             Action::MoveUp => "move_up",
             Action::ToggleProject => "toggle_project",
+            Action::SearchProjects => "search_projects",
             Action::NewAgent => "new_agent",
             Action::NewScratchAgent => "new_scratch_agent",
             Action::ConvertScratchToProject => "convert_scratch_to_project",
@@ -322,6 +324,7 @@ impl Action {
             Action::MoveDown => "Navigate down through projects, sessions, files, and lists.",
             Action::MoveUp => "Navigate up through projects, sessions, files, and lists.",
             Action::ToggleProject => "Collapse or expand the selected project.",
+            Action::SearchProjects => "Filter the projects and agents shown in the left sidebar.",
             Action::NewAgent => "Create a new agent session (worktree).",
             Action::NewScratchAgent => {
                 "Create an agent in the built-in scratch workspace without attaching it to a project or git repository."
@@ -480,6 +483,7 @@ impl Action {
             Action::MoveDown
             | Action::MoveUp
             | Action::ToggleProject
+            | Action::SearchProjects
             | Action::NewAgent
             | Action::NewAgentFromWorktree
             | Action::ForkAgent
@@ -653,6 +657,27 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: None,
     },
     // ── Projects pane ─────────────────────────────────────────────
+    BindingDef {
+        action: Action::SearchProjects,
+        default_keys: &[KeyCombination::one_key(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )],
+        scopes: &[BindingScope::Left],
+        help: Some(HelpEntry {
+            section: "Projects pane",
+            description: "Search projects and agents",
+        }),
+        hint_contexts: &[
+            (HintContext::LeftProject, "Search"),
+            (HintContext::LeftSession, "Search"),
+            (HintContext::LeftTerminal, "Search"),
+        ],
+        palette: Some(PaletteEntry {
+            name: "search-projects",
+            description: "Filter the projects and agents shown in the left sidebar",
+        }),
+    },
     BindingDef {
         action: Action::ToggleProject,
         default_keys: &[key!(space)],
@@ -2972,6 +2997,16 @@ mod tests {
         assert_eq!(
             bindings.lookup(&slash, BindingScope::Files),
             Some(Action::SearchFiles)
+        );
+    }
+
+    #[test]
+    fn left_scope_resolves_slash_to_search_projects() {
+        let bindings = default_bindings();
+        let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(
+            bindings.lookup(&slash, BindingScope::Left),
+            Some(Action::SearchProjects)
         );
     }
 

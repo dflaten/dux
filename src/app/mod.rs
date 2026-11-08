@@ -83,6 +83,11 @@ pub struct App {
     pub(crate) unstaged_files: Vec<ChangedFile>,
     pub(crate) selected_left: usize,
     pub(crate) left_section: LeftSection,
+    pub(crate) left_search: TextInput,
+    pub(crate) left_search_active: bool,
+    /// Selection captured when the sidebar search opens, so `Esc` can put
+    /// the cursor back where it was before the search started.
+    pub(crate) left_search_origin: Option<LeftSelectionTarget>,
     pub(crate) selected_terminal_index: usize,
     pub(crate) right_section: RightSection,
     pub(crate) files_index: usize,
@@ -1320,6 +1325,9 @@ pub(crate) struct MouseLayoutState {
     pub(crate) center: Rect,
     pub(crate) right: Rect,
     pub(crate) left_list: Rect,
+    /// Index of the first row visible in the projects list, used to map mouse
+    /// clicks back to items when the list is scrolled.
+    pub(crate) left_list_offset: usize,
     pub(crate) terminal_list: Rect,
     pub(crate) agent_term: Option<Rect>,
     pub(crate) unstaged_list: Option<Rect>,
@@ -1335,6 +1343,7 @@ impl MouseLayoutState {
         self.center = center;
         self.right = right;
         self.left_list = Rect::default();
+        self.left_list_offset = 0;
         self.terminal_list = Rect::default();
         self.agent_term = None;
         self.unstaged_list = None;
@@ -1549,6 +1558,22 @@ impl LeftItem {
             LeftItem::Project(_) | LeftItem::Session(_) | LeftItem::ScratchHeader
         )
     }
+}
+
+/// A stable identity for the row selected in the left pane.
+///
+/// The left pane stores its selection as an index into the rendered item
+/// list, but that index shifts whenever the list is rebuilt (a background
+/// worker refreshing sessions, a filter narrowing the tree, ...). Keeping
+/// the identity around lets the selection survive those rebuilds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LeftSelectionTarget {
+    /// A regular project, identified by its project id.
+    Project(String),
+    /// An agent session, identified by its session id.
+    Session(String),
+    /// The built-in scratch workspace header.
+    Scratch,
 }
 
 pub(crate) fn build_left_items(
@@ -1959,6 +1984,7 @@ pub(crate) enum ProjectPersistenceAction {
 
 mod components;
 mod input;
+mod left_search;
 mod render;
 mod sessions;
 mod terminal_links;
@@ -2044,6 +2070,9 @@ impl App {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
+            left_search: TextInput::new(),
+            left_search_active: false,
+            left_search_origin: None,
             commit_input: TextInput::new()
                 .with_multiline(4)
                 .with_placeholder("Type your commit message\u{2026}"),
@@ -2684,6 +2713,10 @@ impl App {
             "paste-selection-to-agent" => self.paste_selection_to_agent(),
             "new-terminal" => self.new_companion_terminal(),
             "add-project" => self.open_project_browser(),
+            "search-projects" => {
+                self.open_left_search();
+                Ok(())
+            }
             "copy-path" => self.copy_selected_path(),
             "open-worktree" => self.open_selected_worktree_in_default_editor(),
             "open-worktree-with" => self.open_worktree_editor_picker(),
@@ -2974,12 +3007,27 @@ impl App {
     }
 
     pub(crate) fn rebuild_left_items(&mut self) {
-        self.left_items_cache = build_left_items(
+        // While a search filter is applied the rendered list is a subset of
+        // the real tree, so the selected index can silently drift to a
+        // different row whenever the list is rebuilt. Remember the selected
+        // row by identity and restore it after the rebuild.
+        let target = if self.left_search_is_filtering() {
+            self.selected_left_target()
+        } else {
+            None
+        };
+        self.left_items_cache = left_search::build_filtered_left_items(
             &self.projects,
             &self.sessions,
             &self.collapsed_projects,
             self.config.ui.empty_project_separator_min_projects,
+            self.left_search_query(),
         );
+        if let Some(target) = target
+            && self.select_left_target(&target)
+        {
+            return;
+        }
         self.ensure_selectable_left_item();
     }
 
@@ -3025,30 +3073,48 @@ impl App {
     }
 
     pub(crate) fn sort_sessions_by_updated(&mut self) {
+        let target = self.selected_left_target();
         self.sessions
             .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted by most recently updated.");
     }
 
     pub(crate) fn sort_sessions_by_created(&mut self) {
+        let target = self.selected_left_target();
         self.sessions
             .sort_by_key(|b| std::cmp::Reverse(b.created_at));
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted by creation date (newest first).");
     }
 
     pub(crate) fn sort_sessions_by_name(&mut self) {
+        let target = self.selected_left_target();
         self.sessions.sort_by(|a, b| {
             let name_a = a.title.as_deref().unwrap_or(&a.branch_name);
             let name_b = b.title.as_deref().unwrap_or(&b.branch_name);
             name_a.to_lowercase().cmp(&name_b.to_lowercase())
         });
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted alphabetically by name.");
     }
 
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
+        if self.left_search_is_filtering() {
+            self.set_info(
+                "Projects stay expanded while a project filter is applied. Press Esc to clear the filter, then collapse a project.",
+            );
+            return;
+        }
         // `selected_project` resolves the parent group for a selected session
         // row as well as for project and scratch headers, so toggling works
         // from anywhere inside a group.

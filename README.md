@@ -47,6 +47,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 Recent fork additions include:
 
 - Copy and paste between agent and terminal panes.
+- A searchable project and agent sidebar that narrows the tree as you type.
 - A searchable existing-worktree picker for creating or reconnecting agents.
 - Cleanup for inactive managed worktrees and unreferenced scratch workspaces.
 - An always-visible Scratch workspace for ad-hoc agents, with conversion into a new project or an existing project's worktree.

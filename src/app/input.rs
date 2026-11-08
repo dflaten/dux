@@ -477,6 +477,9 @@ impl App {
         if self.macro_bar.is_some() {
             return self.handle_macro_bar_key(key);
         }
+        // The sidebar search only owns keys while the left pane is focused.
+        // Leaving the pane ends the editing mode but keeps the filter.
+        self.deactivate_left_search_if_unfocused();
         // Interactive mode is handled at the event-loop level via raw stdin
         // passthrough (poll_and_forward_raw_input). When the input target is
         // Agent or Terminal, crossterm's event reader is not called, so
@@ -529,10 +532,18 @@ impl App {
             }
             return Ok(false);
         }
-        if key.code == KeyCode::Esc
-            && self.focus == FocusPane::Files
-            && (self.files_search_active || self.has_files_search())
+        // The files search field owns every key while it is active. Without
+        // this, plain characters are handled by the global bindings first and
+        // typing `q` in a file search would quit dux. The commit message
+        // input keeps priority when it is engaged.
+        if self.focus == FocusPane::Files
+            && self.files_search_active
+            && self.input_target == InputTarget::None
+            && self.handle_files_search_key(key)
         {
+            return Ok(false);
+        }
+        if key.code == KeyCode::Esc && self.focus == FocusPane::Files && self.has_files_search() {
             self.handle_files_key(key)?;
             return Ok(false);
         }
@@ -547,7 +558,29 @@ impl App {
             self.set_info("Canceled diff line selection.");
             return Ok(false);
         }
+        // The sidebar search field owns every key while it is active so plain
+        // characters are typed instead of triggering global actions such as
+        // Quit. It is placed after the overlay handling so an open overlay
+        // still takes precedence for Esc.
         if is_close_overlay && self.close_top_overlay() {
+            return Ok(false);
+        }
+        // Esc clears the sidebar search: it cancels an active search and
+        // restores the row that was selected before, or clears a filter that
+        // was already applied.
+        if key.code == KeyCode::Esc
+            && self.focus == FocusPane::Left
+            && self.left_section == LeftSection::Projects
+            && (self.left_search_active || self.has_left_search())
+        {
+            self.close_left_search(false);
+            return Ok(false);
+        }
+        if self.left_search_active
+            && self.focus == FocusPane::Left
+            && self.left_section == LeftSection::Projects
+            && self.handle_left_search_key(key)?
+        {
             return Ok(false);
         }
         // When typing a commit message, route all keys to the commit input
@@ -570,7 +603,7 @@ impl App {
             let pane_scope = match self.focus {
                 FocusPane::Center => Some(BindingScope::Center),
                 FocusPane::Files => Some(BindingScope::Files),
-                _ => None,
+                FocusPane::Left => Some(BindingScope::Left),
             };
             pane_scope.is_some_and(|scope| self.bindings.lookup(&key, scope).is_some())
         } else {
@@ -746,7 +779,86 @@ impl App {
         Ok(false)
     }
 
+    /// Handles a key while the sidebar search field is active.
+    ///
+    /// Returns `true` when the key was consumed by the search field and
+    /// `false` when it should fall through to the regular key handling.
+    fn handle_left_search_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Enter => {
+                if !self.left_search_is_filtering() {
+                    // A query that is too short cannot narrow anything, so
+                    // Enter dismisses it instead of leaving it displayed as an
+                    // applied filter.
+                    self.close_left_search(false);
+                    return Ok(true);
+                }
+                if self.left_items().is_empty() {
+                    self.set_warning(format!(
+                        "No projects or agents match \"{}\". Keep typing or press Esc to clear the search.",
+                        self.left_search.text.trim()
+                    ));
+                    return Ok(true);
+                }
+                self.close_left_search(true);
+                return Ok(true);
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Apply a filter that matches something and let Tab continue
+                // to the pane switcher. A query with no matches is dropped so
+                // the sidebar does not stay empty.
+                let apply = self.left_search_is_filtering() && !self.left_items().is_empty();
+                self.close_left_search(apply);
+                return Ok(false);
+            }
+            _ => {}
+        }
+
+        // Arrow keys and other non-printing keys keep honoring the configured
+        // MoveUp/MoveDown bindings; plain characters always type into the
+        // query.
+        let is_plain_char =
+            matches!(key.code, KeyCode::Char(_)) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_plain_char {
+            match self.bindings.lookup(&key, BindingScope::Left) {
+                Some(Action::MoveDown) => {
+                    let previous = self.selected_left_target();
+                    if let Some(next) = self.next_selectable_left_item_after(self.selected_left) {
+                        self.selected_left = next;
+                    }
+                    self.refresh_after_left_selection_change(&previous);
+                    return Ok(true);
+                }
+                Some(Action::MoveUp) => {
+                    let previous = self.selected_left_target();
+                    if let Some(prev) =
+                        self.previous_selectable_left_item_before(self.selected_left)
+                    {
+                        self.selected_left = prev;
+                    }
+                    self.refresh_after_left_selection_change(&previous);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        // Cursor-only edits (Left/Right/Home/End) do not change the query, so
+        // they should not rebuild the filtered tree.
+        let before = self.left_search.text.clone();
+        if self.left_search.handle_key(key) && self.left_search.text != before {
+            self.update_left_search();
+        }
+        Ok(true)
+    }
+
     fn handle_left_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Searching is available from both left pane sections, so it is
+        // handled before the terminals section takes over.
+        if self.bindings.lookup(&key, BindingScope::Left) == Some(Action::SearchProjects) {
+            self.open_left_search();
+            return Ok(());
+        }
         if self.left_section == LeftSection::Terminals {
             return self.handle_left_terminal_key(key);
         }
@@ -1388,15 +1500,24 @@ impl App {
         }
     }
 
-    fn handle_files_search_key(&mut self, key: KeyEvent) {
+    /// Handles a key while the files search field is active.
+    ///
+    /// Returns `true` when the key was consumed by the search field and
+    /// `false` when it should fall through to the regular key handling, so
+    /// Tab keeps switching panes.
+    fn handle_files_search_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
                 self.clear_files_search();
-                return;
+                return true;
             }
             KeyCode::Enter => {
                 self.files_search_active = false;
-                return;
+                return true;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.files_search_active = false;
+                return false;
             }
             _ => {}
         }
@@ -1407,6 +1528,7 @@ impl App {
                 self.set_info("No file matches the current search.");
             }
         }
+        true
     }
 
     fn handle_files_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -5022,7 +5144,8 @@ impl App {
             if self.left_items().is_empty() {
                 return Some(MouseTarget::LeftPane);
             }
-            let index = usize::from(row.saturating_sub(self.mouse_layout.left_list.y));
+            let visible_row = usize::from(row.saturating_sub(self.mouse_layout.left_list.y));
+            let index = self.mouse_layout.left_list_offset + visible_row;
             if index < self.left_items().len() {
                 if !self.is_selectable_left_item(index) {
                     return Some(MouseTarget::LeftPane);
@@ -5544,6 +5667,9 @@ impl App {
             return;
         }
         self.prompt = PromptState::None;
+        // A new project rarely matches the active sidebar filter, so drop the
+        // filter to keep the new project visible.
+        self.clear_left_search();
         if let Err(error) = self.add_project(path, String::new()) {
             self.open_add_project_failed_modal(format!("{error:#}"), return_prompt);
         }
@@ -7128,6 +7254,9 @@ impl App {
                     }
                     None => {}
                 }
+                // Clicking another pane ends the sidebar search editing mode
+                // but keeps the applied filter.
+                self.deactivate_left_search_if_unfocused();
             }
             MouseEventKind::Drag(MouseButton::Left) if self.mouse_drag.is_some() => {
                 self.update_dragged_panes(mouse.column, mouse.row);
@@ -7812,7 +7941,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
 
     use super::components::{ButtonPressedTarget, PressedButton};
-    use super::{DOUBLE_CLICK_THRESHOLD, is_terminal_link_click_modifier};
+    use super::{DOUBLE_CLICK_THRESHOLD, MouseTarget, is_terminal_link_click_modifier};
     use crate::app::input::{
         build_diff_comments_prompt, build_rebase_failed_prompt, opencode_sidebar_boundary,
         selected_terminal_text_from_snapshot, startup_command_log_visual_lines,
@@ -8027,6 +8156,9 @@ mod tests {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
+            left_search: TextInput::new(),
+            left_search_active: false,
+            left_search_origin: None,
             commit_input: TextInput::new()
                 .with_multiline(4)
                 .with_placeholder("Type your commit message\u{2026}"),
@@ -8156,6 +8288,7 @@ mod tests {
             center: Rect::new(20, 0, 57, 20),
             right: Rect::new(77, 0, 23, 20),
             left_list: Rect::new(1, 1, 18, 10),
+            left_list_offset: 0,
             terminal_list: Rect::default(),
             agent_term: Some(Rect::new(21, 1, 55, 16)),
             unstaged_list: Some(Rect::new(78, 1, 21, 8)),
@@ -18711,6 +18844,507 @@ cyan = "#00ffff"
         assert!(
             !rendered.contains("→"),
             "arrow should disappear once no swap is pending, got: {rendered}"
+        );
+    }
+
+    // ── Sidebar project/agent search ──────────────────────────────
+
+    fn push_search_project(app: &mut App, id: &str, name: &str) {
+        app.projects.push(Project {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("/tmp/dux-test-{id}"),
+            explicit_default_provider: None,
+            default_provider: ProviderKind::from_str("codex"),
+            leading_branch: Some("main".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "main".to_string(),
+            branch_status: ProjectBranchStatus::Unknown,
+            path_missing: false,
+        });
+        app.rebuild_left_items();
+    }
+
+    fn push_search_session(app: &mut App, id: &str, project_id: &str, title: &str, branch: &str) {
+        let now = Utc::now();
+        let project_path = app
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.path.clone());
+        app.sessions.push(AgentSession {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            project_path,
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: branch.to_string(),
+            worktree_path: format!("/tmp/dux-test-{id}"),
+            title: Some(title.to_string()),
+            started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
+            desired_running: false,
+            auto_reopen_enabled: true,
+            status: SessionStatus::Detached,
+            created_at: now,
+            updated_at: now,
+        });
+        app.rebuild_left_items();
+    }
+
+    /// The seeded app has one project ("demo") with one agent. This adds an
+    /// "alpha" project with an agent so the search has something to find.
+    fn search_test_app() -> App {
+        let mut app = test_app(default_bindings());
+        push_search_project(&mut app, "project-alpha", "alpha");
+        push_search_session(
+            &mut app,
+            "session-alpha",
+            "project-alpha",
+            "fix-auth",
+            "fix-auth",
+        );
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .expect("handle key");
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    fn open_sidebar_search(app: &mut App) {
+        app.focus = FocusPane::Left;
+        press(app, KeyCode::Char('/'));
+        assert!(app.left_search_active, "the search should be active");
+    }
+
+    #[test]
+    fn slash_opens_the_sidebar_search() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        assert_eq!(app.focus, FocusPane::Left);
+        assert_eq!(app.left_section, LeftSection::Projects);
+    }
+
+    #[test]
+    fn typing_in_the_sidebar_search_filters_the_list() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+
+        assert!(app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 2);
+        assert_eq!(app.left_items()[0], LeftItem::Project(1));
+        assert_eq!(app.left_items()[1], LeftItem::Session(1));
+    }
+
+    #[test]
+    fn a_single_character_query_does_not_filter() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "a");
+
+        assert!(!app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 4);
+    }
+
+    #[test]
+    fn enter_applies_the_filter_and_keeps_it() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(!app.left_search_active);
+        assert!(app.has_left_search());
+        assert!(app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 2);
+    }
+
+    #[test]
+    fn esc_clears_the_filter_and_restores_the_previous_selection() {
+        let mut app = search_test_app();
+        app.focus = FocusPane::Left;
+        app.selected_left = 0;
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "alpha");
+
+        // The selection moved to the matching project.
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Project(
+                "project-alpha".to_string()
+            ))
+        );
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(!app.has_left_search());
+        assert!(!app.left_search_active);
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Project(
+                "project-1".to_string()
+            ))
+        );
+        assert_eq!(app.left_items().len(), 4);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 2);
+        let selected = app.selected_left_target();
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(!app.has_left_search());
+        assert!(!app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 4);
+        assert_eq!(
+            app.selected_left_target(),
+            selected,
+            "clearing an applied filter should keep the found row selected"
+        );
+    }
+
+    #[test]
+    fn tab_on_a_query_without_matches_clears_it_and_moves_on() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "zzzz");
+        assert!(app.left_items().is_empty());
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.left_search_active);
+        assert!(!app.has_left_search());
+        assert_eq!(app.focus, FocusPane::Center);
+    }
+
+    #[test]
+    fn tab_while_searching_files_moves_to_the_next_pane() {
+        let mut app = test_app(default_bindings());
+        app.focus = FocusPane::Files;
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.files_search_active);
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.files_search_active);
+        assert_eq!(app.focus, FocusPane::Left);
+    }
+
+    #[test]
+    fn the_scratch_header_keeps_its_selection_while_filtering() {
+        let mut app = search_test_app();
+        push_search_project(&mut app, crate::model::SCRATCH_PROJECT_ID, "Scratch");
+        push_search_session(
+            &mut app,
+            "scratch-1",
+            crate::model::SCRATCH_PROJECT_ID,
+            "adhoc",
+            "adhoc",
+        );
+        let scratch_index = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::ScratchHeader))
+            .expect("scratch header");
+        app.selected_left = scratch_index;
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Scratch)
+        );
+
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "scratch");
+
+        assert!(app.left_search_is_filtering());
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Scratch),
+            "the scratch header selection should survive the filtered rebuild"
+        );
+    }
+
+    #[test]
+    fn arrow_keys_move_within_the_filtered_results() {
+        let mut app = search_test_app();
+        push_search_session(
+            &mut app,
+            "session-alpha-2",
+            "project-alpha",
+            "auth-rewrite",
+            "auth-rewrite",
+        );
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+
+        assert_eq!(app.left_items().len(), 3);
+        assert_eq!(app.selected_left, 0);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_left, 1);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_left, 2);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_left, 1);
+    }
+
+    #[test]
+    fn typing_q_in_the_sidebar_search_does_not_quit() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("handle key");
+
+        assert!(!quit, "typing in the search must not quit dux");
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.left_search.text, "q");
+    }
+
+    #[test]
+    fn typing_q_in_the_files_search_does_not_quit() {
+        let mut app = test_app(default_bindings());
+        app.focus = FocusPane::Files;
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.files_search_active);
+
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .expect("handle key");
+
+        assert!(!quit, "typing in the search must not quit dux");
+        assert!(matches!(app.prompt, PromptState::None));
+        assert_eq!(app.files_search.text, "q");
+    }
+
+    #[test]
+    fn the_sidebar_search_can_be_opened_from_the_terminals_section() {
+        let mut app = search_test_app();
+        app.focus = FocusPane::Left;
+        app.left_section = LeftSection::Terminals;
+
+        press(&mut app, KeyCode::Char('/'));
+
+        assert!(app.left_search_active);
+        assert_eq!(app.left_section, LeftSection::Projects);
+    }
+
+    #[test]
+    fn the_sidebar_search_expands_a_collapsed_sidebar() {
+        let mut app = search_test_app();
+        app.left_collapsed = true;
+        app.focus = FocusPane::Left;
+
+        press(&mut app, KeyCode::Char('/'));
+
+        assert!(!app.left_collapsed);
+        assert!(app.left_search_active);
+    }
+
+    #[test]
+    fn the_selection_survives_a_background_rebuild_while_filtering() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Down);
+        let target = app.selected_left_target();
+
+        // A background worker adds a session and rebuilds the tree.
+        push_search_session(&mut app, "session-late", "project-alpha", "late", "late");
+
+        assert_eq!(app.selected_left_target(), target);
+    }
+
+    #[test]
+    fn enter_without_a_match_keeps_the_search_open() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "zzzz");
+        assert!(app.left_items().is_empty());
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.left_search_active);
+        assert!(app.has_left_search());
+    }
+
+    #[test]
+    fn enter_on_a_short_query_dismisses_it() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "a");
+        assert!(!app.left_search_is_filtering());
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(!app.left_search_active);
+        assert!(!app.has_left_search());
+    }
+
+    #[test]
+    fn tab_applies_the_filter_and_moves_to_the_next_pane() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.left_search_active);
+        assert!(app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 2);
+        assert_eq!(app.focus, FocusPane::Center);
+    }
+
+    #[test]
+    fn creating_an_agent_clears_the_sidebar_filter() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.left_search_is_filtering());
+
+        // The new agent belongs to "demo" and has a title that does not match
+        // "alpha", so an applied filter would hide it.
+        let worktree = app.paths.worktrees_root.join("demo").join("unrelated");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let session = AgentSession {
+            id: "unrelated-session".to_string(),
+            project_id: app.projects[0].id.clone(),
+            project_path: Some(app.projects[0].path.clone()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "unrelated".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            title: Some("unrelated".to_string()),
+            started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
+            desired_running: false,
+            auto_reopen_enabled: true,
+            status: SessionStatus::Detached,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let args = vec!["-c".to_string(), "sleep 1".to_string()];
+        let client =
+            PtyClient::spawn("/bin/sh", &args, &worktree, 24, 80, 1_000).expect("spawn new agent");
+        let request = app.agent_launch_request(
+            session.clone(),
+            true,
+            AgentLaunchKind::Create {
+                status_message: "created".to_string(),
+                repo_path: app.projects[0].path.clone(),
+                owns_worktree: false,
+                startup_result: None,
+            },
+        );
+        app.worker_tx
+            .send(WorkerEvent::AgentLaunchReady(Box::new(
+                crate::app::AgentLaunchReadyData {
+                    request,
+                    client,
+                    previous_provider_session_ids: Default::default(),
+                },
+            )))
+            .unwrap();
+        app.drain_events();
+
+        assert!(
+            !app.has_left_search(),
+            "the filter should be cleared so the new agent is visible"
+        );
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Session(
+                "unrelated-session".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_palette_command_opens_the_sidebar_search() {
+        let mut app = search_test_app();
+
+        app.execute_command("search-projects".to_string())
+            .expect("run palette command");
+
+        assert!(app.left_search_active);
+        assert_eq!(app.focus, FocusPane::Left);
+    }
+
+    #[test]
+    fn projects_stay_expanded_while_a_filter_is_applied() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.left_search_is_filtering());
+
+        let before = app.collapsed_projects.clone();
+        app.toggle_collapse_selected_project();
+
+        assert_eq!(app.collapsed_projects, before);
+    }
+
+    #[test]
+    fn mouse_click_uses_the_left_list_scroll_offset() {
+        let mut app = search_test_app();
+        install_mouse_layout(&mut app);
+        // Simulate a projects list scrolled down by one row.
+        app.mouse_layout.left_list_offset = 1;
+
+        assert_eq!(
+            app.mouse_target(5, 1),
+            Some(MouseTarget::LeftRow(1)),
+            "the first visible row should map to the second list item"
+        );
+    }
+
+    #[test]
+    fn the_sidebar_search_row_is_rendered() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("/ alpha"),
+            "the search row should show the query, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Projects (1/2)"),
+            "the title should show the filtered project count, got: {rendered}"
         );
     }
 }
