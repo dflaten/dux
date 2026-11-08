@@ -286,9 +286,19 @@ impl App {
             .title
             .clone()
             .unwrap_or_else(|| session.branch_name.clone());
-        let default_path = home::home_dir()
-            .map(|home| {
-                default_scratch_project_destination(&home, &label, &self.projects)
+        // Prefer the configured project-browser start directory so new
+        // projects land where the user keeps their code, then fall back to
+        // the home directory.
+        let default_path = self
+            .config
+            .defaults
+            .start_directory
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(home::home_dir)
+            .map(|base| {
+                default_scratch_project_destination(&base, &label, &self.projects)
                     .to_string_lossy()
                     .to_string()
             })
@@ -3981,6 +3991,40 @@ mod tests {
                 assert!(matches!(request, CreateAgentRequest::Scratch { .. }));
             }
             other => panic!("expected scratch name prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_scratch_prompt_defaults_into_the_project_start_directory() {
+        let dir = tempdir().expect("tempdir");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).expect("projects dir");
+
+        let scratch_project = make_scratch_project();
+        let mut session = make_session("scratch-1", "claude", "/tmp/dux-scratch/scratch-1");
+        session.project_id = scratch_project.id.clone();
+        session.title = Some("Notes".to_string());
+        let mut app = test_app_with_sessions(vec![session], vec![scratch_project]);
+        app.config.defaults.start_directory = Some(projects_dir.to_string_lossy().to_string());
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("scratch session row");
+
+        app.open_convert_scratch_to_project_prompt()
+            .expect("convert prompt opens");
+
+        match &app.prompt {
+            PromptState::ConvertScratchToProject { input, .. } => {
+                assert_eq!(
+                    PathBuf::from(&input.text),
+                    projects_dir.join("Notes"),
+                    "the default destination should use the configured start directory"
+                );
+            }
+            other => panic!("expected convert prompt, got {other:?}"),
         }
     }
 
