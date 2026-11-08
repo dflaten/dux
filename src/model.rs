@@ -35,6 +35,14 @@ pub struct PrInfo {
     pub url: String,
 }
 
+/// Reserved project id for the built-in scratch workspace. Scratch agents are
+/// stored in SQLite like any other agent but are never written to
+/// `config.toml`, so the workspace stays runtime-only state.
+pub const SCRATCH_PROJECT_ID: &str = "__dux_scratch__";
+
+/// Display name for the built-in scratch workspace.
+pub const SCRATCH_PROJECT_NAME: &str = "Scratch";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderKind(String);
 
@@ -66,6 +74,13 @@ pub struct Project {
     pub current_branch: String,
     pub branch_status: ProjectBranchStatus,
     pub path_missing: bool,
+}
+
+impl Project {
+    /// Whether this is the built-in scratch workspace rather than a user project.
+    pub fn is_scratch(&self) -> bool {
+        self.id == SCRATCH_PROJECT_ID
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +154,12 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// Whether this agent runs in the built-in scratch workspace instead of a
+    /// project worktree.
+    pub fn is_scratch(&self) -> bool {
+        self.project_id == SCRATCH_PROJECT_ID
+    }
+
     pub fn has_started_provider(&self, provider: &ProviderKind) -> bool {
         self.started_providers
             .iter()

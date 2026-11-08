@@ -41,7 +41,7 @@ use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
     AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProjectBranchStatus, ProviderKind,
-    SessionStatus, SessionSurface,
+    SCRATCH_PROJECT_ID, SCRATCH_PROJECT_NAME, SessionStatus, SessionSurface,
 };
 use crate::provider;
 use crate::pty::PtyClient;
@@ -125,6 +125,7 @@ pub struct App {
     pub(crate) terminal_return_to_list: bool,
     pub(crate) terminal_counter: usize,
     pub(crate) create_agent_in_flight: bool,
+    pub(crate) scratch_conversion_in_flight: bool,
     pub(crate) agent_launches_in_flight: HashSet<String>,
     pub(crate) pulls_in_flight: HashSet<String>,
     pub(crate) rebases_in_flight: HashSet<String>,
@@ -823,6 +824,18 @@ pub(crate) enum PromptState {
         session_id: String,
         input: TextInput,
         rename_branch: bool,
+    },
+    ConvertScratchToProject {
+        session_id: String,
+        session_label: String,
+        input: TextInput,
+    },
+    PickScratchProject {
+        session_id: String,
+        session_label: String,
+        projects: Vec<Project>,
+        selected: usize,
+        filter: TextInput,
     },
     PullRequestInput {
         project: Project,
@@ -1525,11 +1538,16 @@ pub(crate) enum LeftItem {
     Session(usize),
     EmptyProjectsSpacer,
     EmptyProjectsSeparator,
+    ScratchHeader,
+    ScratchSeparator,
 }
 
 impl LeftItem {
     pub(crate) fn is_selectable(self) -> bool {
-        matches!(self, LeftItem::Project(_) | LeftItem::Session(_))
+        matches!(
+            self,
+            LeftItem::Project(_) | LeftItem::Session(_) | LeftItem::ScratchHeader
+        )
     }
 }
 
@@ -1539,12 +1557,19 @@ pub(crate) fn build_left_items(
     collapsed_projects: &HashSet<String>,
     empty_project_separator_min_projects: u16,
 ) -> Vec<LeftItem> {
+    let project_count = projects
+        .iter()
+        .filter(|project| !project.is_scratch())
+        .count();
     let split_empty_projects = empty_project_separator_min_projects > 0
-        && projects.len() >= usize::from(empty_project_separator_min_projects);
+        && project_count >= usize::from(empty_project_separator_min_projects);
     let mut items = Vec::new();
     let mut empty_projects = Vec::new();
 
     for (project_index, project) in projects.iter().enumerate() {
+        if project.is_scratch() {
+            continue;
+        }
         let has_sessions = sessions
             .iter()
             .any(|session| session.project_id == project.id);
@@ -1584,6 +1609,21 @@ pub(crate) fn build_left_items(
                 sessions,
                 collapsed_projects,
             );
+        }
+    }
+
+    // Scratch is always visible and always lives below the project groups.
+    if projects.iter().any(|project| project.is_scratch()) {
+        if !items.is_empty() {
+            items.push(LeftItem::ScratchSeparator);
+        }
+        items.push(LeftItem::ScratchHeader);
+        if !collapsed_projects.contains(SCRATCH_PROJECT_ID) {
+            for (session_index, session) in sessions.iter().enumerate() {
+                if session.is_scratch() {
+                    items.push(LeftItem::Session(session_index));
+                }
+            }
         }
     }
 
@@ -1670,6 +1710,10 @@ pub(crate) enum CreateAgentRequest {
         use_existing_branch: bool,
         pull_before_create: bool,
     },
+    Scratch {
+        project: Project,
+        custom_name: Option<String>,
+    },
     PullRequest {
         project: Project,
         host: String,
@@ -1702,9 +1746,45 @@ pub(crate) enum CreateAgentRequest {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ScratchConversionTarget {
+    NewProject { destination: PathBuf },
+    ExistingProject { project: Project },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScratchConversionRequest {
+    pub(crate) session: AgentSession,
+    pub(crate) target: ScratchConversionTarget,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScratchConversionOutcome {
+    pub(crate) session: AgentSession,
+    pub(crate) new_project: Option<Project>,
+    pub(crate) status_message: String,
+}
+
+pub(crate) fn filtered_scratch_project_indices(projects: &[Project], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    projects
+        .iter()
+        .enumerate()
+        .filter(|(_, project)| {
+            needle.is_empty()
+                || project.name.to_lowercase().contains(&needle)
+                || project.path.to_lowercase().contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub(crate) enum WorkerEvent {
     CreateAgentProgress(String),
     CreateAgentFailed(String),
+    ScratchConversionCompleted {
+        result: std::result::Result<ScratchConversionOutcome, String>,
+    },
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
     ProviderSessionIdDiscovered {
@@ -1917,7 +1997,7 @@ impl App {
 
         let session_store = SessionStore::open(&paths.sessions_db_path)?;
         sync_config_projects_with_store(&mut config, &paths, &bindings, &session_store)?;
-        let projects = load_projects(&session_store.load_projects()?, &config);
+        let mut projects = load_projects(&session_store.load_projects()?, &config);
         persist_runtime_projects_to_config_and_store(
             &projects,
             &mut config,
@@ -1925,6 +2005,7 @@ impl App {
             &bindings,
             &session_store,
         )?;
+        projects.push(scratch_project(&paths, &config)?);
         let sessions = session_store.load_sessions()?;
         let (worker_tx, worker_rx) = mpsc::channel();
         let watched_worktree: Arc<Mutex<Option<WatchedWorktree>>> = Arc::new(Mutex::new(None));
@@ -1993,6 +2074,7 @@ impl App {
             terminal_return_to_list: false,
             terminal_counter: 0,
             create_agent_in_flight: false,
+            scratch_conversion_in_flight: false,
             agent_launches_in_flight: HashSet::new(),
             pulls_in_flight: HashSet::new(),
             rebases_in_flight: HashSet::new(),
@@ -2470,6 +2552,11 @@ impl App {
             Action::RebaseCurrentBranch => self
                 .selected_session()
                 .is_some_and(|session| self.base_branch_updates.contains_key(&session.id)),
+            Action::ConvertScratchToProject | Action::MoveScratchToProject => {
+                self.selected_session()
+                    .is_some_and(|session| session.is_scratch())
+                    && !self.scratch_conversion_in_flight
+            }
             _ => true,
         }
     }
@@ -2523,6 +2610,7 @@ impl App {
         self.config.projects = self
             .projects
             .iter()
+            .filter(|project| !project.is_scratch())
             .map(|project| runtime_project_to_config(project, &existing_projects))
             .collect();
         save_config(&self.paths.config_path, &self.config, &self.bindings)
@@ -2557,6 +2645,9 @@ impl App {
         let command = command.trim();
         match command {
             "new-agent" => self.create_agent_for_selected_project(),
+            "new-scratch-agent" => self.create_scratch_agent(),
+            "convert-scratch-to-project" => self.open_convert_scratch_to_project_prompt(),
+            "move-scratch-to-project" => self.open_move_scratch_to_project_prompt(),
             "new-agent-from-pr" => self.open_new_agent_from_pr_prompt(),
             "new-agent-from-worktree" => self.create_agent_from_existing_worktree(),
             "fork-agent" => self.fork_selected_session(),
@@ -2793,6 +2884,7 @@ impl App {
             &self.bindings,
             &self.session_store,
         )?;
+        self.projects.push(scratch_project(&self.paths, &config)?);
         self.config = config;
 
         refresh_project_defaults(&mut self.projects, &self.config);
@@ -2957,26 +3049,33 @@ impl App {
     }
 
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
-        if let Some(project) = self.selected_project() {
-            let id = project.id.clone();
-            let has_sessions = self.sessions.iter().any(|s| s.project_id == id);
-            if !has_sessions {
-                return;
-            }
-            if self.collapsed_projects.contains(&id) {
-                self.collapsed_projects.remove(&id);
-            } else {
-                self.collapsed_projects.insert(id.clone());
-            }
-            self.rebuild_left_items();
+        let project_id = match self.left_items().get(self.selected_left) {
+            Some(LeftItem::Project(index)) => self.projects.get(*index).map(|p| p.id.clone()),
+            Some(LeftItem::ScratchHeader) => Some(SCRATCH_PROJECT_ID.to_string()),
+            _ => None,
+        };
+        let Some(project_id) = project_id else {
+            return;
+        };
+        let has_sessions = self.sessions.iter().any(|s| s.project_id == project_id);
+        if !has_sessions {
+            return;
+        }
+        if self.collapsed_projects.contains(&project_id) {
+            self.collapsed_projects.remove(&project_id);
+        } else {
+            self.collapsed_projects.insert(project_id.clone());
+        }
+        self.rebuild_left_items();
 
-            // Move selection to the toggled project so collapsing from a
-            // child session leaves the cursor on the parent header.
-            if let Some(new_index) = self.left_items().iter().position(
-                |item| matches!(item, LeftItem::Project(pi) if self.projects[*pi].id == id),
-            ) {
-                self.selected_left = new_index;
-            }
+        // Move selection to the toggled group so collapsing from a child
+        // session leaves the cursor on the parent header.
+        if let Some(new_index) = self.left_items().iter().position(|item| match item {
+            LeftItem::Project(pi) => self.projects[*pi].id == project_id,
+            LeftItem::ScratchHeader => project_id == SCRATCH_PROJECT_ID,
+            _ => false,
+        }) {
+            self.selected_left = new_index;
         }
     }
 
@@ -2988,8 +3087,12 @@ impl App {
                     .iter()
                     .find(|project| project.id == session.project_id)
             }),
-            Some(LeftItem::EmptyProjectsSpacer) => None,
-            Some(LeftItem::EmptyProjectsSeparator) => None,
+            Some(LeftItem::ScratchHeader) => {
+                self.projects.iter().find(|project| project.is_scratch())
+            }
+            Some(LeftItem::EmptyProjectsSpacer)
+            | Some(LeftItem::EmptyProjectsSeparator)
+            | Some(LeftItem::ScratchSeparator) => None,
             None => None,
         }
     }
@@ -3064,6 +3167,18 @@ impl App {
     }
 
     fn reload_changed_files_with_status(&mut self, show_status: bool) {
+        if self
+            .selected_session()
+            .is_some_and(|session| session.is_scratch())
+        {
+            if let Ok(mut guard) = self.watched_worktree.lock() {
+                *guard = None;
+            }
+            self.staged_files.clear();
+            self.unstaged_files.clear();
+            self.clamp_files_cursor();
+            return;
+        }
         let selected = self.selected_session().map(|s| {
             let configured_base_ref = self.configured_base_ref_for_session(s);
             (
@@ -3235,14 +3350,18 @@ impl App {
 
     pub(crate) fn open_rename_session(&mut self) -> Result<()> {
         if let Some(session) = self.selected_session().cloned() {
-            let current_name = session.title.unwrap_or_else(|| session.branch_name.clone());
+            let current_name = session
+                .title
+                .clone()
+                .unwrap_or_else(|| session.branch_name.clone());
+            let rename_branch = !session.is_scratch();
             self.input_target = InputTarget::None;
             self.fullscreen_overlay = FullscreenOverlay::None;
             self.prompt = PromptState::RenameSession {
                 session_id: session.id,
                 input: TextInput::with_text(current_name)
                     .with_char_map(crate::git::agent_name_char_map),
-                rename_branch: true,
+                rename_branch,
             };
         } else {
             self.set_error("No agent session selected.");
@@ -3269,6 +3388,12 @@ impl App {
             return;
         }
 
+        let is_scratch = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .is_some_and(|s| s.is_scratch());
+
         // Capture the previous title before mutating, in case we need to
         // revert on a failed branch rename.
         let previous_title = self
@@ -3287,8 +3412,9 @@ impl App {
         }
         self.rebuild_left_items();
 
-        // Optionally rename the git branch in a background worker.
-        if rename_branch {
+        // Optionally rename the git branch in a background worker. Scratch
+        // agents have no branch; only their display title changes.
+        if rename_branch && !is_scratch {
             let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
                 return;
             };
@@ -3374,6 +3500,7 @@ impl App {
             *guard = self
                 .sessions
                 .iter()
+                .filter(|session| !session.is_scratch())
                 .map(|s| BranchSyncEntry {
                     session_id: s.id.clone(),
                     worktree_path: s.worktree_path.clone(),
@@ -3574,6 +3701,53 @@ pub(crate) fn load_projects(
     projects
 }
 
+/// Turn an agent name into a safe directory component for the scratch root.
+/// Slashes and other path separators are collapsed into dashes so a scratch
+/// agent can never escape its workspace directory.
+pub(crate) fn scratch_workspace_dir_name(requested: &str) -> String {
+    let mut name = String::new();
+    for ch in requested.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            name.push(ch);
+        } else if !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    let trimmed = name.trim_matches(['-', '_']);
+    if trimmed.is_empty() {
+        "scratch".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the built-in scratch workspace. It is added to the runtime project
+/// list on boot and config reload, but intentionally omitted from every
+/// config/SQLite project write.
+pub(crate) fn scratch_project(paths: &DuxPaths, config: &Config) -> Result<Project> {
+    let root = paths.scratch_root();
+    std::fs::create_dir_all(&root).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to create scratch workspace directory {}: {err}",
+            root.display()
+        )
+    })?;
+    Ok(Project {
+        id: SCRATCH_PROJECT_ID.to_string(),
+        name: SCRATCH_PROJECT_NAME.to_string(),
+        path: root.to_string_lossy().to_string(),
+        explicit_default_provider: None,
+        default_provider: config.default_provider(),
+        leading_branch: None,
+        auto_reopen_agents: None,
+        startup_command: None,
+        env: std::collections::BTreeMap::new(),
+        current_branch: String::new(),
+        branch_status: ProjectBranchStatus::Unknown,
+        path_missing: false,
+    })
+}
+
 pub(crate) fn persist_runtime_projects_to_config_and_store(
     projects: &[Project],
     config: &mut Config,
@@ -3584,6 +3758,7 @@ pub(crate) fn persist_runtime_projects_to_config_and_store(
     let existing_projects = config.projects.clone();
     let stored_project_configs = projects
         .iter()
+        .filter(|project| !project.is_scratch())
         .map(|project| runtime_project_to_config(project, &existing_projects))
         .collect::<Vec<_>>();
     let config_project_configs = stored_project_configs
@@ -3680,6 +3855,11 @@ pub(crate) fn sync_config_projects_with_store(
 
 fn validate_project_records(source: &str, projects: &[crate::config::ProjectConfig]) -> Result<()> {
     for (index, project) in projects.iter().enumerate() {
+        if project.id == SCRATCH_PROJECT_ID {
+            anyhow::bail!(
+                "Project sync conflict in {source}: project id \"{SCRATCH_PROJECT_ID}\" is reserved for the built-in scratch workspace. Choose a different id in config.toml."
+            );
+        }
         for other in projects.iter().skip(index + 1) {
             if project.id == other.id {
                 anyhow::bail!(
@@ -4035,6 +4215,52 @@ mod tests {
                 LeftItem::Project(3),
             ]
         );
+    }
+
+    fn test_scratch_project() -> Project {
+        let mut project = test_project(SCRATCH_PROJECT_ID);
+        project.name = SCRATCH_PROJECT_NAME.to_string();
+        project.path = "/tmp/dux-scratch".to_string();
+        project.current_branch = String::new();
+        project.leading_branch = None;
+        project
+    }
+
+    #[test]
+    fn build_left_items_always_shows_scratch_group_below_projects() {
+        let projects = vec![test_project("project-1"), test_scratch_project()];
+        let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
+
+        let items = build_left_items(&projects, &sessions, &HashSet::new(), 1);
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::ScratchSeparator,
+                LeftItem::ScratchHeader,
+                LeftItem::Session(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_left_items_shows_empty_scratch_group_and_respects_collapse() {
+        let projects = vec![test_project("project-1"), test_scratch_project()];
+        let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
+
+        let expanded = build_left_items(&projects, &sessions, &HashSet::new(), 1);
+        assert!(expanded.contains(&LeftItem::ScratchHeader));
+        assert!(expanded.contains(&LeftItem::Session(0)));
+
+        let mut collapsed = HashSet::new();
+        collapsed.insert(SCRATCH_PROJECT_ID.to_string());
+        let collapsed_items = build_left_items(&projects, &sessions, &collapsed, 1);
+        assert!(collapsed_items.contains(&LeftItem::ScratchHeader));
+        assert!(!collapsed_items.contains(&LeftItem::Session(0)));
+
+        let empty_items = build_left_items(&projects, &[], &HashSet::new(), 1);
+        assert!(empty_items.contains(&LeftItem::ScratchHeader));
     }
 
     #[test]

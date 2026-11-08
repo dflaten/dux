@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 
 const MACRO_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const MACRO_AGENT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,6 +32,13 @@ impl App {
                 WorkerEvent::CreateAgentFailed(message) => {
                     self.create_agent_in_flight = false;
                     self.set_error(message);
+                }
+                WorkerEvent::ScratchConversionCompleted { result } => {
+                    self.scratch_conversion_in_flight = false;
+                    match result {
+                        Ok(outcome) => self.finish_scratch_conversion(outcome),
+                        Err(message) => self.set_error(message),
+                    }
                 }
                 WorkerEvent::AgentLaunchReady(boxed) => {
                     self.handle_agent_launch_ready(*boxed);
@@ -1082,11 +1090,28 @@ impl App {
                 status_message,
             } => {
                 let project_id = project.id.clone();
-                self.projects.push(project);
+                if let Some(existing) = self
+                    .projects
+                    .iter_mut()
+                    .find(|candidate| candidate.id == project.id)
+                {
+                    *existing = project;
+                } else {
+                    self.projects.push(project);
+                }
                 self.rebuild_left_items();
-                if let Some(index) = self.left_items().iter().position(|item| {
-                    matches!(item, LeftItem::Project(project_index) if self.projects[*project_index].id == project_id)
-                }) {
+                let selected_converted_session = self
+                    .left_items()
+                    .get(self.selected_left)
+                    .is_some_and(|item| match item {
+                        LeftItem::Session(index) => self.sessions[*index].project_id == project_id,
+                        _ => false,
+                    });
+                if !selected_converted_session
+                    && let Some(index) = self.left_items().iter().position(|item| {
+                        matches!(item, LeftItem::Project(project_index) if self.projects[*project_index].id == project_id)
+                    })
+                {
                     self.selected_left = index;
                 }
                 // The freshly added project is now selected and has no agents,
@@ -1841,7 +1866,11 @@ impl App {
                     return Err("Its project is no longer registered.".to_string());
                 }
                 if !Path::new(&entry.session.worktree_path).is_dir() {
-                    return Err("Its worktree no longer exists.".to_string());
+                    return Err(if entry.session.is_scratch() {
+                        "Its scratch workspace no longer exists (the cleanup workflow may have removed it).".to_string()
+                    } else {
+                        "Its worktree no longer exists.".to_string()
+                    });
                 }
                 if worktree_paths.contains(&entry.session.worktree_path) {
                     return Err("Another agent already uses its worktree.".to_string());
@@ -1886,7 +1915,11 @@ impl App {
     }
 
     pub(crate) fn spawn_project_branch_status_checks(&self) {
-        for project in self.projects.iter().filter(|project| !project.path_missing) {
+        for project in self
+            .projects
+            .iter()
+            .filter(|project| !project.path_missing && !project.is_scratch())
+        {
             let project = project.clone();
             let worker_tx = self.worker_tx.clone();
             thread::spawn(move || {
@@ -2055,6 +2088,7 @@ impl App {
             *guard = self
                 .sessions
                 .iter()
+                .filter(|session| !session.is_scratch())
                 .map(|s| PrSyncEntry {
                     session_id: s.id.clone(),
                     branch_name: s.branch_name.clone(),
@@ -2589,6 +2623,37 @@ pub(crate) fn run_pull_request_lookup_job(
 
 type CreateAgentWorktreeResult = (String, String, String, PathBuf, bool, Option<String>, bool);
 
+/// Create a unique scratch workspace directory for `requested`. Existing
+/// folders are preserved and skipped, so converting or deleting an agent never
+/// makes a future agent silently reuse old files.
+fn create_scratch_workspace(paths: &DuxPaths, requested: &str) -> Result<(String, PathBuf)> {
+    let root = paths.scratch_root();
+    fs::create_dir_all(&root)
+        .map_err(|err| anyhow::anyhow!("failed to create {}: {err}", root.display()))?;
+    let base = scratch_workspace_dir_name(requested);
+    for attempt in 1..=999u16 {
+        let name = if attempt == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let path = root.join(&name);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok((name, path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to create scratch workspace {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not find an available scratch workspace name for \"{requested}\""
+    ))
+}
+
 fn existing_worktree_request_for_branch(
     project: &Project,
     paths: &DuxPaths,
@@ -2735,6 +2800,7 @@ fn create_agent_worktree_from_existing_request(
             ))
         }
         CreateAgentRequest::NewProject { .. }
+        | CreateAgentRequest::Scratch { .. }
         | CreateAgentRequest::PullRequest { .. }
         | CreateAgentRequest::ForkSession { .. } => None,
     }
@@ -2936,6 +3002,52 @@ pub(crate) fn run_create_agent_job(
                 owns_worktree,
                 title,
                 launch_with_resume,
+                None,
+            )
+        }
+        CreateAgentRequest::Scratch {
+            project,
+            custom_name,
+        } => {
+            let Some(custom_name) = custom_name else {
+                let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(
+                    "Creating a scratch agent requires choosing a name first.".to_string(),
+                ));
+                return;
+            };
+            let provider = project.default_provider.clone();
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Creating scratch workspace \"{custom_name}\"..."
+            )));
+            let (workspace_name, worktree_path) =
+                match create_scratch_workspace(&paths, &custom_name) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        logger::error(&format!(
+                            "scratch workspace creation failed for {custom_name}: {err:#}"
+                        ));
+                        let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
+                            "Failed to create scratch workspace \"{custom_name}\": {err:#}"
+                        )));
+                        return;
+                    }
+                };
+            let status_message = format!(
+                "Created {} scratch agent \"{}\" at {}. It is not attached to a git repository; convert it to a project when the work is ready.",
+                provider.as_str(),
+                custom_name,
+                worktree_path.display(),
+            );
+            (
+                project.clone(),
+                provider,
+                String::new(),
+                status_message,
+                workspace_name,
+                worktree_path,
+                false,
+                Some(custom_name),
+                false,
                 None,
             )
         }
@@ -3292,6 +3404,8 @@ pub(crate) fn run_create_agent_job(
                 Path::new(&session.worktree_path),
                 &session.branch_name,
             );
+        } else if project.is_scratch() {
+            let _ = fs::remove_dir(Path::new(&session.worktree_path));
         }
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(message));
         return;
@@ -3304,6 +3418,8 @@ pub(crate) fn run_create_agent_job(
                 Path::new(&session.worktree_path),
                 &session.branch_name,
             );
+        } else if project.is_scratch() {
+            let _ = fs::remove_dir(Path::new(&session.worktree_path));
         }
         let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(hint));
         return;
@@ -3311,6 +3427,9 @@ pub(crate) fn run_create_agent_job(
     let env = match crate::config::resolve_agent_env(&config.env, &project.env) {
         Ok(env) => env,
         Err(err) => {
+            if project.is_scratch() {
+                let _ = fs::remove_dir(Path::new(&session.worktree_path));
+            }
             let _ = worker_tx.send(WorkerEvent::CreateAgentFailed(format!(
                 "Invalid environment variables for project \"{}\": {err:#}",
                 project.name
@@ -3389,6 +3508,285 @@ pub(crate) fn run_create_agent_job(
         },
     };
     run_agent_launch_job(request, worker_tx);
+}
+
+fn unique_scratch_branch(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+    base: &str,
+) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 2u16;
+    loop {
+        let worktree_path = worktrees_root.join(project_name).join(&name);
+        if !git::local_branch_exists(repo_path, &name) && !worktree_path.exists() {
+            return name;
+        }
+        name = format!("{base}-{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn converted_scratch_session(
+    mut session: AgentSession,
+    project: &Project,
+    worktree_path: PathBuf,
+    branch_name: String,
+    source_branch: String,
+) -> AgentSession {
+    session.project_id = project.id.clone();
+    session.project_path = Some(project.path.clone());
+    session.worktree_path = worktree_path.to_string_lossy().to_string();
+    session.branch_name = branch_name;
+    session.source_branch = source_branch;
+    session.status = SessionStatus::Detached;
+    session.updated_at = Utc::now();
+    session
+}
+
+pub(crate) fn run_scratch_conversion_job(
+    request: ScratchConversionRequest,
+    paths: DuxPaths,
+    config: Config,
+    worker_tx: Sender<WorkerEvent>,
+) {
+    let ScratchConversionRequest { session, target } = request;
+    if !session.is_scratch() {
+        let _ = worker_tx.send(WorkerEvent::ScratchConversionCompleted {
+            result: Err("Only scratch agents can be converted.".to_string()),
+        });
+        return;
+    }
+    let scratch_path = PathBuf::from(&session.worktree_path);
+    let scratch_label = session
+        .title
+        .clone()
+        .unwrap_or_else(|| session.branch_name.clone());
+    let result = match target {
+        ScratchConversionTarget::NewProject { destination } => {
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Preparing new project at {}...",
+                destination.display()
+            )));
+            let destination_existed = destination.exists();
+            let outcome = prepare_new_project_from_scratch(
+                &paths,
+                &scratch_path,
+                &destination,
+                &config,
+            )
+            .and_then(|project| {
+                    let base_name = scratch_label.clone();
+                    let branch_base = scratch_workspace_dir_name(&base_name);
+                    let branch_name = unique_scratch_branch(
+                        &destination,
+                        &paths.worktrees_root,
+                        &project.name,
+                        &branch_base,
+                    );
+                    let start_point = project
+                        .leading_branch
+                        .clone()
+                        .unwrap_or_else(|| "main".to_string());
+                    let (branch_name, worktree_path) = git::create_worktree_from_start_point(
+                        &destination,
+                        &paths.worktrees_root,
+                        &project.name,
+                        Some(&start_point),
+                        Some(&branch_name),
+                    )?;
+                    let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                        "Copying scratch files into worktree \"{}\"...",
+                        worktree_path.display()
+                    )));
+                    if let Err(err) =
+                        git::mirror_worktree_contents(&scratch_path, &worktree_path)
+                    {
+                        let _ = git::remove_worktree(&destination, &worktree_path, &branch_name);
+                        return Err(err.context(
+                            "failed to copy scratch files into the new project worktree",
+                        ));
+                    }
+                    let converted = converted_scratch_session(
+                        session,
+                        &project,
+                        worktree_path,
+                        branch_name.clone(),
+                        start_point,
+                    );
+                    let status_message = format!(
+                        "Converted scratch agent \"{}\" into new project \"{}\". Reconnect the agent to continue in its managed worktree. The original scratch folder was kept as a backup and can be removed by the regular cleanup workflow.",
+                        scratch_label, project.name
+                    );
+                    Ok(ScratchConversionOutcome {
+                        session: converted,
+                        new_project: Some(project),
+                        status_message,
+                    })
+                });
+            if outcome.is_err() && !destination_existed {
+                let _ = fs::remove_dir_all(&destination);
+            }
+            outcome
+                .map_err(|err| format!("Failed to convert scratch agent into a project: {err:#}"))
+        }
+        ScratchConversionTarget::ExistingProject { project } => {
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Copying scratch work into project \"{}\"...",
+                project.name
+            )));
+            (|| -> Result<ScratchConversionOutcome> {
+                let repo_path = PathBuf::from(&project.path);
+                if !repo_path.is_dir() {
+                    return Err(anyhow::anyhow!(
+                        "project path {} no longer exists",
+                        project.path
+                    ));
+                }
+                let start_point = project
+                    .leading_branch
+                    .clone()
+                    .filter(|branch| git::local_branch_exists(&repo_path, branch))
+                    .unwrap_or_else(|| project.current_branch.clone());
+                if start_point.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "project \"{}\" does not have a checked-out branch to start from",
+                        project.name
+                    ));
+                }
+                let base_name = scratch_label.clone();
+                let branch_base = scratch_workspace_dir_name(&base_name);
+                let branch_name = unique_scratch_branch(
+                    &repo_path,
+                    &paths.worktrees_root,
+                    &project.name,
+                    &branch_base,
+                );
+                let (branch_name, worktree_path) = git::create_worktree_from_start_point(
+                    &repo_path,
+                    &paths.worktrees_root,
+                    &project.name,
+                    Some(&start_point),
+                    Some(&branch_name),
+                )?;
+                let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                    "Copying scratch files into worktree \"{}\"...",
+                    worktree_path.display()
+                )));
+                if let Err(err) = git::mirror_worktree_contents(&scratch_path, &worktree_path) {
+                    let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+                    return Err(err.context("failed to copy scratch files into the new worktree"));
+                }
+                let converted = converted_scratch_session(
+                    session,
+                    &project,
+                    worktree_path,
+                    branch_name.clone(),
+                    start_point,
+                );
+                let status_message = format!(
+                    "Moved scratch agent \"{}\" into project \"{}\" on branch \"{}\". Reconnect the agent to continue. The original scratch folder was kept as a backup and can be removed by the regular cleanup workflow.",
+                    scratch_label, project.name, branch_name
+                );
+                Ok(ScratchConversionOutcome {
+                    session: converted,
+                    new_project: None,
+                    status_message,
+                })
+            })()
+            .map_err(|err| {
+                format!(
+                    "Failed to move scratch agent into project \"{}\": {err:#}",
+                    project.name
+                )
+            })
+        }
+    };
+    let _ = worker_tx.send(WorkerEvent::ScratchConversionCompleted { result });
+}
+
+fn prepare_new_project_from_scratch(
+    paths: &DuxPaths,
+    scratch_path: &Path,
+    destination: &Path,
+    config: &Config,
+) -> Result<Project> {
+    if !scratch_path.is_dir() {
+        return Err(anyhow::anyhow!(
+            "scratch workspace {} no longer exists",
+            scratch_path.display()
+        ));
+    }
+    if scratch_path.join(".git").exists() {
+        return Err(anyhow::anyhow!(
+            "scratch workspace already contains a git repository. Add it as a project instead of converting it."
+        ));
+    }
+
+    let created_destination = !destination.exists();
+    if destination.exists() {
+        if !destination.is_dir() {
+            return Err(anyhow::anyhow!(
+                "destination {} is not a directory",
+                destination.display()
+            ));
+        }
+        let mut entries = fs::read_dir(destination)
+            .with_context(|| format!("failed to inspect {}", destination.display()))?;
+        if entries.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "destination {} is not empty. Choose a new or empty directory.",
+                destination.display()
+            ));
+        }
+    } else {
+        fs::create_dir_all(destination)
+            .with_context(|| format!("failed to create {}", destination.display()))?;
+    }
+
+    let result = (|| -> Result<Project> {
+        if git::is_under(&paths.root, destination) {
+            return Err(anyhow::anyhow!(
+                "destination must be outside dux's data directory ({})",
+                paths.root.display()
+            ));
+        }
+        if git::is_git_repo(destination) {
+            return Err(anyhow::anyhow!(
+                "destination is inside an existing git repository. Choose a path outside it."
+            ));
+        }
+        git::mirror_worktree_contents(scratch_path, destination)
+            .context("failed to copy scratch files into the new project")?;
+        git::init_repository_with_initial_commit(destination)?;
+
+        let name = destination
+            .file_name()
+            .and_then(|part| part.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("project")
+            .to_string();
+        Ok(Project {
+            id: Uuid::new_v4().to_string(),
+            name,
+            path: destination.to_string_lossy().to_string(),
+            explicit_default_provider: None,
+            default_provider: config.default_provider(),
+            leading_branch: Some("main".to_string()),
+            auto_reopen_agents: None,
+            startup_command: None,
+            env: Default::default(),
+            current_branch: "main".to_string(),
+            branch_status: ProjectBranchStatus::Unknown,
+            path_missing: false,
+        })
+    })();
+
+    if result.is_err() && created_destination {
+        let _ = fs::remove_dir_all(destination);
+    }
+    result
 }
 
 pub(crate) fn run_agent_launch_job(request: AgentLaunchRequest, worker_tx: Sender<WorkerEvent>) {
@@ -3986,6 +4384,124 @@ mod tests {
             lock_path: root.join("dux.lock"),
             root: root.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn scratch_workspaces_are_sanitized_unique_and_never_reused() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+
+        let (first_name, first_path) =
+            create_scratch_workspace(&paths, "My Agent/One").expect("first workspace");
+        assert_eq!(first_name, "My-Agent-One");
+        std::fs::write(first_path.join("note.txt"), "keep me\n").expect("write note");
+
+        let (second_name, second_path) =
+            create_scratch_workspace(&paths, "My Agent/One").expect("second workspace");
+        assert_eq!(second_name, "My-Agent-One-2");
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::read_to_string(first_path.join("note.txt")).expect("read note"),
+            "keep me\n"
+        );
+        assert!(!second_path.join("note.txt").exists());
+    }
+
+    #[test]
+    fn scratch_conversion_rejects_non_empty_destination() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let scratch = tmp.path().join("scratch").join("ad-hoc");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("note.txt"), "keep\n").expect("scratch file");
+        let destination = tmp.path().join("existing");
+        std::fs::create_dir_all(&destination).expect("destination");
+        std::fs::write(destination.join("other.txt"), "other\n").expect("other file");
+
+        let err =
+            prepare_new_project_from_scratch(&paths, &scratch, &destination, &Config::default())
+                .expect_err("non-empty destination should fail");
+
+        assert!(err.to_string().contains("not empty"));
+        assert!(scratch.join("note.txt").exists());
+        assert!(destination.join("other.txt").exists());
+    }
+
+    #[test]
+    fn scratch_conversion_rejects_destination_inside_existing_repo() {
+        let tmp = tempdir().expect("tempdir");
+        let repo_tmp = tempdir().expect("repo tempdir");
+        let repo = repo_tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "backup");
+        let paths = test_paths(tmp.path());
+        let scratch = tmp.path().join("scratch").join("ad-hoc");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("note.txt"), "keep\n").expect("scratch file");
+        let destination = repo.join("nested-project");
+
+        let err =
+            prepare_new_project_from_scratch(&paths, &scratch, &destination, &Config::default())
+                .expect_err("destination inside a repo should fail");
+
+        assert!(err.to_string().contains("existing git repository"));
+        assert!(scratch.join("note.txt").exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn scratch_conversion_into_existing_project_copies_files_and_keeps_backup() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("repo dir");
+        init_repo_with_branch(&repo, "backup");
+        let paths = test_paths(tmp.path());
+        let scratch = tmp.path().join("scratch").join("ad-hoc");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("note.txt"), "from scratch\n").expect("scratch file");
+
+        let project = test_project(&repo);
+        let mut session = test_session(&scratch);
+        session.project_id = SCRATCH_PROJECT_ID.to_string();
+        session.project_path = None;
+        session.branch_name = "ad-hoc".to_string();
+        let (tx, rx) = mpsc::channel();
+        run_scratch_conversion_job(
+            ScratchConversionRequest {
+                session,
+                target: ScratchConversionTarget::ExistingProject {
+                    project: project.clone(),
+                },
+            },
+            paths,
+            Config::default(),
+            tx,
+        );
+
+        let outcome = loop {
+            match rx.recv().expect("worker event") {
+                WorkerEvent::ScratchConversionCompleted { result } => {
+                    break result.expect("conversion succeeds");
+                }
+                WorkerEvent::CreateAgentProgress(_) => continue,
+                _ => panic!("unexpected event"),
+            }
+        };
+
+        assert_eq!(outcome.session.project_id, project.id);
+        assert_eq!(outcome.session.source_branch, "main");
+        assert_eq!(outcome.session.branch_name, "ad-hoc");
+        assert!(outcome.new_project.is_none());
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&outcome.session.worktree_path).join("note.txt"))
+                .expect("converted file"),
+            "from scratch\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("note.txt")).expect("backup file"),
+            "from scratch\n"
+        );
+        assert!(outcome.status_message.contains("Moved scratch agent"));
     }
 
     fn init_repo_with_branch(repo: &Path, branch: &str) {

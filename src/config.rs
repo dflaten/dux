@@ -575,6 +575,13 @@ impl DuxPaths {
             .with_context(|| format!("failed to create {}", self.worktrees_root.display()))?;
         Ok(())
     }
+
+    /// Root directory for scratch agents that are not attached to a project.
+    /// Scratch workspaces live under the dux data directory and are runtime
+    /// state, not project configuration.
+    pub fn scratch_root(&self) -> PathBuf {
+        self.root.join("scratch")
+    }
 }
 
 pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {

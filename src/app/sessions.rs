@@ -223,8 +223,33 @@ impl App {
             return Ok(());
         }
 
+        if project.is_scratch() {
+            return self.open_name_new_agent_prompt(CreateAgentRequest::Scratch {
+                project,
+                custom_name: None,
+            });
+        }
+
         self.dispatch_create_agent_branch_inspection(project);
         Ok(())
+    }
+
+    /// Open the name prompt for a new scratch agent, regardless of what is
+    /// currently selected in the left pane.
+    pub(crate) fn create_scratch_agent(&mut self) -> Result<()> {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.is_scratch())
+            .cloned()
+        else {
+            self.set_error("The scratch workspace is unavailable.");
+            return Ok(());
+        };
+        self.open_name_new_agent_prompt(CreateAgentRequest::Scratch {
+            project,
+            custom_name: None,
+        })
     }
 
     pub(crate) fn continue_create_agent_after_branch_inspection(
@@ -248,6 +273,308 @@ impl App {
         })
     }
 
+    pub(crate) fn open_convert_scratch_to_project_prompt(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select a scratch agent first.");
+            return Ok(());
+        };
+        if !session.is_scratch() {
+            self.set_error("Only scratch agents can be converted to projects.");
+            return Ok(());
+        }
+        let label = session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.branch_name.clone());
+        let dir_name = scratch_workspace_dir_name(&label);
+        let default_path = home::home_dir()
+            .map(|home| home.join(&dir_name).to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.input_target = InputTarget::None;
+        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.prompt = PromptState::ConvertScratchToProject {
+            session_id: session.id,
+            session_label: label,
+            input: TextInput::with_text(default_path).with_placeholder("~/path/to/new-project"),
+        };
+        self.set_info(
+            "Enter the destination for the new project. Scratch files are copied there, a git repository is initialized, and the agent moves to a managed worktree.",
+        );
+        Ok(())
+    }
+
+    pub(crate) fn open_move_scratch_to_project_prompt(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select a scratch agent first.");
+            return Ok(());
+        };
+        if !session.is_scratch() {
+            self.set_error("Only scratch agents can be moved into a project.");
+            return Ok(());
+        }
+        let projects = self
+            .projects
+            .iter()
+            .filter(|project| !project.is_scratch() && !project.path_missing)
+            .cloned()
+            .collect::<Vec<_>>();
+        if projects.is_empty() {
+            self.set_error(
+                "No projects are available. Add a project first, or convert this scratch agent into a new project.",
+            );
+            return Ok(());
+        }
+        let label = session
+            .title
+            .clone()
+            .unwrap_or_else(|| session.branch_name.clone());
+        self.input_target = InputTarget::None;
+        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.prompt = PromptState::PickScratchProject {
+            session_id: session.id,
+            session_label: label,
+            projects,
+            selected: 0,
+            filter: TextInput::new().with_placeholder("Search projects..."),
+        };
+        self.set_info(
+            "Choose the project that should receive this scratch work. The files are copied into a fresh managed worktree.",
+        );
+        Ok(())
+    }
+
+    pub(crate) fn apply_convert_scratch_to_project_prompt(&mut self) -> Result<()> {
+        let (session_id, raw_path) = match &self.prompt {
+            PromptState::ConvertScratchToProject {
+                session_id, input, ..
+            } => (session_id.clone(), input.text.trim().to_string()),
+            _ => return Ok(()),
+        };
+        if raw_path.is_empty() {
+            self.set_error("Enter a destination path for the new project.");
+            return Ok(());
+        }
+        let Some(expanded) = crate::config::expand_path(&raw_path) else {
+            self.set_error(
+                "Project destination must be an absolute path or start with ~. Relative paths are not supported.",
+            );
+            return Ok(());
+        };
+        let destination = PathBuf::from(expanded);
+        if destination.exists() {
+            if !destination.is_dir() {
+                self.set_error(format!(
+                    "Destination {} is not a directory.",
+                    destination.display()
+                ));
+                return Ok(());
+            }
+            match std::fs::read_dir(&destination) {
+                Ok(mut entries) => {
+                    if entries.next().is_some() {
+                        self.set_error(format!(
+                            "Destination {} is not empty. Choose a new or empty directory.",
+                            destination.display()
+                        ));
+                        return Ok(());
+                    }
+                }
+                Err(err) => {
+                    self.set_error(format!(
+                        "Could not inspect destination {}: {err}",
+                        destination.display()
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        if destination.starts_with(&self.paths.root)
+            || git::is_under(&self.paths.root, &destination)
+        {
+            self.set_error(format!(
+                "Destination must be outside dux's data directory ({}).",
+                self.paths.root.display()
+            ));
+            return Ok(());
+        }
+        let canonical = destination
+            .canonicalize()
+            .unwrap_or_else(|_| destination.clone());
+        if self.projects.iter().any(|project| {
+            !project.is_scratch()
+                && PathBuf::from(&project.path)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&project.path))
+                    == canonical
+        }) {
+            self.set_error(format!(
+                "Destination {} is already registered as a project.",
+                destination.display()
+            ));
+            return Ok(());
+        }
+        self.prompt = PromptState::None;
+        self.dispatch_scratch_conversion(
+            session_id,
+            ScratchConversionTarget::NewProject { destination },
+        )
+    }
+
+    pub(crate) fn apply_move_scratch_to_project_prompt(&mut self) -> Result<()> {
+        let PromptState::PickScratchProject {
+            session_id,
+            projects,
+            selected,
+            filter,
+            ..
+        } = &self.prompt
+        else {
+            return Ok(());
+        };
+        let session_id = session_id.clone();
+        let matches = filtered_scratch_project_indices(projects, &filter.text);
+        let Some(project) = matches
+            .get(*selected)
+            .and_then(|index| projects.get(*index))
+            .cloned()
+        else {
+            self.set_error("Select a project first.");
+            return Ok(());
+        };
+        self.prompt = PromptState::None;
+        self.dispatch_scratch_conversion(
+            session_id,
+            ScratchConversionTarget::ExistingProject { project },
+        )
+    }
+
+    fn dispatch_scratch_conversion(
+        &mut self,
+        session_id: String,
+        target: ScratchConversionTarget,
+    ) -> Result<()> {
+        if self.scratch_conversion_in_flight {
+            self.set_error("A scratch conversion is already in progress. Wait for it to finish.");
+            return Ok(());
+        }
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            self.set_error("The scratch agent is no longer available.");
+            return Ok(());
+        };
+        if !session.is_scratch() {
+            self.set_error("Only scratch agents can be converted.");
+            return Ok(());
+        }
+
+        // Stop the running agent and close its terminals before touching the
+        // workspace. Conversion changes the working directory underneath it.
+        self.cancel_provider_session_id_discovery(&session.id);
+        self.providers.remove(&session.id);
+        self.running_provider_pins.remove(&session.id);
+        self.last_pty_activity.remove(&session.id);
+        self.resume_fallback_candidates.remove(&session.id);
+        self.clear_companion_terminals_for_session(&session.id);
+        if let Some(current) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session.id)
+        {
+            current.status = SessionStatus::Detached;
+            current.updated_at = Utc::now();
+        }
+        if let Some(current) = self
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == session.id)
+            && let Err(err) = self.session_store.upsert_session(current)
+        {
+            self.set_warning(format!(
+                "Could not save the detached status before conversion: {err:#}"
+            ));
+        }
+
+        self.scratch_conversion_in_flight = true;
+        let busy_message = match &target {
+            ScratchConversionTarget::NewProject { destination } => format!(
+                "Converting scratch agent \"{}\" into a new project at {}...",
+                session.branch_name,
+                destination.display()
+            ),
+            ScratchConversionTarget::ExistingProject { project } => format!(
+                "Copying scratch agent \"{}\" into project \"{}\"...",
+                session.branch_name, project.name
+            ),
+        };
+        self.set_busy(busy_message);
+
+        let request = ScratchConversionRequest { session, target };
+        let paths = self.paths.clone();
+        let config = self.config.clone();
+        let worker_tx = self.worker_tx.clone();
+        thread::spawn(move || {
+            super::workers::run_scratch_conversion_job(request, paths, config, worker_tx);
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish_scratch_conversion(&mut self, outcome: ScratchConversionOutcome) {
+        let session_id = outcome.session.id.clone();
+        if let Some(project) = outcome.new_project.clone()
+            && let Some(existing) = self
+                .projects
+                .iter_mut()
+                .find(|candidate| candidate.id == project.id)
+        {
+            *existing = project;
+        } else if let Some(project) = outcome.new_project.clone() {
+            self.projects.push(project);
+        }
+
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+        {
+            *existing = outcome.session.clone();
+        } else {
+            self.sessions.push(outcome.session.clone());
+        }
+        if let Err(err) = self.session_store.upsert_session(&outcome.session) {
+            self.set_error(format!(
+                "Scratch conversion finished but the agent could not be saved: {err:#}"
+            ));
+            return;
+        }
+        self.update_branch_sync_sessions();
+        self.update_pr_sync_sessions();
+        self.rebuild_left_items();
+        if let Some(index) = self.left_items().iter().position(|item| {
+            matches!(item, LeftItem::Session(session_index) if self.sessions[*session_index].id == session_id)
+        }) {
+            self.selected_left = index;
+        }
+
+        if let Some(project) = outcome.new_project {
+            let project_name = project.name.clone();
+            self.spawn_project_persistence(ProjectPersistenceAction::Add {
+                project,
+                status_message: outcome.status_message,
+            });
+            self.set_busy(format!(
+                "Saving converted project \"{project_name}\" and finishing the scratch conversion..."
+            ));
+        } else {
+            let message = outcome.status_message;
+            self.set_info(message);
+            self.reload_changed_files();
+        }
+    }
+
     pub(crate) fn create_agent_from_existing_worktree(&mut self) -> Result<()> {
         let Some(project) = self.selected_project().cloned() else {
             self.set_error("Select a project first.");
@@ -256,6 +583,13 @@ impl App {
 
         if project.path_missing {
             self.set_warning(format!("Project path not found: {}", project.path));
+            return Ok(());
+        }
+
+        if project.is_scratch() {
+            self.set_error(
+                "Scratch agents do not use git worktrees. Create a scratch agent or pick a project worktree instead.",
+            );
             return Ok(());
         }
 
@@ -279,6 +613,12 @@ impl App {
             self.set_error("Select an agent session first to fork.");
             return Ok(());
         };
+        if source_session.is_scratch() {
+            self.set_error(
+                "Forking a scratch agent is not supported. Create another scratch agent instead.",
+            );
+            return Ok(());
+        }
         let Some(project) = self.selected_project().cloned() else {
             self.set_error("Select an agent session first to fork.");
             return Ok(());
@@ -311,6 +651,12 @@ impl App {
             ));
             return Ok(());
         }
+        if project.is_scratch() {
+            self.set_error(
+                "Scratch agents are not attached to a repository, so PR agents require a project.",
+            );
+            return Ok(());
+        }
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;
         self.prompt = PromptState::PullRequestInput {
@@ -338,6 +684,7 @@ impl App {
     pub(crate) fn open_name_new_agent_prompt(&mut self, request: CreateAgentRequest) -> Result<()> {
         let initial_name = match &request {
             CreateAgentRequest::NewProject { custom_name, .. }
+            | CreateAgentRequest::Scratch { custom_name, .. }
             | CreateAgentRequest::ForkSession { custom_name, .. }
             | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => custom_name.clone(),
             CreateAgentRequest::PullRequest {
@@ -426,7 +773,10 @@ impl App {
             ));
             return Ok(());
         }
-
+        if project.is_scratch() {
+            self.set_error("The scratch workspace has no git branches to check out.");
+            return Ok(());
+        }
         self.set_busy(format!(
             "Checking the default branch for project \"{}\"...",
             project.name
@@ -799,6 +1149,12 @@ impl App {
             ));
             return Ok(());
         }
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace is not a git repository, so there is nothing to pull.",
+            );
+            return Ok(());
+        }
         logger::info(&format!("refreshing project {}", project.path));
         self.start_pull(
             PathBuf::from(&project.path),
@@ -839,7 +1195,7 @@ impl App {
         self.prompt = PromptState::WorktreeCleanupStart;
         let confirm_key = self.bindings.label_for(Action::Confirm);
         self.set_info(format!(
-            "Worktree cleanup ready. Press {confirm_key} to scan for eligible inactive worktrees."
+            "Cleanup ready. Press {confirm_key} to scan for eligible inactive worktrees and scratch workspaces."
         ));
         Ok(())
     }
@@ -848,14 +1204,16 @@ impl App {
         let sessions = self.sessions.clone();
         let projects = self.projects.clone();
         let worktrees_root = self.paths.worktrees_root.clone();
+        let scratch_root = self.paths.scratch_root();
         let active_session_ids = self.providers.keys().cloned().collect();
         let tx = self.worker_tx.clone();
         self.set_busy(
-            "Scanning for inactive dux-managed worktrees eligible for cleanup. The review list will appear when the scan finishes.",
+            "Scanning for inactive dux-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes.",
         );
         std::thread::spawn(move || {
             let candidates = build_worktree_cleanup_candidates(
                 &worktrees_root,
+                &scratch_root,
                 &sessions,
                 &projects,
                 &active_session_ids,
@@ -879,12 +1237,12 @@ impl App {
         };
         if count == 0 {
             self.set_info(
-                "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
+                "No inactive dux-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open.",
             );
         } else {
             let confirm_key = self.bindings.label_for(Action::Confirm);
             self.set_warning(format!(
-                "Review {count} inactive worktree(s). Press Space to toggle selected rows, then {confirm_key} to remove checked worktrees."
+                "Review {count} inactive worktree(s) or scratch workspace(s). Press Space to toggle selected rows, then {confirm_key} to remove checked entries."
             ));
         }
     }
@@ -897,6 +1255,7 @@ impl App {
         let active_session_ids = self.providers.keys().cloned().collect();
         build_worktree_cleanup_candidates(
             &self.paths.worktrees_root,
+            &self.paths.scratch_root(),
             &self.sessions,
             &self.projects,
             &active_session_ids,
@@ -926,12 +1285,17 @@ impl App {
         }
 
         let mut cleanup_jobs = Vec::new();
+        let scratch_root = self.paths.scratch_root();
         for candidate in candidates {
             if candidate
                 .session_ids
                 .iter()
                 .any(|session_id| self.pending_deletions.contains(session_id))
             {
+                continue;
+            }
+            if candidate.project_id == SCRATCH_PROJECT_ID {
+                cleanup_jobs.push((candidate, scratch_root.to_string_lossy().to_string()));
                 continue;
             }
             let Some(project) = self
@@ -980,13 +1344,28 @@ impl App {
                 for (candidate, project_path) in cleanup_jobs {
                     let worktree_path = candidate.worktree_path.clone();
                     let branch_name = candidate.branch_name.clone();
-                    let result = git::remove_worktree(
-                        std::path::Path::new(&project_path),
-                        std::path::Path::new(&worktree_path),
-                        &branch_name,
-                    )
-                    .map(|r| r.branch_already_deleted)
-                    .map_err(|e| format!("{e:#}"));
+                    let result = if candidate.project_id == SCRATCH_PROJECT_ID {
+                        let root = std::path::Path::new(&project_path);
+                        let path = std::path::Path::new(&worktree_path);
+                        if !git::is_under(root, path) {
+                            Err(format!(
+                                "scratch workspace {} is outside dux's scratch root",
+                                worktree_path
+                            ))
+                        } else {
+                            std::fs::remove_dir_all(path)
+                                .map(|_| true)
+                                .map_err(|err| format!("{err:#}"))
+                        }
+                    } else {
+                        git::remove_worktree(
+                            std::path::Path::new(&project_path),
+                            std::path::Path::new(&worktree_path),
+                            &branch_name,
+                        )
+                        .map(|r| r.branch_already_deleted)
+                        .map_err(|e| format!("{e:#}"))
+                    };
                     let _ =
                         tx.send(WorkerEvent::WorktreeCleanupRemoveCompleted { candidate, result });
                 }
@@ -1033,6 +1412,14 @@ impl App {
         // bounds. `rebuild_left_items` also clamps the selection.
         self.rebuild_left_items();
 
+        if candidate.project_id == SCRATCH_PROJECT_ID {
+            self.set_info(format!(
+                "Removed inactive scratch workspace \"{}\".",
+                candidate.branch_name
+            ));
+            return Ok(());
+        }
+
         if branch_already_deleted {
             self.set_info(format!(
                 "Removed inactive worktree for project \"{}\". Branch \"{}\" was already gone.",
@@ -1055,7 +1442,7 @@ impl App {
         if self.worktree_cleanup_pending > 0 {
             let remaining = self.worktree_cleanup_pending;
             self.set_busy(format!(
-                "Cleaning up worktrees... {remaining} removal(s) remaining."
+                "Cleaning up inactive worktrees and scratch workspaces... {remaining} removal(s) remaining."
             ));
             return;
         }
@@ -1075,11 +1462,11 @@ impl App {
         self.reload_changed_files_quiet();
         if failed_count == 0 {
             self.set_info(format!(
-                "Worktree cleanup complete. Removed {removed_count} worktree(s)."
+                "Cleanup complete. Removed {removed_count} inactive worktree(s) or scratch workspace(s)."
             ));
         } else {
             self.set_error(format!(
-                "Worktree cleanup finished with {failed_count} failure(s) and {removed_count} removal(s)."
+                "Cleanup finished with {failed_count} failure(s) and {removed_count} removal(s)."
             ));
         }
     }
@@ -1297,8 +1684,10 @@ impl App {
         if project_still_has_sessions {
             self.selected_left = self.selected_left.saturating_sub(1);
             self.ensure_selectable_left_item();
-        } else if let Some(project_index) = self.left_items().iter().position(|item| {
-            matches!(item, LeftItem::Project(index) if self.projects[*index].id == session.project_id)
+        } else if let Some(project_index) = self.left_items().iter().position(|item| match item {
+            LeftItem::Project(index) => self.projects[*index].id == session.project_id,
+            LeftItem::ScratchHeader => session.project_id == SCRATCH_PROJECT_ID,
+            _ => false,
         }) {
             self.selected_left = project_index;
         }
@@ -1335,8 +1724,13 @@ impl App {
                     ));
                 }
                 (false, false, _) => {
+                    let location_label = if session.is_scratch() {
+                        "Scratch folder"
+                    } else {
+                        "Worktree"
+                    };
                     self.set_info(format!(
-                        "Deleted {} agent \"{}\". Worktree preserved at {}.",
+                        "Deleted {} agent \"{}\". {location_label} preserved at {}.",
                         session.provider.as_str(),
                         session.branch_name,
                         session.worktree_path,
@@ -1608,6 +2002,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "Scratch agents use the global default provider. Change the global default or swap an individual scratch agent's provider.",
+            );
+            return Ok(());
+        }
         let options = self.change_project_default_provider_options(&project.id);
         let selected = options
             .iter()
@@ -1680,6 +2080,13 @@ impl App {
             self.set_error("Select a provider first.");
             return Ok(());
         };
+        if prompt.project_id == SCRATCH_PROJECT_ID {
+            self.prompt = PromptState::None;
+            self.set_error(
+                "Scratch agents use the global default provider. Change the global default or swap an individual scratch agent's provider.",
+            );
+            return Ok(());
+        }
         self.prompt = PromptState::None;
         if selected.is_current {
             let message = match selected.provider {
@@ -1728,6 +2135,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace does not have project-level settings. Toggle auto-reopen on individual scratch agents instead.",
+            );
+            return Ok(());
+        }
         let enabled = self.project_allows_auto_reopen(&project.id);
         self.spawn_project_persistence(ProjectPersistenceAction::UpdateAutoReopen {
             project_id: project.id.clone(),
@@ -1772,6 +2185,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace does not have project-level settings. Create a project first.",
+            );
+            return Ok(());
+        }
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;
         self.prompt = PromptState::ConfigureStartupCommand {
@@ -1801,6 +2220,10 @@ impl App {
         };
         self.prompt = PromptState::None;
         self.input_target = InputTarget::None;
+        if project_id == SCRATCH_PROJECT_ID {
+            self.set_error("The scratch workspace does not support a startup command.");
+            return Ok(());
+        }
         if !self.projects.iter().any(|project| project.id == project_id) {
             self.set_error(format!("Could not find project \"{project_name}\"."));
             return Ok(());
@@ -1821,6 +2244,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace does not have project-level environment variables. Global environment variables still apply.",
+            );
+            return Ok(());
+        }
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;
         self.prompt = PromptState::ConfigureProjectEnv {
@@ -1891,6 +2320,12 @@ impl App {
         };
         self.prompt = PromptState::None;
         self.input_target = InputTarget::None;
+        if project_id == SCRATCH_PROJECT_ID {
+            self.set_error(
+                "The scratch workspace does not support project-level environment variables.",
+            );
+            return Ok(());
+        }
         if !self.projects.iter().any(|project| project.id == project_id) {
             self.set_error(format!("Could not find project \"{project_name}\"."));
             return Ok(());
@@ -2227,6 +2662,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace is built in and cannot be removed. Delete individual scratch agents instead.",
+            );
+            return Ok(());
+        }
         let has_sessions = self.sessions.iter().any(|s| s.project_id == project.id);
         let has_pending_restore = self
             .pending_restorations
@@ -2255,6 +2696,12 @@ impl App {
             self.set_error("Select a project first.");
             return Ok(());
         };
+        if project.is_scratch() {
+            self.set_error(
+                "The scratch workspace is built in and cannot be deleted. Delete individual scratch agents instead.",
+            );
+            return Ok(());
+        }
 
         // Refuse if any of this project's sessions have an async worktree
         // removal in-flight. `do_delete_session` runs git synchronously and
@@ -2324,7 +2771,7 @@ impl App {
         };
         if !Path::new(&session.worktree_path).exists() {
             self.set_error(format!(
-                "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
+                "Workspace for agent \"{}\" no longer exists. Delete and re-create the agent.",
                 session.branch_name
             ));
             return Ok(());
@@ -2415,7 +2862,7 @@ impl App {
     ) -> Result<bool> {
         if !Path::new(&session.worktree_path).exists() {
             self.set_error(format!(
-                "Worktree for agent \"{}\" no longer exists. Delete and re-create the agent.",
+                "Workspace for agent \"{}\" no longer exists. Delete and re-create the agent.",
                 session.branch_name
             ));
             return Ok(false);
@@ -2560,8 +3007,14 @@ impl App {
                 self.sessions.get(*index).map(|s| s.worktree_path.clone())
             }
             Some(LeftItem::Project(index)) => self.projects.get(*index).map(|p| p.path.clone()),
+            Some(LeftItem::ScratchHeader) => self
+                .projects
+                .iter()
+                .find(|project| project.is_scratch())
+                .map(|p| p.path.clone()),
             Some(LeftItem::EmptyProjectsSpacer) => None,
             Some(LeftItem::EmptyProjectsSeparator) => None,
+            Some(LeftItem::ScratchSeparator) => None,
             None => None,
         };
         match path {
@@ -3046,6 +3499,7 @@ fn parse_github_pull_url_parts(input: &str) -> Option<(String, String)> {
 
 fn build_worktree_cleanup_candidates(
     worktrees_root: &Path,
+    scratch_root: &Path,
     sessions: &[AgentSession],
     projects: &[Project],
     active_session_ids: &std::collections::HashSet<String>,
@@ -3057,10 +3511,10 @@ fn build_worktree_cleanup_candidates(
     let mut known_worktree_paths = std::collections::HashSet::new();
     for session in sessions {
         let worktree_path = std::path::Path::new(&session.worktree_path);
+        known_worktree_paths.insert(canonical_or_original(worktree_path));
         if !git::is_under(worktrees_root, worktree_path) {
             continue;
         }
-        known_worktree_paths.insert(canonical_or_original(worktree_path));
         by_worktree
             .entry(session.worktree_path.clone())
             .or_default()
@@ -3103,7 +3557,7 @@ fn build_worktree_cleanup_candidates(
     }
 
     let mut orphan_worktree_paths = std::collections::HashSet::new();
-    for project in projects {
+    for project in projects.iter().filter(|project| !project.is_scratch()) {
         let Ok(worktrees) = git::list_worktrees(std::path::Path::new(&project.path)) else {
             continue;
         };
@@ -3137,6 +3591,41 @@ fn build_worktree_cleanup_candidates(
         }
     }
 
+    // Scratch workspaces have no git metadata, so use the newest file
+    // modification time as their activity signal. Only folders that are no
+    // longer referenced by a session are eligible.
+    if let Ok(entries) = std::fs::read_dir(scratch_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if known_worktree_paths.contains(&canonical_or_original(&path)) {
+                continue;
+            }
+            let Some(last_activity) = newest_modification_time(&path) else {
+                continue;
+            };
+            let last_activity: chrono::DateTime<Utc> = last_activity.into();
+            if last_activity > cutoff {
+                continue;
+            }
+            let branch_name = path
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or("scratch")
+                .to_string();
+            candidates.push(WorktreeCleanupCandidate {
+                session_ids: Vec::new(),
+                project_id: SCRATCH_PROJECT_ID.to_string(),
+                project_name: SCRATCH_PROJECT_NAME.to_string(),
+                branch_name,
+                worktree_path: path.to_string_lossy().to_string(),
+                last_commit_at: last_activity,
+            });
+        }
+    }
+
     candidates.sort_by(|a, b| {
         a.project_name
             .cmp(&b.project_name)
@@ -3148,6 +3637,29 @@ fn build_worktree_cleanup_candidates(
 
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn newest_modification_time(root: &Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if let Ok(modified) = metadata.modified()
+            && newest.is_none_or(|current| modified > current)
+        {
+            newest = Some(modified);
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&path)
+        {
+            for entry in entries.flatten() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    newest
 }
 
 #[cfg(test)]
@@ -3247,6 +3759,7 @@ mod tests {
             terminal_return_to_list: false,
             terminal_counter: 0,
             create_agent_in_flight: false,
+            scratch_conversion_in_flight: false,
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             rebases_in_flight: std::collections::HashSet::new(),
@@ -3408,6 +3921,66 @@ mod tests {
         }
     }
 
+    fn make_scratch_project() -> Project {
+        let mut project = make_project(SCRATCH_PROJECT_ID, "claude");
+        project.name = SCRATCH_PROJECT_NAME.to_string();
+        project.path = "/tmp/dux-scratch".to_string();
+        project.leading_branch = None;
+        project.current_branch = String::new();
+        project
+    }
+
+    #[test]
+    fn cleanup_includes_only_unreferenced_scratch_workspaces() {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let scratch_root = app.paths.scratch_root();
+        std::fs::create_dir_all(&scratch_root).expect("scratch root");
+        let orphan = scratch_root.join("orphan");
+        let referenced = scratch_root.join("referenced");
+        std::fs::create_dir_all(&orphan).expect("orphan dir");
+        std::fs::create_dir_all(&referenced).expect("referenced dir");
+        std::fs::write(orphan.join("note.txt"), "old\n").expect("orphan file");
+
+        let mut session = make_session("scratch-session", "claude", &referenced.to_string_lossy());
+        session.project_id = SCRATCH_PROJECT_ID.to_string();
+        app.sessions.push(session);
+
+        let now = Utc::now() + chrono::Duration::days(30);
+        let candidates = app.worktree_cleanup_candidates(now);
+
+        let scratch_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate.project_id == SCRATCH_PROJECT_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(scratch_candidates.len(), 1);
+        assert_eq!(scratch_candidates[0].branch_name, "orphan");
+        assert_eq!(
+            scratch_candidates[0].worktree_path,
+            orphan.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn new_agent_on_scratch_header_opens_scratch_name_prompt() {
+        let mut app = test_app_with_sessions(Vec::new(), vec![make_scratch_project()]);
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::ScratchHeader))
+            .expect("scratch header");
+
+        app.create_agent_for_selected_project()
+            .expect("scratch prompt should open");
+
+        match &app.prompt {
+            PromptState::NameNewAgent { request, .. } => {
+                assert!(matches!(request, CreateAgentRequest::Scratch { .. }));
+            }
+            other => panic!("expected scratch name prompt, got {other:?}"),
+        }
+    }
+
     fn run_git(repo_path: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -3529,7 +4102,7 @@ mod tests {
         assert!(matches!(app.prompt, PromptState::WorktreeCleanupStart));
         assert_eq!(
             app.status.message(),
-            "Worktree cleanup ready. Press Enter to scan for eligible inactive worktrees."
+            "Cleanup ready. Press Enter to scan for eligible inactive worktrees and scratch workspaces."
         );
     }
 
@@ -3588,7 +4161,7 @@ mod tests {
         assert!(selected.is_empty());
         assert_eq!(
             app.status.message(),
-            "No inactive dux-managed worktrees are old enough for cleanup. Worktrees are eligible when their latest commit is at least two weeks old and no agent is open."
+            "No inactive dux-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open."
         );
     }
 
@@ -3739,7 +4312,7 @@ mod tests {
         ));
         assert_eq!(
             app.status.message(),
-            "Worktree cleanup complete. Removed 1 worktree(s)."
+            "Cleanup complete. Removed 1 inactive worktree(s) or scratch workspace(s)."
         );
     }
 
@@ -3839,7 +4412,7 @@ mod tests {
         }
         assert_eq!(
             app.status.message(),
-            "Worktree cleanup complete. Removed 45 worktree(s)."
+            "Cleanup complete. Removed 45 inactive worktree(s) or scratch workspace(s)."
         );
     }
 

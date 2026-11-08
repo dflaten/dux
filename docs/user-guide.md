@@ -25,6 +25,10 @@ Every agent runs through a PTY, the same pseudo-terminal your shell uses. That m
 
 dux organizes work around **projects** (git repos) and **agents** (worktree sessions). When you create an agent, dux branches off a new git worktree so the agent has its own isolated copy of the code. No conflicts with your main checkout, no stepping on other agents' changes.
 
+Not every session starts as a project. The left pane always shows a **Scratch** group below your projects. A scratch agent runs in its own folder under dux's data directory and is not attached to a git repository, which is useful for ad-hoc questions, throwaway scripts, or planning before the work has a home. Scratch agents support the same provider launch, resume, terminal, macro, rename, and delete workflows as project agents, but the files pane explains that diffs are unavailable instead of pretending an empty repository exists.
+
+When scratch work grows into something real, use `convert-scratch-to-project` to turn it into a new project: dux copies the files to a destination you choose, initializes git with an initial commit, registers the project, creates a managed worktree, and repoints the existing session. Use `move-scratch-to-project` to instead copy the work into a fresh worktree of an existing project. Both conversions keep the original scratch folder as a backup; inactive unreferenced scratch folders are removed by the same `cleanup-worktrees` review flow as old worktrees.
+
 Already have a Git worktree you want dux to use? The `new-agent-from-worktree` command in the palette lets you pick from existing worktrees for the selected project. If the worktree is already managed by dux, dux reuses it and reconnects like a continuable session; if it's outside dux's managed worktree directory, dux copies it into a fresh managed worktree first so the original checkout is left alone.
 
 The interface has three panes:

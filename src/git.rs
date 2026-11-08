@@ -541,6 +541,106 @@ pub fn create_worktree_from_start_point(
     Ok((branch_name, canonical))
 }
 
+/// Initialize a fresh repository at `path`, set its initial branch to `main`,
+/// and commit the current working tree (including an empty tree). The user's
+/// git identity is used; a missing identity surfaces as an actionable error.
+pub fn init_repository_with_initial_commit(path: &Path) -> Result<()> {
+    init_repository_with_initial_commit_and_identity(path, None)
+}
+
+fn init_repository_with_initial_commit_and_identity(
+    path: &Path,
+    identity: Option<(&str, &str)>,
+) -> Result<()> {
+    let path_arg = path.to_string_lossy();
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        Command::new("git")
+            .arg("-C")
+            .arg(path_arg.as_ref())
+            .args(args)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to run git {} for {}",
+                    args.join(" "),
+                    path.display()
+                )
+            })
+    };
+
+    let output = run(&["init"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git init failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let output = run(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to set initial branch to main for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    if let Some((name, email)) = identity {
+        let output = run(&["config", "user.name", name])?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git config user.name failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let output = run(&["config", "user.email", email])?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git config user.email failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+
+    let output = run(&["add", "-A"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git add failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let output = run(&[
+        "-c",
+        "color.ui=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Initial commit",
+    ])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let identity_hint = if stderr.contains("who you are")
+            || stderr.contains("auto-detect")
+            || stderr.contains("user.email")
+        {
+            "\nConfigure git user.name and user.email, then try again."
+        } else {
+            ""
+        };
+        return Err(anyhow!(
+            "initial commit failed for {}: {}{identity_hint}",
+            path.display(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
 pub fn head_commit(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
@@ -1689,8 +1789,26 @@ mod tests {
         );
     }
 
-    // ── rename_branch tests ──────────────────────────────────────
+    #[test]
+    fn init_repository_with_initial_commit_creates_main_and_tracks_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("README.md"), "hello\n").unwrap();
 
+        init_repository_with_initial_commit_and_identity(path, Some(("test", "t@t"))).unwrap();
+
+        assert!(path.join(".git").is_dir());
+        assert_eq!(current_branch(path).unwrap(), "main");
+        assert!(!head_commit(path).unwrap().is_empty());
+        let output = Command::new("git")
+            .args(["-C", path.to_string_lossy().as_ref(), "ls-files"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "README.md");
+    }
+
+    // ── rename_branch tests ──────────────────────────────────────
     #[test]
     fn rename_branch_succeeds() {
         let repo = init_test_repo();
