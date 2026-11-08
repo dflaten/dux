@@ -4515,6 +4515,65 @@ mod tests {
         assert!(outcome.status_message.contains("Moved scratch agent"));
     }
 
+    #[test]
+    fn scratch_conversion_into_new_project_initializes_repo_and_repoints_session() {
+        let tmp = tempdir().expect("tempdir");
+        let destination_tmp = tempdir().expect("destination tempdir");
+        let paths = test_paths(tmp.path());
+        let scratch = tmp.path().join("scratch").join("ad-hoc");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("note.txt"), "from scratch\n").expect("scratch file");
+        let destination = destination_tmp.path().join("new-project");
+
+        let mut session = test_session(&scratch);
+        session.project_id = SCRATCH_PROJECT_ID.to_string();
+        session.project_path = None;
+        session.branch_name = "ad-hoc".to_string();
+        let (tx, rx) = mpsc::channel();
+        run_scratch_conversion_job(
+            ScratchConversionRequest {
+                session,
+                target: ScratchConversionTarget::NewProject {
+                    destination: destination.clone(),
+                },
+            },
+            paths.clone(),
+            Config::default(),
+            tx,
+        );
+
+        let outcome = loop {
+            match rx.recv().expect("worker event") {
+                WorkerEvent::ScratchConversionCompleted { result } => {
+                    break result.expect("conversion succeeds");
+                }
+                WorkerEvent::CreateAgentProgress(_) => continue,
+                _ => panic!("unexpected event"),
+            }
+        };
+
+        let project = outcome.new_project.expect("new project");
+        assert_eq!(project.path, destination.to_string_lossy());
+        assert_eq!(project.leading_branch.as_deref(), Some("main"));
+        assert!(destination.join(".git").exists());
+        assert_eq!(git::current_branch(&destination).unwrap(), "main");
+        assert!(!git::head_commit(&destination).unwrap().is_empty());
+
+        assert_eq!(outcome.session.project_id, project.id);
+        assert_eq!(outcome.session.source_branch, "main");
+        let worktree = Path::new(&outcome.session.worktree_path);
+        assert!(worktree.starts_with(&paths.worktrees_root));
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("note.txt")).expect("converted file"),
+            "from scratch\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("note.txt")).expect("backup file"),
+            "from scratch\n"
+        );
+        assert!(outcome.status_message.contains("Converted scratch agent"));
+    }
+
     fn init_repo_with_branch(repo: &Path, branch: &str) {
         run_git(repo, &["init", "-b", "main"]);
         run_git(repo, &["config", "user.name", "test"]);

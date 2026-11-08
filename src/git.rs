@@ -542,12 +542,51 @@ pub fn create_worktree_from_start_point(
 }
 
 /// Initialize a fresh repository at `path`, set its initial branch to `main`,
-/// and commit the current working tree (including an empty tree). The user's
-/// git identity is used; a missing identity surfaces as an actionable error.
+/// and commit the current working tree (including an empty tree).
+///
+/// The user's configured git identity is used when available. When git has no
+/// identity configured, a neutral `dux <dux@localhost>` identity is applied to
+/// the initial commit only (via `-c`, never persisted into the repository), so
+/// converting a scratch agent into a project never fails just because git
+/// identity is missing. The user can amend or re-author the commit later.
 pub fn init_repository_with_initial_commit(path: &Path) -> Result<()> {
     init_repository_with_initial_commit_and_identity(path, None)
 }
 
+/// Identity flags for the initial commit. `None` means "use the user's
+/// configured git identity"; a neutral fallback is used only when git reports
+/// no identity is configured.
+fn initial_commit_identity_args(identity: Option<(&str, &str)>, configured: bool) -> Vec<String> {
+    match identity {
+        Some((name, email)) => vec![
+            "-c".to_string(),
+            format!("user.name={name}"),
+            "-c".to_string(),
+            format!("user.email={email}"),
+        ],
+        None if !configured => vec![
+            "-c".to_string(),
+            "user.name=dux".to_string(),
+            "-c".to_string(),
+            "user.email=dux@localhost".to_string(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+fn git_identity_configured(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["var", "GIT_COMMITTER_IDENT"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// `identity` is applied to the initial commit only (via `-c`); it is never
+/// written into the repository. When `None`, the configured identity is used,
+/// falling back to the neutral dux identity if none is configured.
 fn init_repository_with_initial_commit_and_identity(
     path: &Path,
     identity: Option<(&str, &str)>,
@@ -586,23 +625,12 @@ fn init_repository_with_initial_commit_and_identity(
         ));
     }
 
-    if let Some((name, email)) = identity {
-        let output = run(&["config", "user.name", name])?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "git config user.name failed for {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let output = run(&["config", "user.email", email])?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "git config user.email failed for {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+    let identity_configured = git_identity_configured(path);
+    if identity.is_none() && !identity_configured {
+        logger::info(&format!(
+            "git identity is not configured; using dux fallback identity for the initial commit in {}",
+            path.display()
+        ));
     }
 
     let output = run(&["add", "-A"])?;
@@ -614,28 +642,30 @@ fn init_repository_with_initial_commit_and_identity(
         ));
     }
 
-    let output = run(&[
-        "-c",
-        "color.ui=false",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Initial commit",
-    ])?;
+    let mut commit_args: Vec<String> = vec!["-c".to_string(), "color.ui=false".to_string()];
+    commit_args.extend(initial_commit_identity_args(identity, identity_configured));
+    commit_args.extend(
+        ["commit", "--allow-empty", "-m", "Initial commit"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path_arg.as_ref())
+        .args(&commit_args)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run git {} for {}",
+                commit_args.join(" "),
+                path.display()
+            )
+        })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let identity_hint = if stderr.contains("who you are")
-            || stderr.contains("auto-detect")
-            || stderr.contains("user.email")
-        {
-            "\nConfigure git user.name and user.email, then try again."
-        } else {
-            ""
-        };
         return Err(anyhow!(
-            "initial commit failed for {}: {}{identity_hint}",
+            "initial commit failed for {}: {}",
             path.display(),
-            stderr.trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     Ok(())
@@ -1872,6 +1902,47 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "README.md");
+
+        // The commit identity must not be written into the new repository:
+        // doing so would shadow the user's global identity for every future
+        // agent commit.
+        let output = Command::new("git")
+            .args([
+                "-C",
+                path.to_string_lossy().as_ref(),
+                "config",
+                "--local",
+                "user.name",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "initial commit identity must not be persisted in the repository"
+        );
+    }
+
+    #[test]
+    fn initial_commit_identity_args_uses_explicit_identity_or_fallback() {
+        assert_eq!(
+            initial_commit_identity_args(Some(("Test", "t@t")), true),
+            vec![
+                "-c".to_string(),
+                "user.name=Test".to_string(),
+                "-c".to_string(),
+                "user.email=t@t".to_string(),
+            ]
+        );
+        assert!(initial_commit_identity_args(None, true).is_empty());
+        assert_eq!(
+            initial_commit_identity_args(None, false),
+            vec![
+                "-c".to_string(),
+                "user.name=dux".to_string(),
+                "-c".to_string(),
+                "user.email=dux@localhost".to_string(),
+            ]
+        );
     }
 
     // ── rename_branch tests ──────────────────────────────────────

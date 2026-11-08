@@ -286,9 +286,12 @@ impl App {
             .title
             .clone()
             .unwrap_or_else(|| session.branch_name.clone());
-        let dir_name = scratch_workspace_dir_name(&label);
         let default_path = home::home_dir()
-            .map(|home| home.join(&dir_name).to_string_lossy().to_string())
+            .map(|home| {
+                default_scratch_project_destination(&home, &label, &self.projects)
+                    .to_string_lossy()
+                    .to_string()
+            })
             .unwrap_or_default();
         self.input_target = InputTarget::None;
         self.fullscreen_overlay = FullscreenOverlay::None;

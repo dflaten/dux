@@ -3719,6 +3719,43 @@ pub(crate) fn scratch_workspace_dir_name(requested: &str) -> String {
     }
 }
 
+/// Pick the default destination shown when converting a scratch agent into a
+/// new project. Prefers `~/<sanitized label>` and adds a numeric suffix when
+/// that path already exists or is registered as a project, so the prompt opens
+/// with a usable default instead of an error the user only discovers after
+/// pressing Enter.
+pub(crate) fn default_scratch_project_destination(
+    home: &Path,
+    label: &str,
+    projects: &[Project],
+) -> PathBuf {
+    let base = scratch_workspace_dir_name(label);
+    let registered = projects
+        .iter()
+        .filter(|project| !project.is_scratch())
+        .map(|project| PathBuf::from(&project.path))
+        .collect::<Vec<_>>();
+    for attempt in 1..=999u16 {
+        let name = if attempt == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let candidate = home.join(name);
+        let candidate_key = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.clone());
+        let taken = std::fs::symlink_metadata(&candidate).is_ok()
+            || registered
+                .iter()
+                .any(|path| path.canonicalize().unwrap_or_else(|_| path.clone()) == candidate_key);
+        if !taken {
+            return candidate;
+        }
+    }
+    home.join(base)
+}
+
 /// Build the built-in scratch workspace. It is added to the runtime project
 /// list on boot and config reload, but intentionally omitted from every
 /// config/SQLite project write.
@@ -4222,6 +4259,30 @@ mod tests {
         project.current_branch = String::new();
         project.leading_branch = None;
         project
+    }
+
+    #[test]
+    fn default_scratch_project_destination_skips_existing_paths_and_projects() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir.path();
+        std::fs::create_dir_all(home.join("demo")).expect("existing destination");
+
+        let mut registered = test_project("project-1");
+        registered.path = home.join("demo-2").to_string_lossy().to_string();
+        let projects = vec![registered, test_scratch_project()];
+
+        assert_eq!(
+            default_scratch_project_destination(home, "demo", &projects),
+            home.join("demo-3")
+        );
+        assert_eq!(
+            default_scratch_project_destination(home, "Other Agent", &projects),
+            home.join("Other-Agent")
+        );
+        assert_eq!(
+            default_scratch_project_destination(home, "!!!", &projects),
+            home.join("scratch")
+        );
     }
 
     #[test]
