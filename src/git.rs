@@ -698,7 +698,23 @@ pub fn head_commit_time(repo_path: &Path) -> Result<chrono::DateTime<chrono::Utc
     Ok(parsed.with_timezone(&chrono::Utc))
 }
 
+/// Make `destination` look exactly like `source`: entries that only exist in
+/// `destination` are removed. Git administration files are preserved so a
+/// worktree's `.git` link is never replaced.
 pub fn mirror_worktree_contents(source: &Path, destination: &Path) -> Result<()> {
+    sync_worktree_contents(source, destination, true)
+}
+
+/// Copy every visible entry from `source` into `destination`, overwriting
+/// files that already exist, while leaving entries that only exist in
+/// `destination` untouched. Git administration files are skipped. This is the
+/// "merge this work into an existing checkout" counterpart to
+/// [`mirror_worktree_contents`].
+pub fn copy_worktree_contents_into(source: &Path, destination: &Path) -> Result<()> {
+    sync_worktree_contents(source, destination, false)
+}
+
+fn sync_worktree_contents(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", source.display()))?;
@@ -710,7 +726,7 @@ pub fn mirror_worktree_contents(source: &Path, destination: &Path) -> Result<()>
             "source and destination worktrees must be different"
         ));
     }
-    sync_directory_contents(&source, &destination)
+    sync_directory_contents(&source, &destination, prune)
 }
 
 pub struct RemoveResult {
@@ -1401,7 +1417,7 @@ fn is_github_host(host: &str) -> bool {
     host == "github.com" || host.starts_with("github.")
 }
 
-fn sync_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+fn sync_directory_contents(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let mut source_entries = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -1410,24 +1426,26 @@ fn sync_directory_contents(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         source_entries.push(name);
-        sync_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        sync_entry(&entry.path(), &destination.join(entry.file_name()), prune)?;
     }
 
-    for entry in fs::read_dir(destination)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if is_git_admin_entry(&name) {
-            continue;
-        }
-        if !source_entries.iter().any(|candidate| candidate == &name) {
-            remove_path(&entry.path())?;
+    if prune {
+        for entry in fs::read_dir(destination)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if is_git_admin_entry(&name) {
+                continue;
+            }
+            if !source_entries.iter().any(|candidate| candidate == &name) {
+                remove_path(&entry.path())?;
+            }
         }
     }
 
     Ok(())
 }
 
-fn sync_entry(source: &Path, destination: &Path) -> Result<()> {
+fn sync_entry(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -1461,7 +1479,7 @@ fn sync_entry(source: &Path, destination: &Path) -> Result<()> {
             }
             Err(err) => return Err(err.into()),
         }
-        sync_directory_contents(source, destination)?;
+        sync_directory_contents(source, destination, prune)?;
         return Ok(());
     }
 
@@ -1748,6 +1766,54 @@ mod tests {
         assert_eq!(
             fs::read_to_string(destination.join(".git")).unwrap(),
             destination_git_before
+        );
+    }
+
+    #[test]
+    fn copy_worktree_contents_into_overlays_without_pruning_destination() {
+        let repo = init_test_repo();
+        let source = add_worktree(repo.path(), "copy-source");
+        let destination = add_worktree(repo.path(), "copy-destination");
+
+        fs::write(source.join("shared.txt"), "from source\n").unwrap();
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested").join("note.txt"), "scratch note\n").unwrap();
+
+        fs::write(destination.join("shared.txt"), "from destination\n").unwrap();
+        fs::write(destination.join("project-only.txt"), "keep me\n").unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        fs::write(
+            destination.join("nested").join("project-only.txt"),
+            "keep nested me\n",
+        )
+        .unwrap();
+
+        let destination_git_before = fs::read_to_string(destination.join(".git")).unwrap();
+        copy_worktree_contents_into(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("shared.txt")).unwrap(),
+            "from source\n",
+            "source files overwrite same-named destination files"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("project-only.txt")).unwrap(),
+            "keep me\n",
+            "destination-only files survive the copy"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested").join("note.txt")).unwrap(),
+            "scratch note\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested").join("project-only.txt")).unwrap(),
+            "keep nested me\n",
+            "nested destination-only files survive the copy"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(".git")).unwrap(),
+            destination_git_before,
+            "the destination worktree's git admin state is preserved"
         );
     }
 

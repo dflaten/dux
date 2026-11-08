@@ -3601,7 +3601,7 @@ pub(crate) fn run_scratch_conversion_job(
                         worktree_path.display()
                     )));
                     if let Err(err) =
-                        git::mirror_worktree_contents(&scratch_path, &worktree_path)
+                        git::copy_worktree_contents_into(&scratch_path, &worktree_path)
                     {
                         let _ = git::remove_worktree(&destination, &worktree_path, &branch_name);
                         return Err(err.context(
@@ -3674,7 +3674,7 @@ pub(crate) fn run_scratch_conversion_job(
                     "Copying scratch files into worktree \"{}\"...",
                     worktree_path.display()
                 )));
-                if let Err(err) = git::mirror_worktree_contents(&scratch_path, &worktree_path) {
+                if let Err(err) = git::copy_worktree_contents_into(&scratch_path, &worktree_path) {
                     let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
                     return Err(err.context("failed to copy scratch files into the new worktree"));
                 }
@@ -3757,7 +3757,7 @@ fn prepare_new_project_from_scratch(
                 "destination is inside an existing git repository. Choose a path outside it."
             ));
         }
-        git::mirror_worktree_contents(scratch_path, destination)
+        git::copy_worktree_contents_into(scratch_path, destination)
             .context("failed to copy scratch files into the new project")?;
         git::init_repository_with_initial_commit(destination)?;
 
@@ -4455,6 +4455,11 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).expect("repo dir");
         init_repo_with_branch(&repo, "backup");
+        // The converted worktree starts from the project's leading branch and
+        // must keep its tracked files; the scratch copy only adds to it.
+        std::fs::write(repo.join("project.txt"), "from project\n").expect("project file");
+        run_git(&repo, &["add", "project.txt"]);
+        run_git(&repo, &["commit", "-m", "project file"]);
         let paths = test_paths(tmp.path());
         let scratch = tmp.path().join("scratch").join("ad-hoc");
         std::fs::create_dir_all(&scratch).expect("scratch dir");
@@ -4496,6 +4501,12 @@ mod tests {
             std::fs::read_to_string(Path::new(&outcome.session.worktree_path).join("note.txt"))
                 .expect("converted file"),
             "from scratch\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&outcome.session.worktree_path).join("project.txt"))
+                .expect("project file preserved"),
+            "from project\n",
+            "converting into an existing project must not delete its tracked files"
         );
         assert_eq!(
             std::fs::read_to_string(scratch.join("note.txt")).expect("backup file"),
