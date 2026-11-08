@@ -10,6 +10,9 @@ pub enum Action {
     // Projects pane
     ToggleProject,
     NewAgent,
+    NewScratchAgent,
+    ConvertScratchToProject,
+    MoveScratchToProject,
     NewAgentFromPr,
     NewAgentFromWorktree,
     ForkAgent,
@@ -212,6 +215,9 @@ impl Action {
             Action::MoveUp => "move_up",
             Action::ToggleProject => "toggle_project",
             Action::NewAgent => "new_agent",
+            Action::NewScratchAgent => "new_scratch_agent",
+            Action::ConvertScratchToProject => "convert_scratch_to_project",
+            Action::MoveScratchToProject => "move_scratch_to_project",
             Action::NewAgentFromPr => "new_agent_from_pr",
             Action::NewAgentFromWorktree => "new_agent_from_worktree",
             Action::ForkAgent => "fork_agent",
@@ -317,6 +323,15 @@ impl Action {
             Action::MoveUp => "Navigate up through projects, sessions, files, and lists.",
             Action::ToggleProject => "Collapse or expand the selected project.",
             Action::NewAgent => "Create a new agent session (worktree).",
+            Action::NewScratchAgent => {
+                "Create an agent in the built-in scratch workspace without attaching it to a project or git repository."
+            }
+            Action::ConvertScratchToProject => {
+                "Convert the selected scratch agent into a new project with its own git repository and managed worktree."
+            }
+            Action::MoveScratchToProject => {
+                "Copy the selected scratch agent's work into a new worktree of an existing project."
+            }
             Action::NewAgentFromPr => "Create a new agent session from a GitHub pull request.",
             Action::NewAgentFromWorktree => "Create a new agent from an existing git worktree.",
             Action::ForkAgent => "Fork the selected agent into a fresh worktree and session.",
@@ -343,7 +358,9 @@ impl Action {
                 "Check out the default branch for the selected project."
             }
             Action::ReconnectAgent => "Restart the CLI for the selected agent.",
-            Action::DeleteSession => "Delete the selected session and worktree.",
+            Action::DeleteSession => {
+                "Delete the selected agent session. Its worktree or scratch folder is preserved on disk."
+            }
             Action::DeleteTerminal => "Delete the selected companion terminal.",
             Action::InteractAgent => "Start a prompt turn for the agent.",
             Action::ShowTerminal => {
@@ -427,7 +444,7 @@ impl Action {
             }
             Action::ToggleAgentAutoReopen => "Toggle startup auto-reopen for the selected agent.",
             Action::CleanupWorktrees => {
-                "Permanently remove inactive dux-managed worktrees older than two weeks."
+                "Permanently remove inactive dux-managed worktrees and unreferenced scratch workspaces older than two weeks."
             }
             Action::ConfigureStartupCommand => {
                 "Configure the selected project's startup command for newly created agents."
@@ -478,7 +495,8 @@ impl Action {
             | Action::ReconnectAgent
             | Action::DeleteSession
             | Action::DeleteTerminal => Some("Projects pane"),
-            Action::NewAgentFromPr => None,
+            Action::NewAgentFromPr | Action::NewScratchAgent => None,
+            Action::ConvertScratchToProject | Action::MoveScratchToProject => None,
             Action::ExitInteractive
             | Action::OpenMacroBar
             | Action::PasteSelectionToTerminal
@@ -664,6 +682,39 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         }),
     },
     BindingDef {
+        action: Action::NewScratchAgent,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "new-scratch-agent",
+            description: "Create an agent not attached to any project (ad-hoc scratch workspace)",
+        }),
+    },
+    BindingDef {
+        action: Action::ConvertScratchToProject,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "convert-scratch-to-project",
+            description: "Convert the selected scratch agent into a new project",
+        }),
+    },
+    BindingDef {
+        action: Action::MoveScratchToProject,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "move-scratch-to-project",
+            description: "Move the selected scratch agent's work into an existing project",
+        }),
+    },
+    BindingDef {
         action: Action::NewAgentFromPr,
         default_keys: &[],
         scopes: &[],
@@ -787,7 +838,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "cleanup-worktrees",
-            description: "Permanently remove inactive dux-managed worktrees older than two weeks",
+            description: "Permanently remove inactive worktrees and unreferenced scratch workspaces",
         }),
     },
     BindingDef {
@@ -2602,6 +2653,26 @@ mod tests {
         let section_names: Vec<_> = sections.iter().map(|(n, _)| *n).collect();
         assert!(section_names.contains(&"Global"));
         assert!(section_names.contains(&"Projects pane"));
+    }
+
+    #[test]
+    fn scratch_actions_are_available_in_the_palette() {
+        let bindings = default_bindings();
+        for name in [
+            "new-scratch-agent",
+            "convert-scratch-to-project",
+            "move-scratch-to-project",
+        ] {
+            let names: Vec<&str> = bindings
+                .filtered_palette(name)
+                .iter()
+                .filter_map(|binding| binding.palette_name)
+                .collect();
+            assert!(
+                names.contains(&name),
+                "expected '{name}' in palette results, got {names:?}"
+            );
+        }
     }
 
     #[test]

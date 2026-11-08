@@ -1416,6 +1416,25 @@ impl App {
         }
 
         if let Some(action) = self.bindings.lookup(&key, BindingScope::Files) {
+            if self
+                .selected_session()
+                .is_some_and(|session| session.is_scratch())
+                && matches!(
+                    action,
+                    Action::StageUnstage
+                        | Action::CommitChanges
+                        | Action::DiscardChanges
+                        | Action::GenerateCommitMessage
+                        | Action::EngageCommitInput
+                        | Action::PushToRemote
+                        | Action::PullFromRemote
+                )
+            {
+                self.set_error(
+                    "Scratch agents are not attached to a git repository. Convert this agent to a project to stage, commit, push, or pull.",
+                );
+                return Ok(());
+            }
             match action {
                 Action::MoveDown if self.right_section != RightSection::CommitInput => {
                     let len = self.current_files_len();
@@ -1988,6 +2007,12 @@ impl App {
             self.set_error("Select a session first.");
             return Ok(());
         };
+        if session.is_scratch() {
+            self.set_error(
+                "Scratch agents are not attached to a git repository. Convert this agent to a project before pushing.",
+            );
+            return Ok(());
+        }
         let worktree = PathBuf::from(&session.worktree_path);
         let tx = self.worker_tx.clone();
         self.set_busy("Pushing to remote…");
@@ -2051,6 +2076,12 @@ impl App {
             self.set_error("Select a session first.");
             return Ok(());
         };
+        if session.is_scratch() {
+            self.set_error(
+                "Scratch agents are not attached to a git repository. Convert this agent to a project before pulling.",
+            );
+            return Ok(());
+        }
         self.start_pull(
             PathBuf::from(&session.worktree_path),
             PullTarget::Session,
@@ -2065,6 +2096,12 @@ impl App {
             self.set_error("Select an agent session before rebasing.");
             return;
         };
+        if session.is_scratch() {
+            self.set_error(
+                "Scratch agents are not attached to a git repository, so there is nothing to rebase.",
+            );
+            return;
+        }
         let session_id = session.id.clone();
         let branch_name = session.branch_name.clone();
         let worktree = PathBuf::from(&session.worktree_path);
@@ -4184,6 +4221,9 @@ impl App {
                                 project.name
                             )
                         }
+                        CreateAgentRequest::Scratch { project, .. } => {
+                            format!("Creating scratch agent \"{name}\" in {}...", project.path)
+                        }
                         CreateAgentRequest::ForkSession { source_label, .. } => {
                             format!(
                                 "Forking agent \"{source_label}\" as \"{name}\" by cloning its current worktree contents into a fresh session...",
@@ -4230,6 +4270,75 @@ impl App {
                         }
                     } else if let PromptState::NameNewAgent { input, .. } = &mut self.prompt {
                         input.handle_key(key);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        if matches!(self.prompt, PromptState::ConvertScratchToProject { .. }) {
+            let is_plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = if is_plain_char {
+                None
+            } else {
+                self.bindings.lookup(&key, BindingScope::Dialog)
+            };
+            match action {
+                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+                Some(Action::Confirm) => {
+                    self.apply_convert_scratch_to_project_prompt()?;
+                }
+                _ => {
+                    if let PromptState::ConvertScratchToProject { input, .. } = &mut self.prompt {
+                        input.handle_key(key);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        if matches!(self.prompt, PromptState::PickScratchProject { .. }) {
+            let is_plain_char = matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL);
+            let action = if is_plain_char {
+                None
+            } else {
+                self.bindings.lookup(&key, BindingScope::Palette)
+            };
+            match action {
+                Some(Action::CloseOverlay) => self.prompt = PromptState::None,
+                Some(Action::MoveDown) => {
+                    if let PromptState::PickScratchProject {
+                        projects,
+                        selected,
+                        filter,
+                        ..
+                    } = &mut self.prompt
+                    {
+                        let count = filtered_scratch_project_indices(projects, &filter.text).len();
+                        if *selected + 1 < count {
+                            *selected += 1;
+                        }
+                    }
+                }
+                Some(Action::MoveUp) => {
+                    if let PromptState::PickScratchProject { selected, .. } = &mut self.prompt
+                        && *selected > 0
+                    {
+                        *selected -= 1;
+                    }
+                }
+                Some(Action::Confirm) => {
+                    self.apply_move_scratch_to_project_prompt()?;
+                }
+                _ => {
+                    if let PromptState::PickScratchProject {
+                        filter, selected, ..
+                    } = &mut self.prompt
+                        && filter.handle_key(key)
+                    {
+                        *selected = 0;
                     }
                 }
             }
@@ -5847,7 +5956,8 @@ impl App {
             }
             CreateAgentRequest::ForkSession { .. }
             | CreateAgentRequest::ExistingManagedWorktree { .. }
-            | CreateAgentRequest::ForkExternalWorktree { .. } => unreachable!(),
+            | CreateAgentRequest::ForkExternalWorktree { .. }
+            | CreateAgentRequest::Scratch { .. } => unreachable!(),
         };
         if let Err(e) = self.dispatch_create_agent_request(request, msg) {
             self.set_error(format!("{e:#}"));
@@ -6509,6 +6619,37 @@ impl App {
                     self.create_agent_for_selected_project()?;
                 }
             }
+            Some(LeftItem::ScratchHeader) => {
+                let has_sessions = self.sessions.iter().any(|session| session.is_scratch());
+                if has_sessions {
+                    if self.collapsed_projects.contains(SCRATCH_PROJECT_ID) {
+                        self.collapsed_projects.remove(SCRATCH_PROJECT_ID);
+                        self.rebuild_left_items();
+                    }
+                    if let Some(pos) = self
+                        .left_items()
+                        .iter()
+                        .position(|item| matches!(item, LeftItem::Session(si) if self.sessions[*si].is_scratch()))
+                    {
+                        self.selected_left = pos;
+                        self.center_mode = CenterMode::Agent;
+                        self.focus = FocusPane::Center;
+                        self.reload_changed_files();
+                        if self
+                            .selected_session()
+                            .map(|s| self.providers.contains_key(&s.id))
+                            .unwrap_or(false)
+                        {
+                            self.input_target = InputTarget::Agent;
+                            self.fullscreen_overlay = FullscreenOverlay::Agent;
+                        } else if self.selected_session().is_some() {
+                            self.reconnect_selected_session()?;
+                        }
+                    }
+                } else {
+                    self.create_scratch_agent()?;
+                }
+            }
             Some(LeftItem::Session(_)) => {
                 self.center_mode = CenterMode::Agent;
                 self.focus = FocusPane::Center;
@@ -6526,6 +6667,7 @@ impl App {
             }
             Some(LeftItem::EmptyProjectsSpacer) => {}
             Some(LeftItem::EmptyProjectsSeparator) => {}
+            Some(LeftItem::ScratchSeparator) => {}
             None => {}
         }
         Ok(())
@@ -7653,6 +7795,7 @@ fn is_terminal_link_click_modifier(modifiers: KeyModifiers) -> bool {
 fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: String) {
     match request {
         CreateAgentRequest::NewProject { custom_name, .. }
+        | CreateAgentRequest::Scratch { custom_name, .. }
         | CreateAgentRequest::ForkSession { custom_name, .. }
         | CreateAgentRequest::PullRequest { custom_name, .. }
         | CreateAgentRequest::ExistingManagedWorktree { custom_name, .. }
@@ -7920,6 +8063,7 @@ mod tests {
             terminal_return_to_list: false,
             terminal_counter: 0,
             create_agent_in_flight: false,
+            scratch_conversion_in_flight: false,
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             rebases_in_flight: std::collections::HashSet::new(),
@@ -16026,7 +16170,7 @@ cyan = "#00ffff"
         );
         assert_eq!(
             app.status.message(),
-            "Scanning for inactive dux-managed worktrees eligible for cleanup. The review list will appear when the scan finishes."
+            "Scanning for inactive dux-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes."
         );
     }
 

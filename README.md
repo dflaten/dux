@@ -11,7 +11,7 @@
 
 <img src="assets/dux-logo.png" width="200" align="right" />
 
-`dux` is a terminal UI for orchestrating multiple AI coding agents, each in its own git worktree, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
+`dux` is a terminal UI for orchestrating multiple AI coding agents, each project agent in its own git worktree, plus ad-hoc scratch agents that are not attached to a project, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
 
 This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). The original package was great, but I needed a few more workflow features to use it as my day-to-day agent manager. This fork is intended to be installed from source rather than through upstream release channels.
 
@@ -33,7 +33,8 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | Icon | Item | Details |
 | --- | --- | --- |
 | 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
-| 🌿 | Worktrees | One isolated git worktree per agent, with fork and existing-worktree workflows |
+| 🌿 | Worktrees | One isolated git worktree per project agent, with fork and existing-worktree workflows |
+| ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
 | 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
 | 🎨 | Configuration | Fully commented config, rebindable keys, and a theme engine |
@@ -47,7 +48,8 @@ Recent fork additions include:
 
 - Copy and paste between agent and terminal panes.
 - A searchable existing-worktree picker for creating or reconnecting agents.
-- Cleanup for inactive managed worktrees.
+- Cleanup for inactive managed worktrees and unreferenced scratch workspaces.
+- An always-visible Scratch workspace for ad-hoc agents, with conversion into a new project or an existing project's worktree.
 - Always-visible diffs against the base branch, with easy rebasing.
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.

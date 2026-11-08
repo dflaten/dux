@@ -541,6 +541,136 @@ pub fn create_worktree_from_start_point(
     Ok((branch_name, canonical))
 }
 
+/// Initialize a fresh repository at `path`, set its initial branch to `main`,
+/// and commit the current working tree (including an empty tree).
+///
+/// The user's configured git identity is used when available. When git has no
+/// identity configured, a neutral `dux <dux@localhost>` identity is applied to
+/// the initial commit only (via `-c`, never persisted into the repository), so
+/// converting a scratch agent into a project never fails just because git
+/// identity is missing. The user can amend or re-author the commit later.
+pub fn init_repository_with_initial_commit(path: &Path) -> Result<()> {
+    init_repository_with_initial_commit_and_identity(path, None)
+}
+
+/// Identity flags for the initial commit. `None` means "use the user's
+/// configured git identity"; a neutral fallback is used only when git reports
+/// no identity is configured.
+fn initial_commit_identity_args(identity: Option<(&str, &str)>, configured: bool) -> Vec<String> {
+    match identity {
+        Some((name, email)) => vec![
+            "-c".to_string(),
+            format!("user.name={name}"),
+            "-c".to_string(),
+            format!("user.email={email}"),
+        ],
+        None if !configured => vec![
+            "-c".to_string(),
+            "user.name=dux".to_string(),
+            "-c".to_string(),
+            "user.email=dux@localhost".to_string(),
+        ],
+        None => Vec::new(),
+    }
+}
+
+fn git_identity_configured(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["var", "GIT_COMMITTER_IDENT"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// `identity` is applied to the initial commit only (via `-c`); it is never
+/// written into the repository. When `None`, the configured identity is used,
+/// falling back to the neutral dux identity if none is configured.
+fn init_repository_with_initial_commit_and_identity(
+    path: &Path,
+    identity: Option<(&str, &str)>,
+) -> Result<()> {
+    let path_arg = path.to_string_lossy();
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        Command::new("git")
+            .arg("-C")
+            .arg(path_arg.as_ref())
+            .args(args)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to run git {} for {}",
+                    args.join(" "),
+                    path.display()
+                )
+            })
+    };
+
+    let output = run(&["init"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git init failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let output = run(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to set initial branch to main for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let identity_configured = git_identity_configured(path);
+    if identity.is_none() && !identity_configured {
+        logger::info(&format!(
+            "git identity is not configured; using dux fallback identity for the initial commit in {}",
+            path.display()
+        ));
+    }
+
+    let output = run(&["add", "-A"])?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git add failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let mut commit_args: Vec<String> = vec!["-c".to_string(), "color.ui=false".to_string()];
+    commit_args.extend(initial_commit_identity_args(identity, identity_configured));
+    commit_args.extend(
+        ["commit", "--allow-empty", "-m", "Initial commit"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path_arg.as_ref())
+        .args(&commit_args)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run git {} for {}",
+                commit_args.join(" "),
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "initial commit failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 pub fn head_commit(repo_path: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
@@ -598,7 +728,23 @@ pub fn head_commit_time(repo_path: &Path) -> Result<chrono::DateTime<chrono::Utc
     Ok(parsed.with_timezone(&chrono::Utc))
 }
 
+/// Make `destination` look exactly like `source`: entries that only exist in
+/// `destination` are removed. Git administration files are preserved so a
+/// worktree's `.git` link is never replaced.
 pub fn mirror_worktree_contents(source: &Path, destination: &Path) -> Result<()> {
+    sync_worktree_contents(source, destination, true)
+}
+
+/// Copy every visible entry from `source` into `destination`, overwriting
+/// files that already exist, while leaving entries that only exist in
+/// `destination` untouched. Git administration files are skipped. This is the
+/// "merge this work into an existing checkout" counterpart to
+/// [`mirror_worktree_contents`].
+pub fn copy_worktree_contents_into(source: &Path, destination: &Path) -> Result<()> {
+    sync_worktree_contents(source, destination, false)
+}
+
+fn sync_worktree_contents(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let source = source
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", source.display()))?;
@@ -610,7 +756,7 @@ pub fn mirror_worktree_contents(source: &Path, destination: &Path) -> Result<()>
             "source and destination worktrees must be different"
         ));
     }
-    sync_directory_contents(&source, &destination)
+    sync_directory_contents(&source, &destination, prune)
 }
 
 pub struct RemoveResult {
@@ -1301,7 +1447,7 @@ fn is_github_host(host: &str) -> bool {
     host == "github.com" || host.starts_with("github.")
 }
 
-fn sync_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+fn sync_directory_contents(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let mut source_entries = Vec::new();
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -1310,24 +1456,26 @@ fn sync_directory_contents(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         source_entries.push(name);
-        sync_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        sync_entry(&entry.path(), &destination.join(entry.file_name()), prune)?;
     }
 
-    for entry in fs::read_dir(destination)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if is_git_admin_entry(&name) {
-            continue;
-        }
-        if !source_entries.iter().any(|candidate| candidate == &name) {
-            remove_path(&entry.path())?;
+    if prune {
+        for entry in fs::read_dir(destination)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if is_git_admin_entry(&name) {
+                continue;
+            }
+            if !source_entries.iter().any(|candidate| candidate == &name) {
+                remove_path(&entry.path())?;
+            }
         }
     }
 
     Ok(())
 }
 
-fn sync_entry(source: &Path, destination: &Path) -> Result<()> {
+fn sync_entry(source: &Path, destination: &Path, prune: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -1361,7 +1509,7 @@ fn sync_entry(source: &Path, destination: &Path) -> Result<()> {
             }
             Err(err) => return Err(err.into()),
         }
-        sync_directory_contents(source, destination)?;
+        sync_directory_contents(source, destination, prune)?;
         return Ok(());
     }
 
@@ -1652,6 +1800,54 @@ mod tests {
     }
 
     #[test]
+    fn copy_worktree_contents_into_overlays_without_pruning_destination() {
+        let repo = init_test_repo();
+        let source = add_worktree(repo.path(), "copy-source");
+        let destination = add_worktree(repo.path(), "copy-destination");
+
+        fs::write(source.join("shared.txt"), "from source\n").unwrap();
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested").join("note.txt"), "scratch note\n").unwrap();
+
+        fs::write(destination.join("shared.txt"), "from destination\n").unwrap();
+        fs::write(destination.join("project-only.txt"), "keep me\n").unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        fs::write(
+            destination.join("nested").join("project-only.txt"),
+            "keep nested me\n",
+        )
+        .unwrap();
+
+        let destination_git_before = fs::read_to_string(destination.join(".git")).unwrap();
+        copy_worktree_contents_into(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("shared.txt")).unwrap(),
+            "from source\n",
+            "source files overwrite same-named destination files"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("project-only.txt")).unwrap(),
+            "keep me\n",
+            "destination-only files survive the copy"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested").join("note.txt")).unwrap(),
+            "scratch note\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("nested").join("project-only.txt")).unwrap(),
+            "keep nested me\n",
+            "nested destination-only files survive the copy"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join(".git")).unwrap(),
+            destination_git_before,
+            "the destination worktree's git admin state is preserved"
+        );
+    }
+
+    #[test]
     fn mirror_worktree_contents_propagates_source_file_modes() {
         // Assert that file/dir modes match the source after mirroring. The
         // previous implementation created with umask defaults and fixed up
@@ -1689,8 +1885,67 @@ mod tests {
         );
     }
 
-    // ── rename_branch tests ──────────────────────────────────────
+    #[test]
+    fn init_repository_with_initial_commit_creates_main_and_tracks_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        fs::write(path.join("README.md"), "hello\n").unwrap();
 
+        init_repository_with_initial_commit_and_identity(path, Some(("test", "t@t"))).unwrap();
+
+        assert!(path.join(".git").is_dir());
+        assert_eq!(current_branch(path).unwrap(), "main");
+        assert!(!head_commit(path).unwrap().is_empty());
+        let output = Command::new("git")
+            .args(["-C", path.to_string_lossy().as_ref(), "ls-files"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "README.md");
+
+        // The commit identity must not be written into the new repository:
+        // doing so would shadow the user's global identity for every future
+        // agent commit.
+        let output = Command::new("git")
+            .args([
+                "-C",
+                path.to_string_lossy().as_ref(),
+                "config",
+                "--local",
+                "user.name",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "initial commit identity must not be persisted in the repository"
+        );
+    }
+
+    #[test]
+    fn initial_commit_identity_args_uses_explicit_identity_or_fallback() {
+        assert_eq!(
+            initial_commit_identity_args(Some(("Test", "t@t")), true),
+            vec![
+                "-c".to_string(),
+                "user.name=Test".to_string(),
+                "-c".to_string(),
+                "user.email=t@t".to_string(),
+            ]
+        );
+        assert!(initial_commit_identity_args(None, true).is_empty());
+        assert_eq!(
+            initial_commit_identity_args(None, false),
+            vec![
+                "-c".to_string(),
+                "user.name=dux".to_string(),
+                "-c".to_string(),
+                "user.email=dux@localhost".to_string(),
+            ]
+        );
+    }
+
+    // ── rename_branch tests ──────────────────────────────────────
     #[test]
     fn rename_branch_succeeds() {
         let repo = init_test_repo();

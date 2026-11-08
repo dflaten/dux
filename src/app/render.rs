@@ -497,16 +497,27 @@ impl App {
                 Style::default().fg(self.theme.branch_fg).bg(bg),
             ));
             spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
-            spans.push(Span::styled(
-                "branch: ",
-                Style::default().fg(label_fg).bg(bg),
-            ));
-            spans.push(Span::styled(
-                project.current_branch.clone(),
-                Style::default().fg(self.theme.branch_fg).bg(bg),
-            ));
+            if project.is_scratch() {
+                spans.push(Span::styled(
+                    "workspace: ",
+                    Style::default().fg(label_fg).bg(bg),
+                ));
+                spans.push(Span::styled(
+                    "ad-hoc (not a git repository)".to_string(),
+                    Style::default().fg(self.theme.branch_fg).bg(bg),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "branch: ",
+                    Style::default().fg(label_fg).bg(bg),
+                ));
+                spans.push(Span::styled(
+                    project.current_branch.clone(),
+                    Style::default().fg(self.theme.branch_fg).bg(bg),
+                ));
+            }
             if let Some(session) = self.selected_session()
-                && session.branch_name != project.current_branch
+                && (project.is_scratch() || session.branch_name != project.current_branch)
             {
                 spans.push(Span::styled(" ╱ ", Style::default().fg(sep_fg).bg(bg)));
                 spans.push(Span::styled(
@@ -639,10 +650,23 @@ impl App {
                         ]))
                     }
                     LeftItem::EmptyProjectsSpacer => ListItem::new(Line::from("")),
-                    LeftItem::EmptyProjectsSeparator => ListItem::new(Line::from(Span::styled(
-                        "─",
-                        Style::default().fg(self.theme.header_separator_fg),
-                    ))),
+                    LeftItem::EmptyProjectsSeparator | LeftItem::ScratchSeparator => {
+                        ListItem::new(Line::from(Span::styled(
+                            "─",
+                            Style::default().fg(self.theme.header_separator_fg),
+                        )))
+                    }
+                    LeftItem::ScratchHeader => {
+                        let icon = if self.collapsed_projects.contains(SCRATCH_PROJECT_ID) {
+                            "▸"
+                        } else {
+                            "▾"
+                        };
+                        ListItem::new(Line::from(Span::styled(
+                            icon,
+                            Style::default().fg(self.theme.project_icon),
+                        )))
+                    }
                 })
                 .collect::<Vec<_>>();
             let mut state = ListState::default().with_selected(Some(self.selected_left));
@@ -692,7 +716,12 @@ impl App {
         };
         let left_items = self.left_items();
         let projects_focused = focused && self.left_section == LeftSection::Projects;
-        let title = format!("Projects ({})", self.projects.len());
+        let project_count = self
+            .projects
+            .iter()
+            .filter(|project| !project.is_scratch())
+            .count();
+        let title = format!("Projects ({project_count})");
         let projects_inner_width = self
             .themed_block(&title, projects_focused)
             .inner(projects_area)
@@ -835,6 +864,38 @@ impl App {
                         ))
                         .collect::<Vec<_>>(),
                     ))
+                }
+                LeftItem::ScratchSeparator => ListItem::new(empty_projects_separator_line(
+                    projects_inner_width,
+                    &self.theme,
+                )),
+                LeftItem::ScratchHeader => {
+                    let count = session_counts.get(SCRATCH_PROJECT_ID).copied().unwrap_or(0);
+                    let icon = if self.collapsed_projects.contains(SCRATCH_PROJECT_ID) {
+                        "▸ "
+                    } else {
+                        "▾ "
+                    };
+                    let mut spans = vec![
+                        Span::styled(icon, Style::default().fg(self.theme.project_icon)),
+                        Span::styled(
+                            SCRATCH_PROJECT_NAME.to_string(),
+                            Style::default()
+                                .fg(self.theme.text_fg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if count > 0 {
+                        spans.push(Span::styled(
+                            format!(" ({count})"),
+                            Style::default().fg(self.theme.provider_label_fg),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        "  ad-hoc",
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    ));
+                    ListItem::new(Line::from(spans))
                 }
                 LeftItem::EmptyProjectsSeparator => {
                     after_empty_projects_separator = true;
@@ -1665,6 +1726,14 @@ impl App {
             return;
         }
 
+        if self
+            .selected_session()
+            .is_some_and(|session| session.is_scratch())
+        {
+            self.render_scratch_workspace_pane(frame, area);
+            return;
+        }
+
         let focused = self.focus == FocusPane::Files;
         let session_id = self.selected_session().map(|session| session.id.as_str());
         let queued_count = self
@@ -1706,6 +1775,53 @@ impl App {
             self.mouse_layout.commit_area = None;
             self.mouse_layout.commit_text_area = None;
         }
+    }
+
+    fn render_scratch_workspace_pane(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == FocusPane::Files;
+        let block = self.themed_block("Scratch Agent", focused);
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        self.mouse_layout.unstaged_list = None;
+        self.mouse_layout.staged_list = None;
+        self.mouse_layout.commit_area = None;
+        self.mouse_layout.commit_text_area = None;
+
+        let Some(session) = self.selected_session() else {
+            return;
+        };
+        let workspace = session.worktree_path.clone();
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " This agent runs outside a git repository.",
+                Style::default().fg(self.theme.text_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Workspace:",
+                Style::default().fg(self.theme.provider_label_fg),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    " {}",
+                    git::ellipsize_middle(&workspace, inner.width.saturating_sub(2) as usize)
+                ),
+                Style::default().fg(self.theme.branch_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " File changes and diffs are unavailable until this agent is converted to a project.",
+                Style::default().fg(self.theme.hint_desc_fg),
+            )),
+            Line::from(Span::styled(
+                " Use the agent terminal, or open the workspace folder in your editor.",
+                Style::default().fg(self.theme.hint_desc_fg),
+            )),
+        ];
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(inner, frame.buffer_mut());
     }
 
     fn render_diff_comment_queue(&self, frame: &mut Frame, area: Rect, pane_focused: bool) {
@@ -4978,8 +5094,16 @@ impl App {
                     OverlayMouseLayout::AddProjectFailed { ok_button: ok_area };
             }
             PromptState::ConfirmDeleteAgent {
-                branch_name, focus, ..
+                session_id,
+                branch_name,
+                focus,
+                ..
             } => {
+                let is_scratch = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == *session_id)
+                    .is_some_and(|session| session.is_scratch());
                 self.render_dim_overlay(frame);
                 let dialog_width = 56.min(frame.area().width.max(1));
                 let inner_width = dialog_width.saturating_sub(2);
@@ -4996,7 +5120,11 @@ impl App {
                     Line::from(""),
                 ];
                 body_lines.push(Line::from(Span::styled(
-                    " Worktree and branch will be preserved on disk.",
+                    if is_scratch {
+                        " The scratch folder and its files will be preserved on disk."
+                    } else {
+                        " Worktree and branch will be preserved on disk."
+                    },
                     Style::default().fg(self.theme.hint_desc_fg),
                 )));
                 let body_height = wrapped_line_count(&body_lines, inner_width, false);
@@ -5065,7 +5193,7 @@ impl App {
                 let dialog_height = 12.min(frame.area().height.max(1));
                 let area = centered_rect_exact(dialog_width, dialog_height, frame.area());
                 self.clear_overlay_area(frame, area);
-                let outer = self.themed_overlay_block("Cleanup Worktrees");
+                let outer = self.themed_overlay_block("Cleanup Workspaces");
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
                 let confirm_key = self.bindings.label_for(Action::Confirm);
@@ -5073,15 +5201,17 @@ impl App {
 
                 let lines = vec![
                     Line::from(""),
-                    Line::from(" Worktree cleanup removes inactive dux-managed worktrees."),
+                    Line::from(
+                        " Cleanup removes inactive dux-managed worktrees and scratch workspaces.",
+                    ),
                     Line::from(""),
                     Line::from(Span::styled(
-                        " Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
+                        " Entries are eligible when their latest activity is at least two weeks old and no agent is open.",
                         Style::default().fg(self.theme.warning_fg),
                     )),
                     Line::from(""),
                     Line::from(format!(
-                        " Press {confirm_key} to scan for eligible worktrees. Press {close_key} to cancel."
+                        " Press {confirm_key} to scan for eligible entries. Press {close_key} to cancel."
                     )),
                 ];
                 Paragraph::new(lines)
@@ -5098,7 +5228,7 @@ impl App {
                 self.render_dim_overlay(frame);
                 let area = centered_rect(92, 82, frame.area());
                 self.clear_overlay_area(frame, area);
-                let outer = self.themed_overlay_block("Cleanup Worktrees");
+                let outer = self.themed_overlay_block("Cleanup Workspaces");
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
@@ -5120,28 +5250,30 @@ impl App {
                 let intro = if candidates.is_empty() {
                     vec![
                         Line::from(""),
-                        Line::from(" No inactive dux-managed worktrees meet the cleanup criteria."),
+                        Line::from(
+                            " No inactive dux-managed worktrees or scratch workspaces meet the cleanup criteria.",
+                        ),
                         Line::from(""),
                         Line::from(Span::styled(
-                            " Worktrees are eligible when their latest commit is at least two weeks old and no agent is open.",
+                            " Entries are eligible when their latest activity is at least two weeks old and no agent is open.",
                             Style::default().fg(self.theme.warning_fg),
                         )),
                     ]
                 } else {
                     vec![
                         Line::from(format!(
-                            " {} inactive worktree(s) found. {} selected for cleanup.",
+                            " {} inactive entries found. {} selected for cleanup.",
                             candidates.len(),
                             selected_count
                         )),
                         Line::from(""),
                         Line::from(Span::styled(
-                            " Uncommitted changes in selected worktrees will be lost.",
+                            " Uncommitted changes in selected worktrees and all files in selected scratch workspaces will be lost.",
                             Style::default().fg(self.theme.warning_fg),
                         )),
                         Line::from(""),
                         Line::from(format!(
-                            " Use {move_up}/{move_down} to move, Space to keep/remove a worktree, {confirm_key} to remove selected."
+                            " Use {move_up}/{move_down} to move, Space to keep/remove an entry, {confirm_key} to remove selected."
                         )),
                     ]
                 };
@@ -5172,13 +5304,21 @@ impl App {
                         )));
                         last_project = Some(candidate.project_name.as_str());
                     }
+                    let is_scratch = candidate.project_id == SCRATCH_PROJECT_ID;
                     let session_count = candidate.session_ids.len();
-                    let session_label = if session_count == 0 {
+                    let session_label = if is_scratch {
+                        "scratch workspace".to_string()
+                    } else if session_count == 0 {
                         "no database session".to_string()
                     } else if session_count == 1 {
                         "1 session".to_string()
                     } else {
                         format!("{session_count} sessions")
+                    };
+                    let activity_label = if is_scratch {
+                        "last activity"
+                    } else {
+                        "last commit"
                     };
                     let is_cursor = index == *cursor;
                     let style = if is_cursor {
@@ -5199,7 +5339,7 @@ impl App {
                         ),
                         Span::styled(
                             format!(
-                                " - {session_label}, last commit {}",
+                                " - {session_label}, {activity_label} {}",
                                 candidate.last_commit_at.format("%Y-%m-%d")
                             ),
                             style,
@@ -5255,7 +5395,7 @@ impl App {
 
                 let intro = vec![
                     Line::from(format!(
-                        " Removed {} worktree(s). {} failure(s).",
+                        " Removed {} entries. {} failure(s).",
                         removed.len(),
                         failed.len()
                     )),
@@ -5898,6 +6038,195 @@ impl App {
                     use_button: use_area,
                 };
             }
+            PromptState::ConvertScratchToProject {
+                session_label,
+                input,
+                ..
+            } => {
+                self.render_dim_overlay(frame);
+                let dialog_width = 68.min(frame.area().width.max(1));
+                let area = centered_rect_exact(dialog_width, 12, frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Convert Scratch Agent");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+
+                let [label_area, context_area, input_area, hint_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                    ])
+                    .areas(inner);
+
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" Convert \"{session_label}\" into a new project."),
+                    Style::default().fg(self.theme.input_label_fg),
+                )))
+                .render(label_area, frame.buffer_mut());
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        " Destination path:",
+                        Style::default().fg(self.theme.provider_label_fg),
+                    )),
+                    Line::from(Span::styled(
+                        " Files are copied there, git is initialized, and the agent moves to a managed worktree.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                    Line::from(Span::styled(
+                        " The scratch folder is kept as a backup for the cleanup workflow.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                ])
+                .wrap(Wrap { trim: false })
+                .render(context_area, frame.buffer_mut());
+
+                let display = if input.cursor < input.text.len() {
+                    let (before, after) = input.text.split_at(input.cursor);
+                    let (cursor_char, rest) = after.split_at(1);
+                    Line::from(vec![
+                        Span::raw(format!(" {before}")),
+                        Span::styled(
+                            cursor_char.to_string(),
+                            Style::default()
+                                .fg(self.theme.input_cursor_fg)
+                                .bg(self.theme.input_cursor_bg),
+                        ),
+                        Span::raw(rest.to_string()),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw(format!(" {}", input.text)),
+                        Span::styled(
+                            " ",
+                            Style::default()
+                                .fg(self.theme.input_cursor_fg)
+                                .bg(self.theme.input_cursor_bg),
+                        ),
+                    ])
+                };
+                Paragraph::new(display)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_set(border::ROUNDED)
+                            .border_style(Style::default().fg(self.theme.overlay_border)),
+                    )
+                    .render(input_area, frame.buffer_mut());
+
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let mut hints = vec![Span::raw(" ")];
+                hints.extend(self.theme.key_badge_default(&confirm_key));
+                hints.push(Span::styled(
+                    " convert  ",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                hints.extend(self.theme.key_badge_default(&close_key));
+                hints.push(Span::styled(
+                    " cancel",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+            }
+            PromptState::PickScratchProject {
+                session_label,
+                projects,
+                selected,
+                filter,
+                ..
+            } => {
+                self.render_dim_overlay(frame);
+                let dialog_width = 72.min(frame.area().width.max(1));
+                let available_height = frame.area().height.saturating_sub(2);
+                let area =
+                    centered_rect_exact(dialog_width, available_height.min(20), frame.area());
+                self.clear_overlay_area(frame, area);
+                let outer = self.themed_overlay_block("Move Scratch Agent to Project");
+                let inner = outer.inner(area);
+                outer.render(area, frame.buffer_mut());
+
+                let [label_area, filter_area, list_area, hint_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(2),
+                        Constraint::Length(1),
+                        Constraint::Min(3),
+                        Constraint::Length(1),
+                    ])
+                    .areas(inner);
+
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        format!(" Move \"{session_label}\" into an existing project."),
+                        Style::default().fg(self.theme.input_label_fg),
+                    )),
+                    Line::from(Span::styled(
+                        " A fresh worktree is created, and scratch files are copied into it.",
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    )),
+                ])
+                .render(label_area, frame.buffer_mut());
+
+                let filter_label = if filter.text.is_empty() {
+                    " type to filter projects".to_string()
+                } else {
+                    format!(" filter: {}", filter.text)
+                };
+                Paragraph::new(Line::from(Span::styled(
+                    filter_label,
+                    Style::default().fg(self.theme.hint_dim_desc_fg),
+                )))
+                .render(filter_area, frame.buffer_mut());
+
+                let matching = filtered_scratch_project_indices(projects, &filter.text);
+                let rows = usize::from(list_area.height).max(1);
+                let offset = selected.saturating_sub(rows.saturating_sub(1));
+                let items = matching
+                    .iter()
+                    .skip(offset)
+                    .take(rows)
+                    .map(|index| {
+                        let project = &projects[*index];
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                project.name.clone(),
+                                Style::default().fg(self.theme.text_fg),
+                            ),
+                            Span::styled(
+                                format!("  {}", project.path),
+                                Style::default().fg(self.theme.hint_dim_desc_fg),
+                            ),
+                        ]))
+                    })
+                    .collect::<Vec<_>>();
+                let mut state = ListState::default().with_selected(
+                    (!matching.is_empty()).then_some(selected.saturating_sub(offset)),
+                );
+                StatefulWidget::render(
+                    List::new(items).highlight_style(self.theme.selection_style()),
+                    list_area,
+                    frame.buffer_mut(),
+                    &mut state,
+                );
+
+                let confirm_key = self.bindings.label_for(Action::Confirm);
+                let close_key = self.bindings.label_for(Action::CloseOverlay);
+                let mut hints = vec![Span::raw(" ")];
+                hints.extend(self.theme.key_badge_default(&confirm_key));
+                hints.push(Span::styled(
+                    " choose  ",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                hints.extend(self.theme.key_badge_default(&close_key));
+                hints.push(Span::styled(
+                    " cancel",
+                    Style::default().fg(self.theme.hint_desc_fg),
+                ));
+                Paragraph::new(Line::from(hints)).render(hint_area, frame.buffer_mut());
+            }
             PromptState::RenameSession {
                 input,
                 rename_branch,
@@ -6138,6 +6467,10 @@ impl App {
                 let checkbox_spacing = 1;
                 let footer_spacing = 1;
                 let context_line = match request {
+                    CreateAgentRequest::Scratch { project, .. } => Some(format!(
+                        " This agent will run in a new folder under {}. It is not attached to a git repository.",
+                        project.path
+                    )),
                     CreateAgentRequest::ExistingManagedWorktree { worktree_path, .. } => {
                         Some(format!(
                             " This starts a fresh agent session in {}.",
@@ -6189,11 +6522,14 @@ impl App {
                     ])
                     .areas(inner);
 
-                let label = if matches!(request, CreateAgentRequest::ExistingManagedWorktree { .. })
-                {
-                    " Enter a display name for the new agent:"
-                } else {
-                    " Enter a name for the new agent (used as branch name):"
+                let label = match request {
+                    CreateAgentRequest::ExistingManagedWorktree { .. } => {
+                        " Enter a display name for the new agent:"
+                    }
+                    CreateAgentRequest::Scratch { .. } => {
+                        " Enter a name for the scratch agent (used as workspace folder):"
+                    }
+                    _ => " Enter a name for the new agent (used as branch name):",
                 };
                 Paragraph::new(Line::from(Span::styled(
                     label,

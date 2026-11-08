@@ -63,7 +63,7 @@ Subcommands:
   dux config diff          Show settings that differ from defaults (summary)
   dux config diff --raw    Show a unified diff against the default config
   dux config reset         Remove config and logs (keeps agents and worktrees)
-  dux config reset --all   Full factory reset: remove config, logs, sessions, and worktrees
+  dux config reset --all   Full factory reset: remove config, logs, sessions, worktrees, and scratch workspaces
   dux config regenerate    Preview a fresh default config (shows diff)
   dux config regenerate --yes
                            Overwrite the config file with fresh defaults"
@@ -522,11 +522,17 @@ fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
     }
 
     remove_dir_with_message(&paths.worktrees_root)?;
+    remove_dir_with_message(&paths.scratch_root())?;
     remove_file_with_message(&paths.sessions_db_path)?;
     Ok(())
 }
 
 fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSession) {
+    // Scratch workspaces are removed wholesale with the scratch root below;
+    // they have no git worktree or branch to detach first.
+    if session.is_scratch() {
+        return;
+    }
     let worktree = Path::new(&session.worktree_path);
     if !git::is_under(&paths.worktrees_root, worktree) {
         eprintln!(
@@ -732,6 +738,19 @@ mod tests {
 
         run_reset(&harness.paths, true).expect("reset");
 
+        assert!(!harness.paths.root.exists());
+    }
+
+    #[test]
+    fn reset_all_removes_scratch_workspaces() {
+        let harness = ResetHarness::new();
+        let scratch = harness.paths.scratch_root().join("ad-hoc");
+        fs::create_dir_all(&scratch).expect("scratch workspace");
+        fs::write(scratch.join("note.txt"), "scratch\n").expect("scratch file");
+
+        run_reset(&harness.paths, true).expect("reset");
+
+        assert!(!scratch.exists());
         assert!(!harness.paths.root.exists());
     }
 
