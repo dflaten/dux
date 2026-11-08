@@ -3974,6 +3974,45 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_unreferenced_scratch_workspaces() {
+        let mut app = test_app_with_sessions(Vec::new(), Vec::new());
+        let scratch_root = app.paths.scratch_root();
+        std::fs::create_dir_all(&scratch_root).expect("scratch root");
+        let orphan = scratch_root.join("orphan");
+        std::fs::create_dir_all(&orphan).expect("orphan dir");
+        std::fs::write(orphan.join("note.txt"), "old\n").expect("orphan file");
+
+        let candidates = app.worktree_cleanup_candidates(Utc::now() + chrono::Duration::days(30));
+        assert_eq!(candidates.len(), 1);
+        app.begin_worktree_cleanup(candidates);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.worktree_cleanup_pending > 0 && std::time::Instant::now() < deadline {
+            app.drain_events();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.drain_events();
+
+        assert_eq!(app.worktree_cleanup_pending, 0);
+        assert!(
+            !orphan.exists(),
+            "cleanup should remove the scratch workspace"
+        );
+        assert!(matches!(
+            app.prompt,
+            PromptState::WorktreeCleanupSummary {
+                ref removed,
+                ref failed,
+                scroll_offset: 0
+            } if removed.len() == 1 && failed.is_empty()
+        ));
+        assert_eq!(
+            app.status.message(),
+            "Cleanup complete. Removed 1 inactive worktree(s) or scratch workspace(s)."
+        );
+    }
+
+    #[test]
     fn new_agent_on_scratch_header_opens_scratch_name_prompt() {
         let mut app = test_app_with_sessions(Vec::new(), vec![make_scratch_project()]);
         app.rebuild_left_items();
