@@ -32,6 +32,22 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// The fields of a row that participate in matching, split by how strictly
+/// they are matched.
+struct SearchFields {
+    /// Names, titles, branches, providers, and statuses. These are short,
+    /// human-visible values, so a subsequence match is a useful convenience.
+    fuzzy: Vec<String>,
+    /// Filesystem paths. These only match literally.
+    ///
+    /// Subsequence matching a path is far too permissive: every worktree path
+    /// contains `worktrees`, which supplies `t`, `r`, and `e`, so a query like
+    /// `trea` matches almost every agent as soon as any later character is an
+    /// `a` (a project name with an `a`, the `agent` segment, ...). The visible
+    /// row then shows nothing resembling the query.
+    literal: Vec<String>,
+}
+
 /// Whether a lowercased term matches a lowercased candidate.
 fn term_matches(term: &str, candidate: &str) -> bool {
     if candidate.contains(term) {
@@ -43,52 +59,62 @@ fn term_matches(term: &str, candidate: &str) -> bool {
     false
 }
 
-/// Whether every term matches at least one of the candidates.
-fn candidates_match(candidates: &[String], terms: &[String]) -> bool {
+/// Whether every term matches at least one of the fields.
+fn fields_match(fields: &SearchFields, terms: &[String]) -> bool {
     terms.iter().all(|term| {
-        candidates
+        fields
+            .fuzzy
             .iter()
             .any(|candidate| term_matches(term, candidate))
+            || fields
+                .literal
+                .iter()
+                .any(|candidate| candidate.contains(term))
     })
 }
 
-/// The lowercased fields of a project that participate in matching.
-fn project_candidates(project: &Project) -> Vec<String> {
-    vec![project.name.to_lowercase(), project.path.to_lowercase()]
+/// The fields of a project that participate in matching.
+fn project_fields(project: &Project) -> SearchFields {
+    SearchFields {
+        fuzzy: vec![project.name.to_lowercase()],
+        literal: vec![project.path.to_lowercase()],
+    }
 }
 
-/// The lowercased fields of an agent session that participate in matching.
-fn session_candidates(session: &AgentSession, project: &Project) -> Vec<String> {
+/// The fields of an agent session that participate in matching.
+fn session_fields(session: &AgentSession, project: &Project) -> SearchFields {
     let label = session
         .title
         .as_deref()
         .unwrap_or(session.branch_name.as_str());
-    let mut candidates = vec![
+    let mut fuzzy = vec![
         label.to_lowercase(),
         session.branch_name.to_lowercase(),
         session.provider.as_str().to_lowercase(),
         session.status.as_str().to_lowercase(),
-        session.worktree_path.to_lowercase(),
         project.name.to_lowercase(),
+    ];
+    if session.is_scratch() {
+        fuzzy.push("scratch".to_string());
+    }
+    let mut literal = vec![
+        session.worktree_path.to_lowercase(),
         project.path.to_lowercase(),
     ];
     if let Some(project_path) = session.project_path.as_deref() {
-        candidates.push(project_path.to_lowercase());
+        literal.push(project_path.to_lowercase());
     }
-    if session.is_scratch() {
-        candidates.push("scratch".to_string());
-    }
-    candidates
+    SearchFields { fuzzy, literal }
 }
 
 /// Whether the whole query matches the project.
 fn project_matches(project: &Project, terms: &[String]) -> bool {
-    candidates_match(&project_candidates(project), terms)
+    fields_match(&project_fields(project), terms)
 }
 
 /// Whether the whole query matches the session.
 fn session_matches(session: &AgentSession, project: &Project, terms: &[String]) -> bool {
-    candidates_match(&session_candidates(session, project), terms)
+    fields_match(&session_fields(session, project), terms)
 }
 
 /// Builds the left pane item list, narrowed to the rows matching `query`.
@@ -672,6 +698,27 @@ mod tests {
         assert_eq!(
             filtered(&projects, &sessions(), "alpha"),
             vec![LeftItem::Project(0)]
+        );
+    }
+
+    #[test]
+    fn paths_only_match_literally() {
+        let mut sessions = sessions();
+        // "worktrees" supplies t-r-e and "agent" supplies the final a, so a
+        // subsequence match would treat this as a hit for "trea" even though
+        // nothing visible contains the query.
+        sessions[0].worktree_path =
+            "/home/david/.config/dux/worktrees/alpha/agent/first".to_string();
+        assert!(
+            filtered(&projects(), &sessions, "trea").is_empty(),
+            "path fields must not match as a subsequence"
+        );
+
+        // Literal path fragments still match.
+        sessions[0].worktree_path = "/home/david/projects/treatment/agent".to_string();
+        assert_eq!(
+            filtered(&projects(), &sessions, "treatment"),
+            vec![LeftItem::Project(0), LeftItem::Session(0)]
         );
     }
 
