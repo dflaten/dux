@@ -534,9 +534,13 @@ impl App {
         }
         // The files search field owns every key while it is active. Without
         // this, plain characters are handled by the global bindings first and
-        // typing `q` in a file search would quit dux.
-        if self.focus == FocusPane::Files && self.files_search_active {
-            self.handle_files_key(key)?;
+        // typing `q` in a file search would quit dux. The commit message
+        // input keeps priority when it is engaged.
+        if self.focus == FocusPane::Files
+            && self.files_search_active
+            && self.input_target == InputTarget::None
+            && self.handle_files_search_key(key)
+        {
             return Ok(false);
         }
         if key.code == KeyCode::Esc && self.focus == FocusPane::Files && self.has_files_search() {
@@ -566,6 +570,7 @@ impl App {
         // was already applied.
         if key.code == KeyCode::Esc
             && self.focus == FocusPane::Left
+            && self.left_section == LeftSection::Projects
             && (self.left_search_active || self.has_left_search())
         {
             self.close_left_search(false);
@@ -573,6 +578,7 @@ impl App {
         }
         if self.left_search_active
             && self.focus == FocusPane::Left
+            && self.left_section == LeftSection::Projects
             && self.handle_left_search_key(key)?
         {
             return Ok(false);
@@ -780,7 +786,14 @@ impl App {
     fn handle_left_search_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Enter => {
-                if self.left_search_is_filtering() && self.left_items().is_empty() {
+                if !self.left_search_is_filtering() {
+                    // A query that is too short cannot narrow anything, so
+                    // Enter dismisses it instead of leaving it displayed as an
+                    // applied filter.
+                    self.close_left_search(false);
+                    return Ok(true);
+                }
+                if self.left_items().is_empty() {
                     self.set_warning(format!(
                         "No projects or agents match \"{}\". Keep typing or press Esc to clear the search.",
                         self.left_search.text.trim()
@@ -790,27 +803,50 @@ impl App {
                 self.close_left_search(true);
                 return Ok(true);
             }
-            KeyCode::Up => {
-                if let Some(prev) = self.previous_selectable_left_item_before(self.selected_left) {
-                    self.selected_left = prev;
-                }
-                return Ok(true);
-            }
-            KeyCode::Down => {
-                if let Some(next) = self.next_selectable_left_item_after(self.selected_left) {
-                    self.selected_left = next;
-                }
-                return Ok(true);
-            }
             KeyCode::Tab | KeyCode::BackTab => {
-                // Apply the filter and let Tab continue to the pane switcher.
-                self.close_left_search(true);
+                // Apply a filter that matches something and let Tab continue
+                // to the pane switcher. A query with no matches is dropped so
+                // the sidebar does not stay empty.
+                let apply = self.left_search_is_filtering() && !self.left_items().is_empty();
+                self.close_left_search(apply);
                 return Ok(false);
             }
             _ => {}
         }
 
-        if self.left_search.handle_key(key) {
+        // Arrow keys and other non-printing keys keep honoring the configured
+        // MoveUp/MoveDown bindings; plain characters always type into the
+        // query.
+        let is_plain_char =
+            matches!(key.code, KeyCode::Char(_)) && !key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_plain_char {
+            match self.bindings.lookup(&key, BindingScope::Left) {
+                Some(Action::MoveDown) => {
+                    let previous = self.selected_left_target();
+                    if let Some(next) = self.next_selectable_left_item_after(self.selected_left) {
+                        self.selected_left = next;
+                    }
+                    self.refresh_after_left_selection_change(&previous);
+                    return Ok(true);
+                }
+                Some(Action::MoveUp) => {
+                    let previous = self.selected_left_target();
+                    if let Some(prev) =
+                        self.previous_selectable_left_item_before(self.selected_left)
+                    {
+                        self.selected_left = prev;
+                    }
+                    self.refresh_after_left_selection_change(&previous);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        // Cursor-only edits (Left/Right/Home/End) do not change the query, so
+        // they should not rebuild the filtered tree.
+        let before = self.left_search.text.clone();
+        if self.left_search.handle_key(key) && self.left_search.text != before {
             self.update_left_search();
         }
         Ok(true)
@@ -1464,15 +1500,24 @@ impl App {
         }
     }
 
-    fn handle_files_search_key(&mut self, key: KeyEvent) {
+    /// Handles a key while the files search field is active.
+    ///
+    /// Returns `true` when the key was consumed by the search field and
+    /// `false` when it should fall through to the regular key handling, so
+    /// Tab keeps switching panes.
+    fn handle_files_search_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
                 self.clear_files_search();
-                return;
+                return true;
             }
             KeyCode::Enter => {
                 self.files_search_active = false;
-                return;
+                return true;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.files_search_active = false;
+                return false;
             }
             _ => {}
         }
@@ -1483,6 +1528,7 @@ impl App {
                 self.set_info("No file matches the current search.");
             }
         }
+        true
     }
 
     fn handle_files_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -5098,7 +5144,8 @@ impl App {
             if self.left_items().is_empty() {
                 return Some(MouseTarget::LeftPane);
             }
-            let index = usize::from(row.saturating_sub(self.mouse_layout.left_list.y));
+            let visible_row = usize::from(row.saturating_sub(self.mouse_layout.left_list.y));
+            let index = self.mouse_layout.left_list_offset + visible_row;
             if index < self.left_items().len() {
                 if !self.is_selectable_left_item(index) {
                     return Some(MouseTarget::LeftPane);
@@ -7894,7 +7941,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
 
     use super::components::{ButtonPressedTarget, PressedButton};
-    use super::{DOUBLE_CLICK_THRESHOLD, is_terminal_link_click_modifier};
+    use super::{DOUBLE_CLICK_THRESHOLD, MouseTarget, is_terminal_link_click_modifier};
     use crate::app::input::{
         build_diff_comments_prompt, build_rebase_failed_prompt, opencode_sidebar_boundary,
         selected_terminal_text_from_snapshot, startup_command_log_visual_lines,
@@ -8241,6 +8288,7 @@ mod tests {
             center: Rect::new(20, 0, 57, 20),
             right: Rect::new(77, 0, 23, 20),
             left_list: Rect::new(1, 1, 18, 10),
+            left_list_offset: 0,
             terminal_list: Rect::default(),
             agent_term: Some(Rect::new(21, 1, 55, 16)),
             unstaged_list: Some(Rect::new(78, 1, 21, 8)),
@@ -18958,12 +19006,78 @@ cyan = "#00ffff"
         press(&mut app, KeyCode::Enter);
         assert!(app.left_search_is_filtering());
         assert_eq!(app.left_items().len(), 2);
+        let selected = app.selected_left_target();
 
         press(&mut app, KeyCode::Esc);
 
         assert!(!app.has_left_search());
         assert!(!app.left_search_is_filtering());
         assert_eq!(app.left_items().len(), 4);
+        assert_eq!(
+            app.selected_left_target(),
+            selected,
+            "clearing an applied filter should keep the found row selected"
+        );
+    }
+
+    #[test]
+    fn tab_on_a_query_without_matches_clears_it_and_moves_on() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "zzzz");
+        assert!(app.left_items().is_empty());
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.left_search_active);
+        assert!(!app.has_left_search());
+        assert_eq!(app.focus, FocusPane::Center);
+    }
+
+    #[test]
+    fn tab_while_searching_files_moves_to_the_next_pane() {
+        let mut app = test_app(default_bindings());
+        app.focus = FocusPane::Files;
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.files_search_active);
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.files_search_active);
+        assert_eq!(app.focus, FocusPane::Left);
+    }
+
+    #[test]
+    fn the_scratch_header_keeps_its_selection_while_filtering() {
+        let mut app = search_test_app();
+        push_search_project(&mut app, crate::model::SCRATCH_PROJECT_ID, "Scratch");
+        push_search_session(
+            &mut app,
+            "scratch-1",
+            crate::model::SCRATCH_PROJECT_ID,
+            "adhoc",
+            "adhoc",
+        );
+        let scratch_index = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::ScratchHeader))
+            .expect("scratch header");
+        app.selected_left = scratch_index;
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Scratch)
+        );
+
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "scratch");
+
+        assert!(app.left_search_is_filtering());
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Scratch),
+            "the scratch header selection should survive the filtered rebuild"
+        );
     }
 
     #[test]
@@ -19072,6 +19186,98 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn enter_on_a_short_query_dismisses_it() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "a");
+        assert!(!app.left_search_is_filtering());
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(!app.left_search_active);
+        assert!(!app.has_left_search());
+    }
+
+    #[test]
+    fn tab_applies_the_filter_and_moves_to_the_next_pane() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(!app.left_search_active);
+        assert!(app.left_search_is_filtering());
+        assert_eq!(app.left_items().len(), 2);
+        assert_eq!(app.focus, FocusPane::Center);
+    }
+
+    #[test]
+    fn creating_an_agent_clears_the_sidebar_filter() {
+        let mut app = search_test_app();
+        open_sidebar_search(&mut app);
+        type_text(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.left_search_is_filtering());
+
+        // The new agent belongs to "demo" and has a title that does not match
+        // "alpha", so an applied filter would hide it.
+        let worktree = app.paths.worktrees_root.join("demo").join("unrelated");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let session = AgentSession {
+            id: "unrelated-session".to_string(),
+            project_id: app.projects[0].id.clone(),
+            project_path: Some(app.projects[0].path.clone()),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: "unrelated".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            title: Some("unrelated".to_string()),
+            started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
+            desired_running: false,
+            auto_reopen_enabled: true,
+            status: SessionStatus::Detached,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let args = vec!["-c".to_string(), "sleep 1".to_string()];
+        let client =
+            PtyClient::spawn("/bin/sh", &args, &worktree, 24, 80, 1_000).expect("spawn new agent");
+        let request = app.agent_launch_request(
+            session.clone(),
+            true,
+            AgentLaunchKind::Create {
+                status_message: "created".to_string(),
+                repo_path: app.projects[0].path.clone(),
+                owns_worktree: false,
+                startup_result: None,
+            },
+        );
+        app.worker_tx
+            .send(WorkerEvent::AgentLaunchReady(Box::new(
+                crate::app::AgentLaunchReadyData {
+                    request,
+                    client,
+                    previous_provider_session_ids: Default::default(),
+                },
+            )))
+            .unwrap();
+        app.drain_events();
+
+        assert!(
+            !app.has_left_search(),
+            "the filter should be cleared so the new agent is visible"
+        );
+        assert_eq!(
+            app.selected_left_target(),
+            Some(crate::app::LeftSelectionTarget::Session(
+                "unrelated-session".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn the_palette_command_opens_the_sidebar_search() {
         let mut app = search_test_app();
 
@@ -19094,6 +19300,20 @@ cyan = "#00ffff"
         app.toggle_collapse_selected_project();
 
         assert_eq!(app.collapsed_projects, before);
+    }
+
+    #[test]
+    fn mouse_click_uses_the_left_list_scroll_offset() {
+        let mut app = search_test_app();
+        install_mouse_layout(&mut app);
+        // Simulate a projects list scrolled down by one row.
+        app.mouse_layout.left_list_offset = 1;
+
+        assert_eq!(
+            app.mouse_target(5, 1),
+            Some(MouseTarget::LeftRow(1)),
+            "the first visible row should map to the second list item"
+        );
     }
 
     #[test]

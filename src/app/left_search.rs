@@ -132,13 +132,22 @@ pub(crate) fn build_filtered_left_items(
             continue;
         }
         let project_hit = project_matches(project, &terms);
-        let matched = matching_sessions(
-            project,
-            sessions,
-            sessions_by_project.get(project.id.as_str()),
-            &terms,
-            project_hit,
-        );
+        // A project whose checkout is missing hides its agents in the regular
+        // tree; keep that rule while filtering so search does not surface
+        // rows that cannot be acted on.
+        let matched = if project.path_missing {
+            Vec::new()
+        } else {
+            matching_sessions(
+                project,
+                sessions,
+                sessions_by_project
+                    .get(project.id.as_str())
+                    .map(Vec::as_slice),
+                &terms,
+                project_hit,
+            )
+        };
         if !project_hit && matched.is_empty() {
             continue;
         }
@@ -152,11 +161,16 @@ pub(crate) fn build_filtered_left_items(
         let matched = matching_sessions(
             project,
             sessions,
-            sessions_by_project.get(SCRATCH_PROJECT_ID),
+            sessions_by_project
+                .get(SCRATCH_PROJECT_ID)
+                .map(Vec::as_slice),
             &terms,
             project_hit,
         );
         if project_hit || !matched.is_empty() {
+            if !items.is_empty() {
+                items.push(LeftItem::ScratchSeparator);
+            }
             items.push(LeftItem::ScratchHeader);
             items.extend(matched.into_iter().map(LeftItem::Session));
         }
@@ -169,7 +183,7 @@ pub(crate) fn build_filtered_left_items(
 fn matching_sessions(
     project: &Project,
     sessions: &[AgentSession],
-    session_indices: Option<&Vec<usize>>,
+    session_indices: Option<&[usize]>,
     terms: &[String],
     project_hit: bool,
 ) -> Vec<usize> {
@@ -217,6 +231,7 @@ impl App {
         self.focus = FocusPane::Left;
         self.left_section = LeftSection::Projects;
         self.left_collapsed = false;
+        self.input_target = InputTarget::None;
         self.left_search.move_end();
         if !self.left_search_active {
             self.left_search_origin = self.selected_left_target();
@@ -227,31 +242,49 @@ impl App {
         );
     }
 
+    /// Clears the sidebar search state without rebuilding the list.
+    ///
+    /// Callers that are about to rebuild the list themselves can use this to
+    /// drop the filter before the rebuild.
+    pub(crate) fn reset_left_search_state(&mut self) {
+        self.left_search.clear();
+        self.left_search_active = false;
+        self.left_search_origin = None;
+    }
+
     /// Leaves the search field.
     ///
     /// Applying keeps the query as a filter on the sidebar; clearing drops
     /// the query and restores the row that was selected when the search
     /// opened.
     pub(crate) fn close_left_search(&mut self, apply: bool) {
-        let target = if apply {
-            self.selected_left_target()
+        let had_query = self.has_left_search();
+        let previous = self.selected_left_target();
+        // Cancelling an active search returns to where the search started.
+        // Clearing an already-applied filter keeps the row that is selected
+        // in the filtered list instead of jumping to whatever now sits at the
+        // same index in the full tree.
+        let target = if apply || !self.left_search_active {
+            previous.clone()
         } else {
-            self.left_search_origin.clone()
+            self.left_search_origin.clone().or(previous.clone())
         };
-        if !apply {
-            self.left_search.clear();
+        if apply {
+            self.left_search_active = false;
+            self.left_search_origin = None;
+        } else {
+            self.reset_left_search_state();
         }
-        self.left_search_active = false;
-        self.left_search_origin = None;
         self.rebuild_left_items();
         if let Some(target) = target {
             self.select_left_target(&target);
         }
+        self.refresh_after_left_selection_change(&previous);
         if apply {
             self.set_info(
                 "Project filter applied. Press Esc to clear it and show every project and agent again.",
             );
-        } else {
+        } else if had_query {
             self.set_info("Project search cleared. The full project list is shown again.");
         }
     }
@@ -261,14 +294,13 @@ impl App {
         if !self.has_left_search() && !self.left_search_active {
             return;
         }
-        let target = self.selected_left_target();
-        self.left_search.clear();
-        self.left_search_active = false;
-        self.left_search_origin = None;
+        let previous = self.selected_left_target();
+        self.reset_left_search_state();
         self.rebuild_left_items();
-        if let Some(target) = target {
+        if let Some(target) = previous.clone() {
             self.select_left_target(&target);
         }
+        self.refresh_after_left_selection_change(&previous);
     }
 
     /// Re-applies the query after the search text changed.
@@ -276,44 +308,116 @@ impl App {
     /// The selected row is kept when it still matches, otherwise the first
     /// matching row is selected.
     pub(crate) fn update_left_search(&mut self) {
-        let target = self.selected_left_target();
+        let previous = self.selected_left_target();
         self.rebuild_left_items();
-        if let Some(target) = target
+        if let Some(target) = previous.clone()
             && self.select_left_target(&target)
         {
-            return;
+            // The selected row survived the new query.
+        } else {
+            self.select_first_left_item();
         }
-        self.select_first_left_item();
+        self.refresh_after_left_selection_change(&previous);
     }
 
     /// Ends search editing mode when the left pane is no longer focused.
     ///
     /// The filter itself stays applied so the user comes back to the same
-    /// narrowed list.
+    /// narrowed list. A query that is too short to filter anything is dropped
+    /// instead of lingering as a no-op filter.
     pub(crate) fn deactivate_left_search_if_unfocused(&mut self) {
-        if self.left_search_active && self.focus != FocusPane::Left {
+        if !self.left_search_active {
+            return;
+        }
+        if self.focus == FocusPane::Left && self.left_section == LeftSection::Projects {
+            return;
+        }
+        if self.left_search_is_effective() {
             self.left_search_active = false;
             self.left_search_origin = None;
+        } else {
+            self.reset_left_search_state();
+        }
+    }
+
+    /// The identity of the row at `index` in the left pane.
+    pub(crate) fn left_target_at(&self, index: usize) -> Option<LeftSelectionTarget> {
+        match self.left_items().get(index)? {
+            LeftItem::Project(project_index) => {
+                let project = self.projects.get(*project_index)?;
+                Some(LeftSelectionTarget::Project(project.id.clone()))
+            }
+            LeftItem::Session(session_index) => {
+                let session = self.sessions.get(*session_index)?;
+                Some(LeftSelectionTarget::Session(session.id.clone()))
+            }
+            LeftItem::ScratchHeader => Some(LeftSelectionTarget::Scratch),
+            _ => None,
         }
     }
 
     /// The identity of the currently selected left pane row.
     pub(crate) fn selected_left_target(&self) -> Option<LeftSelectionTarget> {
-        match self.left_items().get(self.selected_left)? {
-            LeftItem::Project(index) => {
-                let project = self.projects.get(*index)?;
-                if project.is_scratch() {
-                    Some(LeftSelectionTarget::Scratch)
-                } else {
-                    Some(LeftSelectionTarget::Project(project.id.clone()))
-                }
-            }
-            LeftItem::Session(index) => {
-                let session = self.sessions.get(*index)?;
-                Some(LeftSelectionTarget::Session(session.id.clone()))
-            }
-            _ => None,
+        self.left_target_at(self.selected_left)
+    }
+
+    /// The identity of the selectable row above the current selection.
+    pub(crate) fn previous_left_target(&self) -> Option<LeftSelectionTarget> {
+        self.previous_selectable_left_item_before(self.selected_left)
+            .and_then(|index| self.left_target_at(index))
+    }
+
+    /// Whether the current selection belongs to the given project.
+    pub(crate) fn selection_belongs_to_project(&self, project_id: &str) -> bool {
+        match self.selected_left_target() {
+            Some(LeftSelectionTarget::Project(id)) => id == project_id,
+            Some(LeftSelectionTarget::Session(id)) => self
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .is_some_and(|session| session.project_id == project_id),
+            Some(LeftSelectionTarget::Scratch) => project_id == SCRATCH_PROJECT_ID,
+            None => false,
         }
+    }
+
+    /// Restores the left-pane selection after a project was removed.
+    ///
+    /// When the removed project was selected, the cursor moves to the row
+    /// above it (or a valid neighbour when there is none). Otherwise the
+    /// previously selected row is kept by identity.
+    pub(crate) fn restore_selection_after_removal(
+        &mut self,
+        selected_before: Option<LeftSelectionTarget>,
+        removed_was_selected: bool,
+        previous_target: Option<LeftSelectionTarget>,
+    ) {
+        if removed_was_selected {
+            if let Some(target) = previous_target
+                && self.select_left_target(&target)
+            {
+                return;
+            }
+            self.selected_left = self.selected_left.saturating_sub(1);
+            self.ensure_selectable_left_item();
+        } else if let Some(target) = selected_before {
+            self.select_left_target(&target);
+        }
+    }
+
+    /// Mirrors the bookkeeping that normal left-pane navigation performs when
+    /// the selected row changes, so the center diff and the files pane do not
+    /// keep showing the previous row's work after a search moved the cursor.
+    pub(crate) fn refresh_after_left_selection_change(
+        &mut self,
+        previous: &Option<LeftSelectionTarget>,
+    ) {
+        if &self.selected_left_target() == previous {
+            return;
+        }
+        self.close_diff_view();
+        self.reload_changed_files_quiet();
+        self.update_missing_project_warning();
     }
 
     /// Selects the row matching the given identity, if it is still listed.
@@ -553,5 +657,46 @@ mod tests {
         // empty-project section.
         let items = build_filtered_left_items(&projects, &sessions, &HashSet::new(), 1, "first");
         assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(0)]);
+    }
+
+    #[test]
+    fn path_missing_projects_keep_their_agents_hidden() {
+        let mut projects = projects();
+        projects[0].path_missing = true;
+
+        // The agent title matches, but the project checkout is missing, so
+        // the agent row stays hidden just like in the regular tree.
+        assert!(filtered(&projects, &sessions(), "first").is_empty());
+
+        // The project header is still shown when the project itself matches.
+        assert_eq!(
+            filtered(&projects, &sessions(), "alpha"),
+            vec![LeftItem::Project(0)]
+        );
+    }
+
+    #[test]
+    fn scratch_results_get_the_usual_separator() {
+        let mut projects = projects();
+        projects.push(project(SCRATCH_PROJECT_ID, "Scratch"));
+        let mut sessions = sessions();
+        sessions.push(session(
+            "scratch-1",
+            SCRATCH_PROJECT_ID,
+            "adhoc",
+            "adhoc",
+            "codex",
+        ));
+
+        let items = filtered(&projects, &sessions, "codex");
+        assert_eq!(
+            items.last(),
+            Some(&LeftItem::Session(3)),
+            "the scratch agent should be the last row"
+        );
+        assert!(
+            items.contains(&LeftItem::ScratchSeparator),
+            "the scratch group should keep its separator: {items:?}"
+        );
     }
 }

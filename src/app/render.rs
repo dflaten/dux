@@ -678,6 +678,7 @@ impl App {
                 frame.buffer_mut(),
                 &mut state,
             );
+            self.mouse_layout.left_list_offset = state.offset();
             return;
         }
 
@@ -707,14 +708,26 @@ impl App {
             .map(|(id, t)| ((*id).clone(), t.label.clone(), t.foreground_cmd.clone()))
             .collect();
 
-        let session_counts: HashMap<String, usize> = {
+        let left_items = self.left_items();
+        // While filtering, the per-project count must reflect the agents that
+        // are actually listed, not the unfiltered total.
+        let session_counts: HashMap<String, usize> = if self.left_search_is_filtering() {
+            let mut counts = HashMap::new();
+            for item in left_items {
+                if let LeftItem::Session(index) = item
+                    && let Some(session) = self.sessions.get(*index)
+                {
+                    *counts.entry(session.project_id.clone()).or_insert(0) += 1;
+                }
+            }
+            counts
+        } else {
             let mut counts = HashMap::new();
             for session in &self.sessions {
                 *counts.entry(session.project_id.clone()).or_insert(0) += 1;
             }
             counts
         };
-        let left_items = self.left_items();
         let projects_focused = focused && self.left_section == LeftSection::Projects;
         let project_count = self
             .projects
@@ -989,6 +1002,7 @@ impl App {
                 Style::default().fg(self.theme.hint_dim_desc_fg),
             )))
             .render(list_area, frame.buffer_mut());
+            self.mouse_layout.left_list_offset = 0;
         } else {
             StatefulWidget::render(
                 List::new(items).highlight_style(self.theme.selection_style()),
@@ -996,6 +1010,7 @@ impl App {
                 frame.buffer_mut(),
                 &mut state,
             );
+            self.mouse_layout.left_list_offset = state.offset();
         }
 
         // Render terminals section if any terminals exist.

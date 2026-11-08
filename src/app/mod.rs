@@ -1325,6 +1325,9 @@ pub(crate) struct MouseLayoutState {
     pub(crate) center: Rect,
     pub(crate) right: Rect,
     pub(crate) left_list: Rect,
+    /// Index of the first row visible in the projects list, used to map mouse
+    /// clicks back to items when the list is scrolled.
+    pub(crate) left_list_offset: usize,
     pub(crate) terminal_list: Rect,
     pub(crate) agent_term: Option<Rect>,
     pub(crate) unstaged_list: Option<Rect>,
@@ -1340,6 +1343,7 @@ impl MouseLayoutState {
         self.center = center;
         self.right = right;
         self.left_list = Rect::default();
+        self.left_list_offset = 0;
         self.terminal_list = Rect::default();
         self.agent_term = None;
         self.unstaged_list = None;
@@ -3069,26 +3073,38 @@ impl App {
     }
 
     pub(crate) fn sort_sessions_by_updated(&mut self) {
+        let target = self.selected_left_target();
         self.sessions
             .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted by most recently updated.");
     }
 
     pub(crate) fn sort_sessions_by_created(&mut self) {
+        let target = self.selected_left_target();
         self.sessions
             .sort_by_key(|b| std::cmp::Reverse(b.created_at));
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted by creation date (newest first).");
     }
 
     pub(crate) fn sort_sessions_by_name(&mut self) {
+        let target = self.selected_left_target();
         self.sessions.sort_by(|a, b| {
             let name_a = a.title.as_deref().unwrap_or(&a.branch_name);
             let name_b = b.title.as_deref().unwrap_or(&b.branch_name);
             name_a.to_lowercase().cmp(&name_b.to_lowercase())
         });
         self.rebuild_left_items();
+        if let Some(target) = target {
+            self.select_left_target(&target);
+        }
         self.set_info("Agents sorted alphabetically by name.");
     }
 
