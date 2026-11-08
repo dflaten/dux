@@ -4516,6 +4516,63 @@ mod tests {
     }
 
     #[test]
+    fn scratch_create_job_builds_a_workspace_backed_session() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mut project = test_project(tmp.path());
+        project.id = SCRATCH_PROJECT_ID.to_string();
+        project.name = SCRATCH_PROJECT_NAME.to_string();
+        project.path = paths.scratch_root().to_string_lossy().to_string();
+        project.default_provider = ProviderKind::from_str("opencode");
+        let mut config = Config::default();
+        config
+            .providers
+            .commands
+            .get_mut("opencode")
+            .expect("opencode provider")
+            .command = "true".to_string();
+        let (worker_tx, worker_rx) = mpsc::channel();
+
+        run_create_agent_job(
+            CreateAgentRequest::Scratch {
+                project,
+                custom_name: Some("Notes".to_string()),
+            },
+            paths.clone(),
+            config,
+            Vec::new(),
+            worker_tx,
+            (80, 24),
+        );
+
+        loop {
+            match worker_rx.recv().expect("worker event") {
+                WorkerEvent::AgentLaunchReady(data) => {
+                    let session = &data.request.session;
+                    assert!(session.is_scratch());
+                    assert_eq!(session.project_id, SCRATCH_PROJECT_ID);
+                    assert_eq!(session.title.as_deref(), Some("Notes"));
+                    assert_eq!(session.branch_name, "Notes");
+                    let workspace = Path::new(&session.worktree_path);
+                    assert!(workspace.starts_with(paths.scratch_root()));
+                    assert!(workspace.is_dir());
+                    match &data.request.kind {
+                        AgentLaunchKind::Create { status_message, .. } => {
+                            assert!(
+                                status_message.contains("Created opencode scratch agent \"Notes\"")
+                            );
+                        }
+                        _ => panic!("expected create launch"),
+                    }
+                    break;
+                }
+                WorkerEvent::CreateAgentProgress(_) => {}
+                _ => panic!("expected agent launch ready event"),
+            }
+        }
+    }
+
+    #[test]
     fn scratch_conversion_into_new_project_initializes_repo_and_repoints_session() {
         let tmp = tempdir().expect("tempdir");
         let destination_tmp = tempdir().expect("destination tempdir");
