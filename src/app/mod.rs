@@ -3049,12 +3049,10 @@ impl App {
     }
 
     pub(crate) fn toggle_collapse_selected_project(&mut self) {
-        let project_id = match self.left_items().get(self.selected_left) {
-            Some(LeftItem::Project(index)) => self.projects.get(*index).map(|p| p.id.clone()),
-            Some(LeftItem::ScratchHeader) => Some(SCRATCH_PROJECT_ID.to_string()),
-            _ => None,
-        };
-        let Some(project_id) = project_id else {
+        // `selected_project` resolves the parent group for a selected session
+        // row as well as for project and scratch headers, so toggling works
+        // from anywhere inside a group.
+        let Some(project_id) = self.selected_project().map(|project| project.id.clone()) else {
             return;
         };
         let has_sessions = self.sessions.iter().any(|s| s.project_id == project_id);

@@ -3981,6 +3981,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn toggling_from_a_session_row_collapses_its_project() {
+        let project = make_project("project-1", "claude");
+        let mut session = make_session("session-1", "claude", "/tmp/worktrees/session-1");
+        session.project_id = project.id.clone();
+        let mut app = test_app_with_sessions(vec![session], vec![project.clone()]);
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(_)))
+            .expect("session row");
+
+        app.toggle_collapse_selected_project();
+
+        assert!(app.collapsed_projects.contains(&project.id));
+        assert!(
+            matches!(
+                app.left_items().get(app.selected_left),
+                Some(LeftItem::Project(_))
+            ),
+            "collapsing from a child session selects the parent header"
+        );
+    }
+
+    #[test]
+    fn toggling_from_a_scratch_session_row_collapses_the_scratch_group() {
+        let project = make_project("project-1", "claude");
+        let mut session = make_session("scratch-1", "claude", "/tmp/dux-scratch/scratch-1");
+        session.project_id = SCRATCH_PROJECT_ID.to_string();
+        let mut app = test_app_with_sessions(vec![session], vec![project, make_scratch_project()]);
+        app.rebuild_left_items();
+        app.selected_left = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::Session(index) if app.sessions[*index].is_scratch()))
+            .expect("scratch session row");
+
+        app.toggle_collapse_selected_project();
+
+        assert!(app.collapsed_projects.contains(SCRATCH_PROJECT_ID));
+        assert!(matches!(
+            app.left_items().get(app.selected_left),
+            Some(LeftItem::ScratchHeader)
+        ));
+    }
+
     fn run_git(repo_path: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
