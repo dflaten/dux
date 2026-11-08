@@ -39,6 +39,8 @@ The interface has three panes:
 
 Tab between panes. Resize them with keyboard or mouse. Collapse the sidebar or git pane when you want more room. Go fullscreen with interactive mode.
 
+The left pane can be searched. Press the search key in the projects pane (or run `search-projects` from the command palette) and type to narrow the list down to the projects and agents that match. Matching is fuzzy and case-insensitive, so `auth` finds `fix-auth` and `auth-rewrite` alike, and every word of the query has to match something. Enter applies the filter, Esc clears it again, and the arrow keys move through the results while you type. Besides project and agent names, the search also looks at branch names, providers, agent status, and worktree paths, so `claude` lists every Claude agent. A project whose name matches keeps all of its agents in the result, while a project that only has matching agents shows just those.
+
 ## Bring Any CLI
 
 Any terminal command can be a provider. The built-in defaults include Claude, Codex, and OpenCode, but adding your own is a config-only change:

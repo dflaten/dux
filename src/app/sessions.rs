@@ -223,6 +223,10 @@ impl App {
             return Ok(());
         }
 
+        // The new agent rarely matches the active sidebar filter, so drop the
+        // filter to keep the new agent visible.
+        self.clear_left_search();
+
         if project.is_scratch() {
             return self.open_name_new_agent_prompt(CreateAgentRequest::Scratch {
                 project,
@@ -3736,6 +3740,9 @@ mod tests {
             files_index: 0,
             files_search: TextInput::new(),
             files_search_active: false,
+            left_search: TextInput::new(),
+            left_search_active: false,
+            left_search_origin: None,
             commit_input: TextInput::new()
                 .with_multiline(4)
                 .with_placeholder("Type your commit message\u{2026}"),

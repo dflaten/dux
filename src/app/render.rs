@@ -721,11 +721,32 @@ impl App {
             .iter()
             .filter(|project| !project.is_scratch())
             .count();
-        let title = format!("Projects ({project_count})");
-        let projects_inner_width = self
-            .themed_block(&title, projects_focused)
+        let visible_project_count = left_items
+            .iter()
+            .filter(|item| matches!(item, LeftItem::Project(_)))
+            .count();
+        // The search row needs two rows of its own. In a pane that is too
+        // short for it, the query moves into the block title instead.
+        let show_search = self.left_search_active || self.has_left_search();
+        let search_fits = self
+            .themed_block("", projects_focused)
             .inner(projects_area)
-            .width;
+            .height
+            >= 4;
+        let mut title = if self.left_search_is_filtering() {
+            format!("Projects ({visible_project_count}/{project_count})")
+        } else {
+            format!("Projects ({project_count})")
+        };
+        if show_search && !search_fits {
+            let query = self.left_search.text.trim();
+            if !query.is_empty() {
+                title = format!("{title} · {query}");
+            }
+        }
+        let projects_block = self.themed_block(&title, projects_focused);
+        let projects_inner = projects_block.inner(projects_area);
+        let projects_inner_width = projects_inner.width;
         let mut after_empty_projects_separator = false;
         let items = left_items
             .iter()
@@ -906,25 +927,79 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
-        self.mouse_layout.left_list = self
-            .themed_block(&title, projects_focused)
-            .inner(projects_area);
+        // The search field lives inside the projects block, above the list.
+        projects_block.render(projects_area, frame.buffer_mut());
+        let (search_area, list_area) = if show_search && search_fits {
+            let [sa, la] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(1)])
+                .areas(projects_inner);
+            (Some(sa), la)
+        } else {
+            (None, projects_inner)
+        };
+
+        if let Some(search_area) = search_area {
+            let query = self.left_search.text.clone();
+            let search_line = if self.left_search_active {
+                let mut line = render_single_line_cursor_input(
+                    "/ ",
+                    &query,
+                    self.left_search.cursor,
+                    self.theme.input_cursor_fg,
+                    self.theme.input_cursor_bg,
+                );
+                if query.is_empty() {
+                    line.spans.push(Span::styled(
+                        " Type to filter projects and agents…",
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    ));
+                }
+                line
+            } else {
+                Line::from(vec![
+                    Span::styled("/ ", Style::default().fg(self.theme.hint_dim_desc_fg)),
+                    Span::styled(query, Style::default().fg(self.theme.hint_dim_desc_fg)),
+                ])
+            };
+            Paragraph::new(search_line)
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(Style::default().fg(self.theme.border_normal)),
+                )
+                .render(search_area, frame.buffer_mut());
+        }
+
+        self.mouse_layout.left_list = list_area;
         let mut state =
             ListState::default().with_selected(if self.left_section == LeftSection::Projects {
                 Some(self.selected_left)
             } else {
                 None
             });
-        StatefulWidget::render(
-            List::new(items)
-                .block(self.themed_block(&title, projects_focused))
-                .highlight_style(self.theme.selection_style()),
-            projects_area,
-            frame.buffer_mut(),
-            &mut state,
-        );
+        if items.is_empty() && self.left_search_is_filtering() {
+            let message = format!(
+                "No projects or agents match \"{}\"",
+                self.left_search.text.trim()
+            );
+            let message = truncate_to_width(&message, list_area.width as usize);
+            Paragraph::new(Line::from(Span::styled(
+                message,
+                Style::default().fg(self.theme.hint_dim_desc_fg),
+            )))
+            .render(list_area, frame.buffer_mut());
+        } else {
+            StatefulWidget::render(
+                List::new(items).highlight_style(self.theme.selection_style()),
+                list_area,
+                frame.buffer_mut(),
+                &mut state,
+            );
+        }
 
         // Render terminals section if any terminals exist.
+
         if let Some(term_area) = terminals_area {
             let terminals_focused = focused && self.left_section == LeftSection::Terminals;
             let term_title = format!("Terminals ({})", terminal_render_data.len());
