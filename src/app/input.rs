@@ -19141,6 +19141,23 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn scratch_section_separator_is_labelled_scratch() {
+        let mut app = search_test_app();
+        select_scratch_agent(&mut app);
+
+        let rendered = render_to_string(&mut app, 160, 24);
+
+        assert!(
+            rendered.contains("─ Scratch ─"),
+            "the scratch section separator should be labelled Scratch, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Projects with no agents"),
+            "the scratch section should not reuse the empty-projects label, got: {rendered}"
+        );
+    }
+
+    #[test]
     fn selecting_a_scratch_agent_hides_the_right_pane_and_skips_files_focus() {
         let mut app = search_test_app();
         select_scratch_agent(&mut app);
