@@ -285,6 +285,7 @@ fn default_true() -> bool {
 pub struct UiConfig {
     pub left_width_pct: u16,
     pub right_width_pct: u16,
+    pub hide_scratch_right_pane: bool,
     pub terminal_pane_height_pct: u16,
     pub empty_project_separator_min_projects: u16,
     pub staged_pane_height_pct: u16,
@@ -319,6 +320,7 @@ impl Default for Config {
             ui: UiConfig {
                 left_width_pct: 20,
                 right_width_pct: 23,
+                hide_scratch_right_pane: true,
                 terminal_pane_height_pct: 35,
                 empty_project_separator_min_projects: 5,
                 staged_pane_height_pct: 50,
@@ -497,6 +499,7 @@ impl Default for UiConfig {
         Self {
             left_width_pct: 17,
             right_width_pct: 19,
+            hide_scratch_right_pane: true,
             terminal_pane_height_pct: 35,
             empty_project_separator_min_projects: 5,
             staged_pane_height_pct: 50,
@@ -1056,6 +1059,15 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::U16(c.ui.right_width_pct),
         },
         ConfigEntry::Field {
+            key: "hide_scratch_right_pane",
+            comment: Some(CommentSource::Static(
+                "# Hide the right files/diff pane while a scratch agent is selected.\n\
+                 # Scratch agents are not attached to a git repository, so there are no\n\
+                 # diffs to show. Set to false to show a workspace info pane instead.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.hide_scratch_right_pane),
+        },
+        ConfigEntry::Field {
             key: "terminal_pane_height_pct",
             comment: Some(CommentSource::Static(
                 "# Maximum height percentage of the left pane used by the companion terminals list.",
@@ -1341,6 +1353,12 @@ pub fn save_config(
     // --- [ui] ---
     patch_table_u16(&mut doc, "ui", "left_width_pct", config.ui.left_width_pct);
     patch_table_u16(&mut doc, "ui", "right_width_pct", config.ui.right_width_pct);
+    patch_table_bool(
+        &mut doc,
+        "ui",
+        "hide_scratch_right_pane",
+        config.ui.hide_scratch_right_pane,
+    );
     patch_table_u16(
         &mut doc,
         "ui",
@@ -2718,6 +2736,7 @@ mod tests {
         assert!(rendered.contains("[ui]"));
         assert!(rendered.contains("agent_scrollback_lines = 10000"));
         assert!(rendered.contains("base_branch_fetch_interval = 300"));
+        assert!(rendered.contains("hide_scratch_right_pane = true"));
         assert!(rendered.contains("empty_project_separator_min_projects = 5"));
         assert!(rendered.contains("auto_reopen_agents = false"));
         assert!(rendered.contains("deleted_agent_retention_days = 30"));
@@ -2962,6 +2981,27 @@ name = "test"
         let rendered = render_config_default(&config);
         let parsed: Config = toml::from_str(&rendered).expect("config should parse");
         assert_eq!(parsed.ui.staged_pane_height_pct, 65);
+    }
+
+    #[test]
+    fn hide_scratch_right_pane_round_trips() {
+        let mut config = Config::default();
+        config.ui.hide_scratch_right_pane = false;
+        let rendered = render_config_default(&config);
+        let parsed: Config = toml::from_str(&rendered).expect("config should parse");
+        assert!(!parsed.ui.hide_scratch_right_pane);
+    }
+
+    #[test]
+    fn old_config_missing_hide_scratch_right_pane_defaults_to_hidden() {
+        let toml_str = r#"
+[ui]
+left_width_pct = 20
+right_width_pct = 23
+terminal_pane_height_pct = 35
+"#;
+        let parsed: Config = toml::from_str(toml_str).expect("should parse");
+        assert!(parsed.ui.hide_scratch_right_pane);
     }
 
     #[test]

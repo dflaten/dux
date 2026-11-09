@@ -2928,9 +2928,7 @@ impl App {
             }
             "toggle-remove-git-pane" => {
                 self.right_hidden = !self.right_hidden;
-                if self.right_hidden && self.focus == FocusPane::Files {
-                    self.focus = FocusPane::Center;
-                }
+                self.normalize_focus_for_hidden_right_pane();
                 Ok(())
             }
             "help" => {
@@ -3399,6 +3397,29 @@ impl App {
         match self.left_items().get(self.selected_left) {
             Some(LeftItem::Session(index)) => self.sessions.get(*index),
             _ => None,
+        }
+    }
+
+    /// Whether the right files/diff pane is hidden for the current selection.
+    ///
+    /// The user's global pane toggle always wins. In addition, scratch
+    /// workspaces are not git repositories, so the diff pane is hidden by
+    /// default (and can be opted back in via config for the info pane).
+    pub(crate) fn right_pane_hidden(&self) -> bool {
+        self.right_hidden
+            || (self.config.ui.hide_scratch_right_pane
+                && self
+                    .selected_project()
+                    .is_some_and(|project| project.is_scratch()))
+    }
+
+    /// Keeps pane focus valid when the right pane is hidden for the current
+    /// selection. Without this, a scratch agent selected by a background
+    /// worker while the files pane was focused would leave keyboard input
+    /// routed to a pane that is no longer visible.
+    pub(crate) fn normalize_focus_for_hidden_right_pane(&mut self) {
+        if self.focus == FocusPane::Files && self.right_pane_hidden() {
+            self.focus = FocusPane::Center;
         }
     }
 

@@ -210,6 +210,12 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         defaults.ui.right_width_pct,
         current.ui.right_width_pct,
     );
+    diff_bool(
+        &mut changes,
+        "ui.hide_scratch_right_pane",
+        defaults.ui.hide_scratch_right_pane,
+        current.ui.hide_scratch_right_pane,
+    );
     diff_u16(
         &mut changes,
         "ui.terminal_pane_height_pct",
