@@ -29,6 +29,7 @@ Rules:
 #[serde(default)]
 pub struct Config {
     pub defaults: Defaults,
+    pub agent_control: AgentControlConfig,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub providers: ProvidersConfig,
@@ -123,6 +124,24 @@ pub struct Defaults {
     pub enable_randomized_pet_name_by_default: bool,
     #[serde(default = "default_true")]
     pub pull_before_creating_agent_by_default: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentControlConfig {
+    /// Whether agents running inside dux may use the local control socket.
+    pub enabled: bool,
+    /// Whether split-out may add an unregistered repository as a project.
+    pub allow_unregistered_repos: bool,
+}
+
+impl Default for AgentControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_unregistered_repos: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -287,6 +306,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             defaults: Defaults::default(),
+            agent_control: AgentControlConfig::default(),
             env: BTreeMap::new(),
             providers: ProvidersConfig::default(),
             terminal: TerminalConfig::default(),
@@ -547,6 +567,9 @@ pub struct DuxPaths {
     pub config_path: PathBuf,
     pub sessions_db_path: PathBuf,
     pub worktrees_root: PathBuf,
+    /// Path to the agent control socket. Agent processes use this to ask the
+    /// running dux instance to create related worktrees.
+    pub control_socket_path: PathBuf,
     /// Path to the lockfile that enforces a single dux instance per
     /// config directory. Contains the PID of the holder.
     pub lock_path: PathBuf,
@@ -559,10 +582,15 @@ impl DuxPaths {
             home::home_dir(),
             env::var_os("XDG_CONFIG_HOME"),
         )?;
+        let control_socket_path = env::var_os("DUX_SOCKET")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| root.join("dux.sock"));
         Ok(Self {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path,
             lock_path: root.join("dux.lock"),
             root,
         })
@@ -968,6 +996,27 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.defaults.pull_before_creating_agent_by_default),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("agent_control"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Allow agents running inside dux to control dux through the local socket\n\
+                 # at <config_dir>/dux.sock. The socket is user-only and is used by commands\n\
+                 # such as `dux agent split-out`, which create related worktrees in other repos.\n\
+                 # Set to false to disable agent-initiated workspace changes.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.agent_control.enabled),
+        },
+        ConfigEntry::Field {
+            key: "allow_unregistered_repos",
+            comment: Some(CommentSource::Static(
+                "# When true, `dux agent split-out --repo <path>` may add an unregistered git\n\
+                 # checkout as a dux project before creating the related worktree. The repo path\n\
+                 # is still validated and the new project is written to config.toml and SQLite.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.agent_control.allow_unregistered_repos),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Env,
         ConfigEntry::Blank,
         ConfigEntry::Projects,
@@ -1267,6 +1316,20 @@ pub fn save_config(
         config.defaults.pull_before_creating_agent_by_default,
     );
     remove_table_key(&mut doc, "defaults", "prompt_for_name");
+
+    // --- [agent_control] ---
+    patch_table_bool(
+        &mut doc,
+        "agent_control",
+        "enabled",
+        config.agent_control.enabled,
+    );
+    patch_table_bool(
+        &mut doc,
+        "agent_control",
+        "allow_unregistered_repos",
+        config.agent_control.allow_unregistered_repos,
+    );
 
     // --- [env] ---
     patch_env_table(&mut doc, "env", &config.env);
@@ -2650,6 +2713,8 @@ mod tests {
         assert!(rendered.contains("[startup_command_terminal]"));
         assert!(rendered.contains("command = \"$SHELL\""));
         assert!(rendered.contains("args = [\"-l\", \"-c\"]"));
+        assert!(rendered.contains("[agent_control]"));
+        assert!(rendered.contains("allow_unregistered_repos = true"));
         assert!(rendered.contains("[ui]"));
         assert!(rendered.contains("agent_scrollback_lines = 10000"));
         assert!(rendered.contains("base_branch_fetch_interval = 300"));
@@ -3095,6 +3160,7 @@ forward_scroll = true
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
+            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
             lock_path: tmp.path().join("dux.lock"),
             root: tmp.path().to_path_buf(),
         };
@@ -4307,6 +4373,8 @@ args = [\"-l\"]
         config.ui.auto_reopen_agents = true;
         config.defaults.pull_before_creating_agent_by_default = false;
         config.editor.default = "zed".to_string();
+        config.agent_control.enabled = false;
+        config.agent_control.allow_unregistered_repos = false;
         let bindings = crate::keybindings::RuntimeBindings::from_keys_config(&config.keys);
         save_config(&config_path, &config, &bindings).expect("save");
 
@@ -4317,6 +4385,8 @@ args = [\"-l\"]
         assert!(reloaded.ui.auto_reopen_agents);
         assert!(!reloaded.defaults.pull_before_creating_agent_by_default);
         assert_eq!(reloaded.editor.default, "zed");
+        assert!(!reloaded.agent_control.enabled);
+        assert!(!reloaded.agent_control.allow_unregistered_repos);
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod diff;
 mod editor;
 mod git;
 mod io_retry;
+mod ipc;
 mod keybindings;
 mod lockfile;
 mod logger;
@@ -27,7 +28,7 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if wants_top_level_help(&args) {
         print_help();
         return Ok(());
     }
@@ -38,6 +39,10 @@ fn main() -> Result<()> {
     }
 
     let paths = config::DuxPaths::discover()?;
+
+    if args.first().map(|s| s.as_str()) == Some("agent") {
+        return cli::run_agent(&args[1..], &paths);
+    }
 
     if args.first().map(|s| s.as_str()) == Some("config") {
         let config_args = &args[1..];
@@ -80,6 +85,16 @@ fn main() -> Result<()> {
     app.run()
 }
 
+/// Only the help flags as the first argument print top-level help. Running
+/// `dux` with no arguments must launch the TUI, and subcommands such as
+/// `dux agent --help` and `dux config diff --help` handle their own help.
+fn wants_top_level_help(args: &[String]) -> bool {
+    matches!(
+        args.first().map(|arg| arg.as_str()),
+        Some("--help") | Some("-h")
+    )
+}
+
 fn print_help() {
     println!(
         "dux\n\n\
@@ -87,7 +102,12 @@ fn print_help() {
          Usage:\n\
           dux              Launch the TUI\n\
           dux --version    Print the version\n\
+          dux agent        Create or inspect related agent worktrees\n\
           dux config       Manage the configuration file\n\n\
+         Agent subcommands:\n\
+          dux agent split-out     Create a related worktree in another project\n\
+          dux agent related       List agents related to the current agent\n\
+          dux agent --help        Full split-out and related options\n\n\
          Config subcommands:\n\
           dux config path          Print the config file path\n\
           dux config diff          Show settings that differ from defaults\n\
@@ -101,7 +121,8 @@ fn print_help() {
            DUX_HOME    Override the config directory (must be an absolute path).\n\
                        When unset, defaults to:\n\
                          macOS: ~/.dux/\n\
-                         Linux: $XDG_CONFIG_HOME/dux/ or ~/.config/dux/\n\n\
+                         Linux: $XDG_CONFIG_HOME/dux/ or ~/.config/dux/\n\
+           DUX_SOCKET  Override the agent control socket path (absolute).\n\n\
          First run writes a full default config to:\n\
            macOS: ~/.dux/config.toml\n\
            Linux: $XDG_CONFIG_HOME/dux/config.toml or ~/.config/dux/config.toml\n\
@@ -118,5 +139,35 @@ fn acquire_lock_or_exit(path: &Path) -> lockfile::SingleInstanceLock {
             eprintln!("{err}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_arguments_launches_the_tui_instead_of_printing_help() {
+        assert!(!wants_top_level_help(&[]));
+    }
+
+    #[test]
+    fn help_flags_as_the_first_argument_print_top_level_help() {
+        assert!(wants_top_level_help(&["--help".to_string()]));
+        assert!(wants_top_level_help(&["-h".to_string()]));
+    }
+
+    #[test]
+    fn help_flags_after_a_subcommand_are_left_to_the_subcommand() {
+        assert!(!wants_top_level_help(&[
+            "config".to_string(),
+            "diff".to_string(),
+            "--help".to_string(),
+        ]));
+        assert!(!wants_top_level_help(&[
+            "agent".to_string(),
+            "split-out".to_string(),
+            "--help".to_string(),
+        ]));
     }
 }

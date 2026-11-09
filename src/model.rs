@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 /// GitHub CLI availability status, checked once at startup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -134,6 +135,31 @@ pub enum SessionSurface {
     Terminal,
 }
 
+/// A group of agent sessions that represent one piece of work spanning
+/// multiple worktrees or repositories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentGroup {
+    pub id: String,
+    /// Fallback label used when the origin session no longer exists.
+    pub label: String,
+    pub origin_session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AgentGroup {
+    pub fn new(label: String, origin_session_id: Option<String>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            label,
+            origin_session_id,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentSession {
     pub id: String,
@@ -149,6 +175,8 @@ pub struct AgentSession {
     pub desired_running: bool,
     pub auto_reopen_enabled: bool,
     pub status: SessionStatus,
+    pub group_id: Option<String>,
+    pub parent_session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

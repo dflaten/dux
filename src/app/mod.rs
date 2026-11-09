@@ -34,14 +34,18 @@ use crate::config::{
 use crate::diff::SyntaxCache;
 use crate::editor::DetectedEditor;
 use crate::git;
+use crate::ipc::{
+    ControlCommand, ControlResponse, ControlServer, IncomingControlRequest, RelatedAgentInfo,
+    SplitOutParams,
+};
 use crate::keybindings::{
     Action, BindingScope, HintContext, InteractiveBytePatterns, RuntimeBindings,
 };
 use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
-    AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProjectBranchStatus, ProviderKind,
-    SCRATCH_PROJECT_ID, SCRATCH_PROJECT_NAME, SessionStatus, SessionSurface,
+    AgentGroup, AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProjectBranchStatus,
+    ProviderKind, SCRATCH_PROJECT_ID, SCRATCH_PROJECT_NAME, SessionStatus, SessionSurface,
 };
 use crate::provider;
 use crate::pty::PtyClient;
@@ -79,6 +83,7 @@ pub struct App {
     pub(crate) session_store: SessionStore,
     pub(crate) projects: Vec<Project>,
     pub(crate) sessions: Vec<AgentSession>,
+    pub(crate) groups: Vec<AgentGroup>,
     pub(crate) staged_files: Vec<ChangedFile>,
     pub(crate) unstaged_files: Vec<ChangedFile>,
     pub(crate) selected_left: usize,
@@ -117,6 +122,16 @@ pub struct App {
     pub(crate) clipboard: Clipboard,
     pub(crate) worker_tx: Sender<WorkerEvent>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
+    pub(crate) control_rx: Option<Receiver<IncomingControlRequest>>,
+    pub(crate) control_server: Option<ControlServer>,
+    /// Responses waiting for a background split-out to finish, keyed by request id.
+    pub(crate) pending_control_responses: HashMap<String, Sender<ControlResponse>>,
+    pub(crate) split_out_in_flight: bool,
+    /// True once a split-out request has actually entered the create-agent
+    /// worker. Prepare/registration failures must not clear a normal create's
+    /// in-flight flag.
+    pub(crate) split_out_create_started: bool,
+    pub(crate) pending_split_out: Option<SplitOutPlan>,
     pub(crate) providers: HashMap<String, PtyClient>,
     pub(crate) provider_session_discovery_cancellations: HashMap<String, Arc<AtomicBool>>,
     pub(crate) provider_session_discovery_lifetime: Arc<()>,
@@ -162,6 +177,7 @@ pub struct App {
     pub(crate) watched_worktree: Arc<Mutex<Option<WatchedWorktree>>>,
     pub(crate) has_active_processes: Arc<AtomicBool>,
     pub(crate) collapsed_projects: HashSet<String>,
+    pub(crate) related_collapsed: bool,
     pub(crate) left_items_cache: Vec<LeftItem>,
     pub(crate) mouse_layout: MouseLayoutState,
     pub(crate) overlay_layout: OverlayMouseLayoutState,
@@ -1547,6 +1563,9 @@ pub(crate) enum LeftItem {
     Session(usize),
     EmptyProjectsSpacer,
     EmptyProjectsSeparator,
+    RelatedHeader,
+    RelatedSeparator,
+    RelatedGroupLabel(usize),
     ScratchHeader,
     ScratchSeparator,
 }
@@ -1555,7 +1574,10 @@ impl LeftItem {
     pub(crate) fn is_selectable(self) -> bool {
         matches!(
             self,
-            LeftItem::Project(_) | LeftItem::Session(_) | LeftItem::ScratchHeader
+            LeftItem::Project(_)
+                | LeftItem::Session(_)
+                | LeftItem::RelatedHeader
+                | LeftItem::ScratchHeader
         )
     }
 }
@@ -1572,6 +1594,8 @@ pub(crate) enum LeftSelectionTarget {
     Project(String),
     /// An agent session, identified by its session id.
     Session(String),
+    /// The collapsible Related work section header.
+    Related,
     /// The built-in scratch workspace header.
     Scratch,
 }
@@ -1579,7 +1603,9 @@ pub(crate) enum LeftSelectionTarget {
 pub(crate) fn build_left_items(
     projects: &[Project],
     sessions: &[AgentSession],
+    groups: &[AgentGroup],
     collapsed_projects: &HashSet<String>,
+    related_collapsed: bool,
     empty_project_separator_min_projects: u16,
 ) -> Vec<LeftItem> {
     let project_count = projects
@@ -1607,6 +1633,7 @@ pub(crate) fn build_left_items(
             project_index,
             project,
             sessions,
+            groups,
             collapsed_projects,
         );
     }
@@ -1621,6 +1648,7 @@ pub(crate) fn build_left_items(
                 project_index,
                 project,
                 sessions,
+                groups,
                 collapsed_projects,
             );
         }
@@ -1632,8 +1660,29 @@ pub(crate) fn build_left_items(
                 project_index,
                 project,
                 sessions,
+                groups,
                 collapsed_projects,
             );
+        }
+    }
+
+    let related_groups = related_group_indices(groups, sessions);
+    if !related_groups.is_empty() {
+        if !items.is_empty() {
+            items.push(LeftItem::RelatedSeparator);
+        }
+        items.push(LeftItem::RelatedHeader);
+        if !related_collapsed {
+            for group_index in related_groups {
+                items.push(LeftItem::RelatedGroupLabel(group_index));
+                for (session_index, session) in sessions.iter().enumerate() {
+                    if session.group_id.as_deref() == Some(groups[group_index].id.as_str())
+                        && session.parent_session_id.is_some()
+                    {
+                        items.push(LeftItem::Session(session_index));
+                    }
+                }
+            }
         }
     }
 
@@ -1645,7 +1694,7 @@ pub(crate) fn build_left_items(
         items.push(LeftItem::ScratchHeader);
         if !collapsed_projects.contains(SCRATCH_PROJECT_ID) {
             for (session_index, session) in sessions.iter().enumerate() {
-                if session.is_scratch() {
+                if session.is_scratch() && related_group_index(groups, session).is_none() {
                     items.push(LeftItem::Session(session_index));
                 }
             }
@@ -1655,11 +1704,67 @@ pub(crate) fn build_left_items(
     items
 }
 
+pub(crate) fn related_group_index(groups: &[AgentGroup], session: &AgentSession) -> Option<usize> {
+    session.parent_session_id.as_ref()?;
+    let group_id = session.group_id.as_deref()?;
+    groups.iter().position(|group| group.id == group_id)
+}
+
+pub(crate) fn related_group_indices(
+    groups: &[AgentGroup],
+    sessions: &[AgentSession],
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for session in sessions {
+        if let Some(index) = related_group_index(groups, session)
+            && !indices.contains(&index)
+        {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
+/// Per-project session counts for rows rendered under the project tree.
+/// Related members live in the Related work section, so they must not make a
+/// project look expanded or inflate its agent count.
+pub(crate) fn project_visible_session_counts(
+    sessions: &[AgentSession],
+    groups: &[AgentGroup],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for session in sessions {
+        if related_group_index(groups, session).is_some() {
+            continue;
+        }
+        *counts.entry(session.project_id.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+pub(crate) fn related_group_label_for(sessions: &[AgentSession], group: &AgentGroup) -> String {
+    if let Some(origin_id) = group.origin_session_id.as_deref()
+        && let Some(origin) = sessions.iter().find(|session| session.id == origin_id)
+    {
+        return origin
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| origin.branch_name.clone());
+    }
+    if group.label.trim().is_empty() {
+        "Related work".to_string()
+    } else {
+        group.label.clone()
+    }
+}
+
 fn push_project_left_items(
     items: &mut Vec<LeftItem>,
     project_index: usize,
     project: &Project,
     sessions: &[AgentSession],
+    groups: &[AgentGroup],
     collapsed_projects: &HashSet<String>,
 ) {
     items.push(LeftItem::Project(project_index));
@@ -1667,7 +1772,7 @@ fn push_project_left_items(
         return;
     }
     for (session_index, session) in sessions.iter().enumerate() {
-        if session.project_id == project.id {
+        if session.project_id == project.id && related_group_index(groups, session).is_none() {
             items.push(LeftItem::Session(session_index));
         }
     }
@@ -1687,6 +1792,15 @@ pub(crate) enum AgentLaunchKind {
         repo_path: String,
         owns_worktree: bool,
         startup_result: Option<crate::startup::StartupCommandResult>,
+        /// Set for agent-initiated split-out requests so success/failure can be
+        /// returned to the waiting CLI.
+        request_id: Option<String>,
+        /// Whether to focus/select the newly created agent when it launches.
+        focus_on_ready: bool,
+        /// Optional initial handoff prompt for a split-out child agent.
+        handoff_prompt: Option<String>,
+        /// Whether split-out registered the target project for this request.
+        project_added: bool,
     },
     Reconnect {
         status_message: String,
@@ -1769,6 +1883,47 @@ pub(crate) enum CreateAgentRequest {
         source_branch: String,
         custom_name: Option<String>,
     },
+    SplitOut {
+        request_id: String,
+        source_session_id: String,
+        group_id: String,
+        parent_session_id: String,
+        project: Project,
+        custom_name: Option<String>,
+        base_branch: Option<String>,
+        provider: Option<ProviderKind>,
+        handoff_prompt: Option<String>,
+        project_added: bool,
+    },
+}
+
+/// A resolved split-out request. It becomes executable immediately when the
+/// target project already exists, or after quiet project registration when it
+/// does not.
+#[derive(Clone, Debug)]
+pub(crate) struct SplitOutPlan {
+    pub(crate) request_id: String,
+    pub(crate) source_session_id: String,
+    pub(crate) project: Project,
+    pub(crate) project_is_new: bool,
+    pub(crate) base_branch: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) provider: Option<ProviderKind>,
+    pub(crate) prompt: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SplitOutCreateRequest {
+    pub(crate) request_id: String,
+    pub(crate) source_session_id: String,
+    pub(crate) group_id: String,
+    pub(crate) parent_session_id: String,
+    pub(crate) project: Project,
+    pub(crate) name: String,
+    pub(crate) base_branch: String,
+    pub(crate) provider: ProviderKind,
+    pub(crate) handoff_prompt: Option<String>,
+    pub(crate) project_added: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1807,8 +1962,16 @@ pub(crate) fn filtered_scratch_project_indices(projects: &[Project], filter: &st
 pub(crate) enum WorkerEvent {
     CreateAgentProgress(String),
     CreateAgentFailed(String),
+    SplitOutPrepared {
+        plan: Box<SplitOutPlan>,
+    },
+    SplitOutFailed {
+        request_id: String,
+        code: String,
+        message: String,
+    },
     ScratchConversionCompleted {
-        result: std::result::Result<ScratchConversionOutcome, String>,
+        result: Box<std::result::Result<ScratchConversionOutcome, String>>,
     },
     AgentLaunchReady(Box<AgentLaunchReadyData>),
     AgentLaunchFailed(Box<AgentLaunchFailedData>),
@@ -1950,6 +2113,9 @@ pub(crate) enum ProjectPersistenceAction {
     Add {
         project: Project,
         status_message: String,
+        /// When true, do not move the sidebar selection to the new project.
+        /// Used by agent-initiated split-out so the user stays on the source agent.
+        quiet: bool,
     },
     Remove {
         project_id: String,
@@ -1983,6 +2149,7 @@ pub(crate) enum ProjectPersistenceAction {
 }
 
 mod components;
+mod control;
 mod input;
 mod left_search;
 mod render;
@@ -2033,6 +2200,8 @@ impl App {
         )?;
         projects.push(scratch_project(&paths, &config)?);
         let sessions = session_store.load_sessions()?;
+        session_store.purge_empty_groups()?;
+        let groups = session_store.load_groups()?;
         let (worker_tx, worker_rx) = mpsc::channel();
         let watched_worktree: Arc<Mutex<Option<WatchedWorktree>>> = Arc::new(Mutex::new(None));
         let initial_status = format!(
@@ -2061,6 +2230,7 @@ impl App {
             session_store,
             projects,
             sessions,
+            groups,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -2094,6 +2264,12 @@ impl App {
             clipboard: Clipboard::new(),
             worker_tx,
             worker_rx,
+            control_rx: None,
+            control_server: None,
+            pending_control_responses: HashMap::new(),
+            split_out_in_flight: false,
+            split_out_create_started: false,
+            pending_split_out: None,
             providers: HashMap::new(),
             provider_session_discovery_cancellations: HashMap::new(),
             provider_session_discovery_lifetime: Arc::new(()),
@@ -2129,6 +2305,7 @@ impl App {
             watched_worktree: Arc::clone(&watched_worktree),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: HashSet::new(),
+            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
@@ -2189,12 +2366,14 @@ impl App {
         self.spawn_branch_sync_worker();
         self.spawn_project_branch_status_checks();
         self.spawn_gh_status_check();
+        self.start_control_server();
         let mut terminal = ratatui::init();
         execute!(stdout(), DuxEnableMouseCapture)?;
 
         let result: Result<()> = {
             loop {
                 self.drain_events();
+                self.drain_control_requests();
                 self.poll_pty_activity();
                 self.flush_pending_macro_sends();
                 self.expire_macro_deliveries();
@@ -2586,6 +2765,16 @@ impl App {
                     .is_some_and(|session| session.is_scratch())
                     && !self.scratch_conversion_in_flight
             }
+            Action::NextRelatedAgent => self
+                .selected_session()
+                .and_then(|session| self.group_for_session(session))
+                .is_some_and(|group| {
+                    self.sessions
+                        .iter()
+                        .filter(|session| session.group_id.as_deref() == Some(group.id.as_str()))
+                        .count()
+                        > 1
+                }),
             _ => true,
         }
     }
@@ -2702,6 +2891,7 @@ impl App {
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
             "recover-deleted-agent" => self.open_recover_deleted_agent_prompt(),
+            "next-related-agent" => self.select_next_related_agent(),
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "reconnect-agent" => self.reconnect_selected_session(),
@@ -3019,7 +3209,9 @@ impl App {
         self.left_items_cache = left_search::build_filtered_left_items(
             &self.projects,
             &self.sessions,
+            &self.groups,
             &self.collapsed_projects,
+            self.related_collapsed,
             self.config.ui.empty_project_separator_min_projects,
             self.left_search_query(),
         );
@@ -3115,14 +3307,31 @@ impl App {
             );
             return;
         }
+        if matches!(
+            self.selected_left_target(),
+            Some(LeftSelectionTarget::Related)
+        ) {
+            self.related_collapsed = !self.related_collapsed;
+            self.rebuild_left_items();
+            if let Some(index) = self
+                .left_items()
+                .iter()
+                .position(|item| matches!(item, LeftItem::RelatedHeader))
+            {
+                self.selected_left = index;
+            }
+            return;
+        }
         // `selected_project` resolves the parent group for a selected session
         // row as well as for project and scratch headers, so toggling works
         // from anywhere inside a group.
         let Some(project_id) = self.selected_project().map(|project| project.id.clone()) else {
             return;
         };
-        let has_sessions = self.sessions.iter().any(|s| s.project_id == project_id);
-        if !has_sessions {
+        let has_visible_sessions = self.sessions.iter().any(|session| {
+            session.project_id == project_id && related_group_index(&self.groups, session).is_none()
+        });
+        if !has_visible_sessions {
             return;
         }
         if self.collapsed_projects.contains(&project_id) {
@@ -3156,6 +3365,9 @@ impl App {
             }
             Some(LeftItem::EmptyProjectsSpacer)
             | Some(LeftItem::EmptyProjectsSeparator)
+            | Some(LeftItem::RelatedHeader)
+            | Some(LeftItem::RelatedSeparator)
+            | Some(LeftItem::RelatedGroupLabel(_))
             | Some(LeftItem::ScratchSeparator) => None,
             None => None,
         }
@@ -4272,6 +4484,8 @@ mod tests {
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -4304,7 +4518,7 @@ mod tests {
         ];
         let sessions = vec![test_session("session-1", "project-2", 0)];
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
 
         assert_eq!(
             items,
@@ -4356,7 +4570,7 @@ mod tests {
         let projects = vec![test_project("project-1"), test_scratch_project()];
         let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 1);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 1);
 
         assert_eq!(
             items,
@@ -4374,17 +4588,17 @@ mod tests {
         let projects = vec![test_project("project-1"), test_scratch_project()];
         let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
 
-        let expanded = build_left_items(&projects, &sessions, &HashSet::new(), 1);
+        let expanded = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 1);
         assert!(expanded.contains(&LeftItem::ScratchHeader));
         assert!(expanded.contains(&LeftItem::Session(0)));
 
         let mut collapsed = HashSet::new();
         collapsed.insert(SCRATCH_PROJECT_ID.to_string());
-        let collapsed_items = build_left_items(&projects, &sessions, &collapsed, 1);
+        let collapsed_items = build_left_items(&projects, &sessions, &[], &collapsed, false, 1);
         assert!(collapsed_items.contains(&LeftItem::ScratchHeader));
         assert!(!collapsed_items.contains(&LeftItem::Session(0)));
 
-        let empty_items = build_left_items(&projects, &[], &HashSet::new(), 1);
+        let empty_items = build_left_items(&projects, &[], &[], &HashSet::new(), false, 1);
         assert!(empty_items.contains(&LeftItem::ScratchHeader));
     }
 
@@ -4402,7 +4616,7 @@ mod tests {
             test_session("session-2", "project-4", 0),
         ];
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
 
         assert_eq!(
             items,
@@ -4421,6 +4635,68 @@ mod tests {
     }
 
     #[test]
+    fn build_left_items_shows_related_members_below_projects() {
+        let projects = vec![test_project("alpha"), test_project("beta")];
+        let mut sessions = vec![
+            test_session("origin", "alpha", 0),
+            test_session("child", "beta", -1),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[1].group_id = Some(group.id.clone());
+        sessions[1].parent_session_id = Some("origin".to_string());
+
+        let items = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+        );
+        assert!(items.contains(&LeftItem::RelatedHeader));
+        assert!(items.contains(&LeftItem::RelatedGroupLabel(0)));
+        // The origin stays in its project tree, the child is only in Related work.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| **item == LeftItem::Session(1))
+                .count(),
+            1
+        );
+
+        let collapsed = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            true,
+            5,
+        );
+        assert!(collapsed.contains(&LeftItem::RelatedHeader));
+        assert!(!collapsed.contains(&LeftItem::RelatedGroupLabel(0)));
+    }
+
+    #[test]
+    fn project_visible_session_counts_exclude_related_members() {
+        let mut sessions = vec![
+            test_session("origin", "alpha", 0),
+            test_session("plain", "alpha", -1),
+            test_session("child", "beta", -2),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[2].group_id = Some(group.id.clone());
+        sessions[2].parent_session_id = Some("origin".to_string());
+
+        let counts = project_visible_session_counts(&sessions, std::slice::from_ref(&group));
+        assert_eq!(counts.get("alpha"), Some(&2));
+        assert_eq!(counts.get("beta"), None);
+    }
+
+    #[test]
     fn build_left_items_moves_project_above_separator_when_session_is_added() {
         let projects = vec![
             test_project("project-1"),
@@ -4435,7 +4711,7 @@ mod tests {
             test_session("session-3", "project-3", 0),
         ];
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
 
         assert_eq!(
             items,
@@ -4470,7 +4746,7 @@ mod tests {
         ];
         sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
 
         assert_eq!(
             items,
@@ -4500,7 +4776,7 @@ mod tests {
         ];
         let sessions = vec![test_session("session-1", "project-2", 0)];
 
-        let items = build_left_items(&projects, &sessions, &HashSet::new(), 0);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 0);
 
         assert!(!items.contains(&LeftItem::EmptyProjectsSeparator));
         assert!(!items.contains(&LeftItem::EmptyProjectsSpacer));
@@ -4517,7 +4793,7 @@ mod tests {
             test_project("project-5"),
         ];
 
-        let items = build_left_items(&projects, &[], &HashSet::new(), 5);
+        let items = build_left_items(&projects, &[], &[], &HashSet::new(), false, 5);
 
         assert_eq!(
             items,
@@ -4539,6 +4815,7 @@ mod tests {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -4589,6 +4866,7 @@ leading_branch = "main"
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -4628,6 +4906,7 @@ leading_branch = "main"
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -4676,6 +4955,7 @@ leading_branch = "main"
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -4746,6 +5026,7 @@ leading_branch = "main"
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -4931,6 +5212,7 @@ leading_branch = "main"
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("lock"),
         };
         let sessions = vec![AgentSession {
@@ -4947,6 +5229,8 @@ leading_branch = "main"
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }];

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -298,6 +298,46 @@ impl PtyClient {
         writer.flush().context("failed to flush PTY writer")?;
         self.dirty.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Write bytes from a background thread once the child has produced its
+    /// first output. Used for split-out handoff prompts so the prompt is not
+    /// typed into a provider that is still initializing, and so a large paste
+    /// cannot block the UI thread.
+    ///
+    /// Best-effort: the write happens after `timeout` even if the child never
+    /// produces output, and it cannot help when a provider's first output is
+    /// an onboarding or trust prompt that consumes typed input.
+    pub fn write_bytes_after_first_output(
+        &self,
+        bytes: Vec<u8>,
+        timeout: Duration,
+        settle: Duration,
+    ) {
+        let writer = Arc::clone(&self.writer);
+        let dirty = Arc::clone(&self.dirty);
+        let has_output = Arc::clone(&self.has_output);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            while !has_output.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            // Give the provider a moment to finish drawing its first frame.
+            std::thread::sleep(settle);
+            let result = (|| -> Result<()> {
+                let mut writer = writer.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                writer.write_all(&bytes).context("failed to write to PTY")?;
+                writer.flush().context("failed to flush PTY writer")?;
+                Ok(())
+            })();
+            if result.is_ok() {
+                dirty.store(true, Ordering::Release);
+            } else if let Err(err) = result {
+                crate::logger::error(&format!(
+                    "failed to write split-out handoff prompt to PTY: {err:#}"
+                ));
+            }
+        });
     }
 
     /// Get an owned snapshot of the currently visible terminal viewport.
@@ -1282,6 +1322,35 @@ mod tests {
         panic!(
             "expected custom env output, got {:?}",
             viewport_lines(&snapshot)
+        );
+    }
+
+    #[test]
+    fn writes_split_out_prompt_after_child_output_arrives() {
+        let script = "printf 'ready\\n'; IFS= read -r line; printf 'GOT:%s\\n' \"$line\"";
+        let args = vec!["-c".to_string(), script.to_string()];
+        let client =
+            PtyClient::spawn("/bin/sh", &args, Path::new("."), 5, 40, 100).expect("spawn pty");
+
+        client.write_bytes_after_first_output(
+            b"handoff\r".to_vec(),
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        );
+
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            if viewport_lines(&client.snapshot())
+                .iter()
+                .any(|line| line.contains("GOT:handoff"))
+            {
+                return;
+            }
+        }
+
+        panic!(
+            "expected the handoff prompt to reach the child, got {:?}",
+            viewport_lines(&client.snapshot())
         );
     }
 

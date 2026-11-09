@@ -360,6 +360,7 @@ mod tests {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.to_path_buf().join("dux.sock"),
             lock_path: root.join("dux.lock"),
         }
     }
@@ -397,6 +398,8 @@ mod tests {
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         }

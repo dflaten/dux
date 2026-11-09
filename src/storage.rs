@@ -16,9 +16,9 @@ pub struct DeletedAgentSession {
 
 const UPSERT_SESSION_SQL: &str = r#"
     insert into agent_sessions
-        (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at)
+        (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at)
     values
-        (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
     on conflict(id) do update set
         project_path=excluded.project_path,
         provider=excluded.provider,
@@ -31,6 +31,8 @@ const UPSERT_SESSION_SQL: &str = r#"
         desired_running=excluded.desired_running,
         auto_reopen_enabled=excluded.auto_reopen_enabled,
         status=excluded.status,
+        group_id=excluded.group_id,
+        parent_session_id=excluded.parent_session_id,
         updated_at=excluded.updated_at
     "#;
 
@@ -72,6 +74,8 @@ impl SessionStore {
                 title text,
                 project_path text,
                 status text not null,
+                group_id text,
+                parent_session_id text,
                 created_at text not null,
                 updated_at text not null
             );
@@ -144,6 +148,19 @@ impl SessionStore {
             "auto_reopen_enabled",
             "integer not null default 1",
         )?;
+        ensure_column(&self.conn, "agent_sessions", "group_id", "text")?;
+        ensure_column(&self.conn, "agent_sessions", "parent_session_id", "text")?;
+        self.conn.execute_batch(
+            r#"
+            create table if not exists agent_groups (
+                id text primary key,
+                label text not null,
+                origin_session_id text,
+                created_at text not null,
+                updated_at text not null
+            );
+            "#,
+        )?;
         self.conn.execute_batch(
             r#"
             create table if not exists deleted_agent_sessions (
@@ -160,11 +177,20 @@ impl SessionStore {
                 desired_running integer not null default 0,
                 auto_reopen_enabled integer not null default 1,
                 status text not null,
+                group_id text,
+                parent_session_id text,
                 created_at text not null,
                 updated_at text not null,
                 deleted_at text not null
             );
             "#,
+        )?;
+        ensure_column(&self.conn, "deleted_agent_sessions", "group_id", "text")?;
+        ensure_column(
+            &self.conn,
+            "deleted_agent_sessions",
+            "parent_session_id",
+            "text",
         )?;
         self.conn.execute_batch(
             r#"
@@ -310,6 +336,83 @@ impl SessionStore {
             projects.push(row?);
         }
         Ok(projects)
+    }
+
+    pub fn upsert_group(&self, group: &crate::model::AgentGroup) -> Result<()> {
+        self.conn.execute(
+            r#"
+            insert into agent_groups (id, label, origin_session_id, created_at, updated_at)
+            values (?1, ?2, ?3, ?4, ?5)
+            on conflict(id) do update set
+                label=excluded.label,
+                origin_session_id=excluded.origin_session_id,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                group.id,
+                group.label,
+                group.origin_session_id,
+                group.created_at.to_rfc3339(),
+                group.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_groups(&self) -> Result<Vec<crate::model::AgentGroup>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            select id, label, origin_session_id, created_at, updated_at
+            from agent_groups
+            order by created_at desc
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_at: String = row.get(3)?;
+            let updated_at: String = row.get(4)?;
+            Ok(crate::model::AgentGroup {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                origin_session_id: row.get(2)?,
+                created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
+                updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
+            })
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            groups.push(row?);
+        }
+        Ok(groups)
+    }
+
+    pub fn set_session_group(
+        &self,
+        id: &str,
+        group_id: Option<&str>,
+        parent_session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            update agent_sessions
+            set group_id = ?2, parent_session_id = ?3
+            where id = ?1
+            "#,
+            params![id, group_id, parent_session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove groups that no longer have any active or archived sessions.
+    pub fn purge_empty_groups(&self) -> Result<()> {
+        self.conn.execute(
+            r#"
+            delete from agent_groups
+            where id not in (select group_id from agent_sessions where group_id is not null)
+              and id not in (select group_id from deleted_agent_sessions where group_id is not null)
+            "#,
+            [],
+        )?;
+        Ok(())
     }
 
     pub fn update_project_default_provider(
@@ -491,7 +594,7 @@ impl SessionStore {
     pub fn load_sessions(&self) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at
             from agent_sessions
             order by updated_at desc
             "#,
@@ -499,8 +602,8 @@ impl SessionStore {
         let rows = stmt.query_map([], |row| {
             let started_providers: String = row.get(8)?;
             let provider_session_ids: String = row.get(9)?;
-            let created_at: String = row.get(13)?;
-            let updated_at: String = row.get(14)?;
+            let created_at: String = row.get(15)?;
+            let updated_at: String = row.get(16)?;
             Ok(AgentSession {
                 id: row.get(0)?,
                 project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -515,6 +618,8 @@ impl SessionStore {
                 desired_running: row.get(10)?,
                 auto_reopen_enabled: row.get(11)?,
                 status: SessionStatus::from_str(row.get::<_, String>(12)?.as_str()),
+                group_id: row.get(13)?,
+                parent_session_id: row.get(14)?,
                 created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
                 updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
             })
@@ -534,9 +639,9 @@ impl SessionStore {
         transaction.execute(
             r#"
             insert into deleted_agent_sessions
-                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at, deleted_at)
+                (id, project_id, project_path, provider, source_branch, branch_name, worktree_path, title, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at, deleted_at)
             values
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             on conflict(id) do update set
                 project_id=excluded.project_id,
                 project_path=excluded.project_path,
@@ -550,6 +655,8 @@ impl SessionStore {
                 desired_running=excluded.desired_running,
                 auto_reopen_enabled=excluded.auto_reopen_enabled,
                 status=excluded.status,
+                group_id=excluded.group_id,
+                parent_session_id=excluded.parent_session_id,
                 created_at=excluded.created_at,
                 updated_at=excluded.updated_at,
                 deleted_at=excluded.deleted_at
@@ -581,7 +688,7 @@ impl SessionStore {
     ) -> Result<Vec<DeletedAgentSession>> {
         let mut statement = self.conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at, deleted_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at, deleted_at
             from deleted_agent_sessions where deleted_at <= ?1
             "#,
         )?;
@@ -589,7 +696,7 @@ impl SessionStore {
             .query_map(params![cutoff.to_rfc3339()], |row| {
                 Ok(DeletedAgentSession {
                     session: session_from_row(row)?,
-                    deleted_at: parse_time(&row.get::<_, String>(15)?).unwrap_or_else(Utc::now),
+                    deleted_at: parse_time(&row.get::<_, String>(17)?).unwrap_or_else(Utc::now),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -606,7 +713,7 @@ impl SessionStore {
     pub fn load_deleted_sessions(&self) -> Result<Vec<DeletedAgentSession>> {
         let mut statement = self.conn.prepare(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at, deleted_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at, deleted_at
             from deleted_agent_sessions
             order by deleted_at desc
             "#,
@@ -665,8 +772,8 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     let started_providers: String = row.get(8)?;
     let provider_session_ids: String = row.get(9)?;
-    let created_at: String = row.get(13)?;
-    let updated_at: String = row.get(14)?;
+    let created_at: String = row.get(15)?;
+    let updated_at: String = row.get(16)?;
     Ok(AgentSession {
         id: row.get(0)?,
         project_id: row.get::<_, String>(1).unwrap_or_default(),
@@ -681,6 +788,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         desired_running: row.get(10)?,
         auto_reopen_enabled: row.get(11)?,
         status: SessionStatus::from_str(row.get::<_, String>(12)?.as_str()),
+        group_id: row.get(13)?,
+        parent_session_id: row.get(14)?,
         created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
         updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
     })
@@ -717,6 +826,11 @@ fn session_values(session: &AgentSession) -> Vec<Value> {
         Value::Integer(i64::from(session.desired_running)),
         Value::Integer(i64::from(session.auto_reopen_enabled)),
         Value::Text(session.status.as_str().to_string()),
+        session.group_id.clone().map_or(Value::Null, Value::Text),
+        session
+            .parent_session_id
+            .clone()
+            .map_or(Value::Null, Value::Text),
         Value::Text(session.created_at.to_rfc3339()),
         Value::Text(session.updated_at.to_rfc3339()),
     ]
@@ -729,14 +843,14 @@ fn load_deleted_session_in(
     transaction
         .query_row(
             r#"
-            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, created_at, updated_at, deleted_at
+            select id, project_id, provider, source_branch, branch_name, worktree_path, title, project_path, started_providers, provider_session_ids, desired_running, auto_reopen_enabled, status, group_id, parent_session_id, created_at, updated_at, deleted_at
             from deleted_agent_sessions where id = ?1
             "#,
             params![id],
             |row| {
                 Ok(DeletedAgentSession {
                     session: session_from_row(row)?,
-                    deleted_at: parse_time(&row.get::<_, String>(15)?).unwrap_or_else(Utc::now),
+                    deleted_at: parse_time(&row.get::<_, String>(17)?).unwrap_or_else(Utc::now),
                 })
             },
         )
@@ -812,6 +926,8 @@ fn test_session(
         desired_running: false,
         auto_reopen_enabled: true,
         status: SessionStatus::Active,
+        group_id: None,
+        parent_session_id: None,
         created_at,
         updated_at,
     }
@@ -937,6 +1053,63 @@ mod tests {
 
         // Order unchanged: s2 still has the more recent updated_at.
         assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn related_group_fields_round_trip_and_empty_groups_are_purged() {
+        let mut store = test_store();
+        let now = Utc::now();
+        let group =
+            crate::model::AgentGroup::new("origin agent".to_string(), Some("origin".to_string()));
+        store.upsert_group(&group).unwrap();
+
+        let mut origin = test_session("origin", now, now);
+        origin.group_id = Some(group.id.clone());
+        let mut child = test_session("child", now, now);
+        child.id = "child".to_string();
+        child.group_id = Some(group.id.clone());
+        child.parent_session_id = Some("origin".to_string());
+        store.upsert_session(&origin).unwrap();
+        store.upsert_session(&child).unwrap();
+
+        let loaded = store.load_sessions().unwrap();
+        let loaded_child = loaded.iter().find(|session| session.id == "child").unwrap();
+        assert_eq!(loaded_child.group_id.as_deref(), Some(group.id.as_str()));
+        assert_eq!(loaded_child.parent_session_id.as_deref(), Some("origin"));
+
+        let groups = store.load_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "origin agent");
+
+        store.purge_empty_groups().unwrap();
+        assert_eq!(store.load_groups().unwrap().len(), 1);
+
+        store.permanently_delete_session("origin").unwrap();
+        store.permanently_delete_session("child").unwrap();
+        store.purge_empty_groups().unwrap();
+        assert!(store.load_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archived_sessions_keep_their_related_group() {
+        let mut store = test_store();
+        let now = Utc::now();
+        let group = crate::model::AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        store.upsert_group(&group).unwrap();
+        let mut session = test_session("origin", now, now);
+        session.group_id = Some(group.id.clone());
+        store.upsert_session(&session).unwrap();
+
+        store.archive_and_delete_session(&session).unwrap();
+        let deleted = store.load_deleted_sessions().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(
+            deleted[0].session.group_id.as_deref(),
+            Some(group.id.as_str())
+        );
+
+        let restored = store.restore_deleted_session("origin").unwrap().unwrap();
+        assert_eq!(restored.group_id.as_deref(), Some(group.id.as_str()));
     }
 
     #[test]
@@ -1095,6 +1268,9 @@ mod tests {
         assert!(!loaded[0].desired_running);
         assert!(loaded[0].auto_reopen_enabled);
         assert!(loaded[0].provider_session_ids.is_empty());
+        assert!(loaded[0].group_id.is_none());
+        assert!(loaded[0].parent_session_id.is_none());
+        assert!(store.load_groups().unwrap().is_empty());
     }
 }
 

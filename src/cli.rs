@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{self, Config, DuxPaths};
 use crate::git;
@@ -15,6 +16,10 @@ use crate::storage::SessionStore;
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_config_help();
+        return Ok(());
+    }
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "reset" => {
@@ -88,6 +93,7 @@ fn run_reset(paths: &DuxPaths, all: bool) -> Result<()> {
 
     remove_file_with_message(&log_path)?;
     prune_empty_ancestors(&log_path, &paths.root)?;
+    remove_socket_with_message(&paths.control_socket_path)?;
     remove_file_with_message(&paths.config_path)?;
     prune_empty_ancestors(&paths.config_path, &paths.root)?;
 
@@ -161,6 +167,20 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         "defaults.commit_prompt",
         defaults.defaults.commit_prompt.as_deref(),
         current.defaults.commit_prompt.as_deref(),
+    );
+
+    // [agent_control]
+    diff_bool(
+        &mut changes,
+        "agent_control.enabled",
+        defaults.agent_control.enabled,
+        current.agent_control.enabled,
+    );
+    diff_bool(
+        &mut changes,
+        "agent_control.allow_unregistered_repos",
+        defaults.agent_control.allow_unregistered_repos,
+        current.agent_control.allow_unregistered_repos,
     );
 
     // [logging]
@@ -564,6 +584,287 @@ fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSessio
 }
 
 // ---------------------------------------------------------------------------
+// dux agent
+// ---------------------------------------------------------------------------
+
+pub fn run_agent(args: &[String], paths: &DuxPaths) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    let result = match sub {
+        "split-out" => run_agent_split_out(&args[1..], paths),
+        "related" => run_agent_related(&args[1..], paths),
+        "" | "--help" | "-h" => {
+            print_agent_help();
+            Ok(())
+        }
+        other => bail!("unknown agent subcommand: {other}\nRun `dux agent --help` for usage."),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if wants_json => {
+            print_control_response(
+                &crate::ipc::ControlResponse::error("invalid_request", format!("{err:#}")),
+                true,
+            );
+            std::process::exit(1);
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn print_agent_help() {
+    println!(
+        "\
+dux agent — work with agents from the command line
+
+Subcommands:
+  dux agent split-out     Create a related worktree/agent in another project
+  dux agent related       List agents related to the current or selected agent
+
+split-out options:
+  --repo <path>           Target git checkout (may be auto-registered as a project)
+  --project <id|name>     Target project already registered in dux
+  --name <branch>         Branch and worktree name (generated when omitted)
+  --base <branch>         Base branch (defaults to the target project's leading branch)
+  --provider <name>       Provider override (defaults to the target project's provider)
+  --prompt <text>         Initial handoff prompt for the child agent
+  --prompt-file <path|->  Read the handoff prompt from a file or stdin
+  --source <session-id>   Source session (defaults to DUX_SESSION_ID)
+  --timeout <seconds>     How long to wait for dux (default 120)
+  --json                  Print the machine-readable JSON response
+
+related options:
+  --session <session-id>  Session to inspect (defaults to DUX_SESSION_ID)
+  --json                  Print the machine-readable JSON response
+
+Environment:
+  DUX_BIN                 Path to the dux binary that launched the agent
+  DUX_SESSION_ID          Current agent session id
+  DUX_SOCKET              Override the control socket path"
+    );
+}
+
+fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+
+    let mut repo = None;
+    let mut project = None;
+    let mut name = None;
+    let mut base = None;
+    let mut provider = None;
+    let mut prompt = None;
+    let mut prompt_file = None;
+    let mut source_session_id = None;
+    let mut timeout_secs = None;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--repo" => repo = Some(take_value("--repo")?),
+            "--project" => project = Some(take_value("--project")?),
+            "--name" => name = Some(take_value("--name")?),
+            "--base" => base = Some(take_value("--base")?),
+            "--provider" => provider = Some(take_value("--provider")?),
+            "--prompt" => prompt = Some(take_value("--prompt")?),
+            "--prompt-file" => prompt_file = Some(take_value("--prompt-file")?),
+            "--source" => source_session_id = Some(take_value("--source")?),
+            "--timeout" => {
+                let value = take_value("--timeout")?;
+                timeout_secs = Some(
+                    value
+                        .parse::<u64>()
+                        .with_context(|| format!("invalid --timeout value: {value}"))?,
+                );
+            }
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+
+    if repo.is_none() && project.is_none() {
+        bail!("split-out requires --repo <path> or --project <id|name>.");
+    }
+    if prompt.is_some() && prompt_file.is_some() {
+        bail!("use either --prompt or --prompt-file, not both.");
+    }
+    if let Some(name) = name.as_deref()
+        && !git::is_valid_agent_name(name)
+    {
+        bail!(
+            "invalid agent name \"{name}\". Use letters, numbers, dashes, underscores, and slashes."
+        );
+    }
+    if let Some(file) = prompt_file {
+        prompt = Some(crate::ipc::read_prompt_file(&file)?);
+    }
+    if source_session_id.is_none() {
+        source_session_id = std::env::var("DUX_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+    }
+    if source_session_id.is_none() {
+        bail!(
+            "split-out must run inside an agent started by dux, or be given --source <session-id>."
+        );
+    }
+    let repo = repo.map(|raw| {
+        if let Some(expanded) = crate::config::expand_path(&raw) {
+            expanded
+        } else {
+            let path = PathBuf::from(&raw);
+            if path.is_absolute() {
+                raw
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path).to_string_lossy().to_string())
+                    .unwrap_or(raw)
+            }
+        }
+    });
+
+    let request = crate::ipc::ControlRequest::split_out(crate::ipc::SplitOutParams {
+        source_session_id,
+        repo,
+        project,
+        name,
+        base,
+        provider,
+        prompt,
+        timeout_ms: timeout_secs.map(|seconds| seconds.saturating_mul(1000)),
+    });
+    send_and_print_request(paths, request, json)
+}
+
+fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+
+    let mut source_session_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => source_session_id = Some(take_value("--session")?),
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    if source_session_id.is_none() {
+        source_session_id = std::env::var("DUX_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+    }
+    if source_session_id.is_none() {
+        bail!("related needs a session id, either from DUX_SESSION_ID or --session <session-id>.");
+    }
+    let request = crate::ipc::ControlRequest::related(source_session_id);
+    send_and_print_request(paths, request, json)
+}
+
+fn send_and_print_request(
+    paths: &DuxPaths,
+    request: crate::ipc::ControlRequest,
+    json: bool,
+) -> Result<()> {
+    let timeout = match &request.command {
+        crate::ipc::ControlCommand::SplitOut(params) => params.timeout(),
+        crate::ipc::ControlCommand::Related { .. } => crate::ipc::DEFAULT_CONTROL_TIMEOUT,
+    };
+    let response = match crate::ipc::send_request(&paths.control_socket_path, &request, timeout) {
+        Ok(response) => response,
+        Err(err) => {
+            let response = crate::ipc::ControlResponse::error("connection_failed", err.to_string());
+            print_control_response(&response, json);
+            std::process::exit(1);
+        }
+    };
+    print_control_response(&response, json);
+    if !response.ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
+    if json {
+        match serde_json::to_string_pretty(response) {
+            Ok(encoded) => println!("{encoded}"),
+            Err(err) => eprintln!("failed to encode dux response: {err}"),
+        }
+        return;
+    }
+
+    if !response.ok {
+        eprintln!(
+            "{}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("dux could not complete the request.")
+        );
+        return;
+    }
+
+    if let Some(message) = response.message.as_deref() {
+        println!("{message}");
+    }
+    if let Some(project) = response.project.as_deref() {
+        println!("project:  {project}");
+    }
+    if let Some(branch) = response.branch.as_deref() {
+        println!("branch:   {branch}");
+    }
+    if let Some(worktree) = response.worktree.as_deref() {
+        println!("worktree: {worktree}");
+    }
+    if let Some(session_id) = response.session_id.as_deref() {
+        println!("session:  {session_id}");
+    }
+    if let Some(group_id) = response.group_id.as_deref() {
+        println!("group:    {group_id}");
+    }
+    if !response.related.is_empty() {
+        println!();
+        for agent in &response.related {
+            let origin = if agent.is_origin { " (origin)" } else { "" };
+            println!(
+                "- [{}] {} · {} · {} · {}{}",
+                agent.project_name,
+                agent.label,
+                agent.branch_name,
+                agent.worktree_path,
+                agent.status,
+                origin
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File / directory helpers
 // ---------------------------------------------------------------------------
 
@@ -585,6 +886,17 @@ fn remove_file_with_message(path: &Path) -> Result<()> {
         println!("removed {}", path.display());
     }
     Ok(())
+}
+
+/// Remove the agent control socket if it still exists. `DUX_SOCKET` may point
+/// anywhere, so never delete a regular file that happens to live at that path.
+fn remove_socket_with_message(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => remove_file_with_message(path),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("failed to inspect {}: {error}", path.display())),
+    }
 }
 
 fn remove_dir_with_message(path: &Path) -> Result<()> {
@@ -784,10 +1096,44 @@ mod tests {
             config_path: PathBuf::from("/tmp/test/config.toml"),
             sessions_db_path: PathBuf::from("/tmp/test/sessions.sqlite3"),
             worktrees_root: PathBuf::from("/tmp/test/worktrees"),
+            control_socket_path: PathBuf::from("/tmp/test/dux.sock"),
             lock_path: PathBuf::from("/tmp/test/dux.lock"),
         };
         let result = run(&["path".to_string()], &paths);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_help_flag_works_after_a_subcommand() {
+        let harness = ResetHarness::new();
+        let result = run(&["diff".to_string(), "--help".to_string()], &harness.paths);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reset_keeps_regular_files_at_the_control_socket_path() {
+        let harness = ResetHarness::new();
+        fs::write(&harness.paths.control_socket_path, "keep me").expect("regular file");
+
+        run_reset(&harness.paths, false).expect("reset");
+
+        assert_eq!(
+            fs::read_to_string(&harness.paths.control_socket_path).expect("file survives"),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn reset_removes_a_stale_control_socket() {
+        let harness = ResetHarness::new();
+        let listener = std::os::unix::net::UnixListener::bind(&harness.paths.control_socket_path)
+            .expect("bind socket");
+        drop(listener);
+        assert!(harness.paths.control_socket_path.exists());
+
+        run_reset(&harness.paths, false).expect("reset");
+
+        assert!(!harness.paths.control_socket_path.exists());
     }
 
     struct ResetHarness {
@@ -804,6 +1150,7 @@ mod tests {
                 config_path: root.join("config.toml"),
                 sessions_db_path: root.join("sessions.sqlite3"),
                 worktrees_root: root.join("worktrees"),
+                control_socket_path: root.join("dux.sock"),
                 lock_path: root.join("dux.lock"),
                 root,
             };
@@ -851,6 +1198,8 @@ mod tests {
                     desired_running: false,
                     auto_reopen_enabled: true,
                     status: SessionStatus::Active,
+                    group_id: None,
+                    parent_session_id: None,
                     created_at: now,
                     updated_at: now,
                 })
