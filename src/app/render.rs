@@ -277,9 +277,8 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16, trim: bool) -> u16 {
     total
 }
 
-fn empty_projects_separator_line(width: u16, theme: &Theme) -> Line<'static> {
-    const LABEL: &str = "Projects with no agents";
-    const PADDED_LABEL: &str = " Projects with no agents ";
+fn left_section_separator_line(width: u16, theme: &Theme, label: &str) -> Line<'static> {
+    let padded_label = format!(" {label} ");
 
     if width == 0 {
         return Line::from("");
@@ -287,39 +286,40 @@ fn empty_projects_separator_line(width: u16, theme: &Theme) -> Line<'static> {
 
     let separator_style = Style::default().fg(theme.header_separator_fg);
     let label_style = Style::default().fg(theme.provider_label_fg);
-    let label_width = PADDED_LABEL.chars().count();
+    let label_width = label.chars().count();
+    let padded_label_width = padded_label.chars().count();
     let width = usize::from(width);
 
-    if width <= LABEL.chars().count() {
+    if width <= label_width {
         return Line::from(Span::styled(
-            LABEL.chars().take(width).collect::<String>(),
+            label.chars().take(width).collect::<String>(),
             label_style,
         ));
     }
 
-    if width <= label_width {
-        let side_padding = width.saturating_sub(LABEL.chars().count()) / 2;
+    if width <= padded_label_width {
+        let side_padding = width.saturating_sub(label_width) / 2;
         let right_padding = width
-            .saturating_sub(LABEL.chars().count())
+            .saturating_sub(label_width)
             .saturating_sub(side_padding);
         return Line::from(Span::styled(
             format!(
                 "{}{}{}",
                 " ".repeat(side_padding),
-                LABEL,
+                label,
                 " ".repeat(right_padding)
             ),
             label_style,
         ));
     }
 
-    let remaining = width - label_width;
+    let remaining = width - padded_label_width;
     let left_width = remaining / 2;
     let right_width = remaining - left_width;
 
     Line::from(vec![
         Span::styled("─".repeat(left_width), separator_style),
-        Span::styled(PADDED_LABEL, label_style),
+        Span::styled(padded_label, label_style),
         Span::styled("─".repeat(right_width), separator_style),
     ])
 }
@@ -957,9 +957,10 @@ impl App {
                             .collect::<Vec<_>>(),
                     ))
                 }
-                LeftItem::RelatedSeparator => ListItem::new(empty_projects_separator_line(
+                LeftItem::RelatedSeparator => ListItem::new(left_section_separator_line(
                     projects_inner_width,
                     &self.theme,
+                    "Related work",
                 )),
                 LeftItem::RelatedHeader => {
                     let count = self
@@ -1009,9 +1010,10 @@ impl App {
                         ),
                     ]))
                 }
-                LeftItem::ScratchSeparator => ListItem::new(empty_projects_separator_line(
+                LeftItem::ScratchSeparator => ListItem::new(left_section_separator_line(
                     projects_inner_width,
                     &self.theme,
+                    SCRATCH_PROJECT_NAME,
                 )),
                 LeftItem::ScratchHeader => {
                     let count = session_counts.get(SCRATCH_PROJECT_ID).copied().unwrap_or(0);
@@ -1043,9 +1045,10 @@ impl App {
                 }
                 LeftItem::EmptyProjectsSeparator => {
                     after_empty_projects_separator = true;
-                    ListItem::new(empty_projects_separator_line(
+                    ListItem::new(left_section_separator_line(
                         projects_inner_width,
                         &self.theme,
+                        "Projects with no agents",
                     ))
                 }
             })
@@ -8831,6 +8834,41 @@ fn status_footer_lines(status_text: &str, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn left_section_separator_line_uses_the_requested_label() {
+        let theme = Theme::default_dark();
+
+        assert_eq!(
+            line_text(&left_section_separator_line(30, &theme, "Scratch")),
+            "────────── Scratch ───────────"
+        );
+        assert_eq!(
+            line_text(&left_section_separator_line(30, &theme, "Related work")),
+            "──────── Related work ────────"
+        );
+    }
+
+    #[test]
+    fn left_section_separator_line_truncates_narrow_labels() {
+        let theme = Theme::default_dark();
+
+        assert_eq!(
+            line_text(&left_section_separator_line(5, &theme, "Scratch")),
+            "Scrat"
+        );
+        assert_eq!(
+            line_text(&left_section_separator_line(0, &theme, "Scratch")),
+            ""
+        );
+    }
 
     #[test]
     fn draw_terminal_snapshot_cell_wraps_url_cells_with_osc8() {
