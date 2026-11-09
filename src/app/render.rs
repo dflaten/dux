@@ -410,6 +410,7 @@ impl App {
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame) {
+        self.normalize_focus_for_hidden_right_pane();
         // Pre-fill the whole frame with the theme's app background. Cells
         // that no widget paints over (gutters, modal interiors, the strip
         // under the PR banner caps) inherit this color, so light themes
@@ -435,7 +436,7 @@ impl App {
             ])
             .areas(frame.area());
         self.render_header(frame, header);
-        let right_constraint = if self.right_hidden {
+        let right_constraint = if self.right_pane_hidden() {
             Constraint::Length(0)
         } else if self.right_collapsed {
             Constraint::Length(3)
@@ -449,7 +450,7 @@ impl App {
                 .constraints([Constraint::Length(4), Constraint::Min(20), right_constraint])
                 .areas(body)
         } else {
-            let right_pct = if self.right_hidden || self.right_collapsed {
+            let right_pct = if self.right_pane_hidden() || self.right_collapsed {
                 0
             } else {
                 self.right_width_pct
@@ -1027,6 +1028,10 @@ impl App {
                                 .fg(self.theme.text_fg)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(
+                            " (ad-hoc)",
+                            Style::default().fg(self.theme.hint_dim_desc_fg),
+                        ),
                     ];
                     if count > 0 {
                         spans.push(Span::styled(
@@ -1034,10 +1039,6 @@ impl App {
                             Style::default().fg(self.theme.provider_label_fg),
                         ));
                     }
-                    spans.push(Span::styled(
-                        "  ad-hoc",
-                        Style::default().fg(self.theme.hint_dim_desc_fg),
-                    ));
                     ListItem::new(Line::from(spans))
                 }
                 LeftItem::EmptyProjectsSeparator => {
@@ -1892,7 +1893,7 @@ impl App {
     }
 
     fn render_files(&mut self, frame: &mut Frame, area: Rect) {
-        if self.right_hidden {
+        if self.right_pane_hidden() {
             return;
         }
 

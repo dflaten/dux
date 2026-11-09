@@ -463,6 +463,7 @@ fn scroll_startup_command_log(
 
 impl App {
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.normalize_focus_for_hidden_right_pane();
         // Prompts take precedence over every other input target so modal text
         // fields can safely capture keystrokes even when other modes were
         // previously active.
@@ -672,7 +673,7 @@ impl App {
                         }
                     } else {
                         self.focus = self.focus.next();
-                        if self.focus == FocusPane::Files && self.right_hidden {
+                        if self.focus == FocusPane::Files && self.right_pane_hidden() {
                             self.focus = self.focus.next();
                         }
                         if self.focus == FocusPane::Files {
@@ -694,7 +695,7 @@ impl App {
                         && self.left_section == LeftSection::Projects
                     {
                         self.focus = self.focus.previous();
-                        if self.focus == FocusPane::Files && self.right_hidden {
+                        if self.focus == FocusPane::Files && self.right_pane_hidden() {
                             self.focus = self.focus.previous();
                         }
                         if self.focus == FocusPane::Files {
@@ -713,7 +714,7 @@ impl App {
                         }
                     } else {
                         self.focus = self.focus.previous();
-                        if self.focus == FocusPane::Files && self.right_hidden {
+                        if self.focus == FocusPane::Files && self.right_pane_hidden() {
                             self.focus = self.focus.previous();
                         }
                         if self.focus == FocusPane::Files {
@@ -742,9 +743,7 @@ impl App {
                 }
                 Action::RemoveGitPane => {
                     self.right_hidden = !self.right_hidden;
-                    if self.right_hidden && self.focus == FocusPane::Files {
-                        self.focus = FocusPane::Center;
-                    }
+                    self.normalize_focus_for_hidden_right_pane();
                 }
                 Action::ToggleResizeMode => {
                     self.resize_mode = !self.resize_mode;
@@ -5233,7 +5232,7 @@ impl App {
             return Some(ResizeDragState::LeftDivider);
         }
 
-        if !self.right_hidden && (column == center_right || column == right_left) {
+        if !self.right_pane_hidden() && (column == center_right || column == right_left) {
             return Some(ResizeDragState::RightDivider);
         }
 
@@ -18953,6 +18952,43 @@ cyan = "#00ffff"
         app
     }
 
+    fn select_scratch_agent(app: &mut App) {
+        push_search_project(app, crate::model::SCRATCH_PROJECT_ID, "Scratch");
+        push_search_session(
+            app,
+            "scratch-1",
+            crate::model::SCRATCH_PROJECT_ID,
+            "adhoc",
+            "adhoc",
+        );
+        let index = app
+            .left_items()
+            .iter()
+            .position(|item| {
+                matches!(item, LeftItem::Session(index) if app.sessions[*index].is_scratch())
+            })
+            .expect("scratch session");
+        app.selected_left = index;
+    }
+
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
             .expect("handle key");
@@ -19089,6 +19125,75 @@ cyan = "#00ffff"
 
         assert!(!app.files_search_active);
         assert_eq!(app.focus, FocusPane::Left);
+    }
+
+    #[test]
+    fn scratch_header_shows_the_adhoc_label() {
+        let mut app = search_test_app();
+        select_scratch_agent(&mut app);
+
+        let rendered = render_to_string(&mut app, 160, 24);
+
+        assert!(
+            rendered.contains("Scratch (ad-hoc)"),
+            "the scratch header should use the ad-hoc label, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn selecting_a_scratch_agent_hides_the_right_pane_and_skips_files_focus() {
+        let mut app = search_test_app();
+        select_scratch_agent(&mut app);
+
+        assert!(app.right_pane_hidden());
+        app.focus = FocusPane::Center;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.focus,
+            FocusPane::Left,
+            "Tab from the center should skip the hidden files pane"
+        );
+    }
+
+    #[test]
+    fn scratch_right_pane_can_be_shown_from_config() {
+        let mut app = search_test_app();
+        app.config.ui.hide_scratch_right_pane = false;
+        select_scratch_agent(&mut app);
+
+        assert!(!app.right_pane_hidden());
+        app.focus = FocusPane::Center;
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, FocusPane::Files);
+    }
+
+    #[test]
+    fn rendering_a_scratch_agent_hides_the_right_pane() {
+        let mut app = search_test_app();
+        select_scratch_agent(&mut app);
+        app.focus = FocusPane::Files;
+
+        let rendered = render_to_string(&mut app, 160, 24);
+
+        assert_eq!(
+            app.focus,
+            FocusPane::Center,
+            "rendering should move focus off a hidden files pane"
+        );
+        assert_eq!(app.mouse_layout.right.width, 0);
+        assert!(
+            !rendered.contains("Scratch Agent"),
+            "the right pane should not render for a scratch agent, got: {rendered}"
+        );
+
+        app.config.ui.hide_scratch_right_pane = false;
+        let rendered = render_to_string(&mut app, 160, 24);
+
+        assert!(app.mouse_layout.right.width > 0);
+        assert!(
+            rendered.contains("Scratch Agent"),
+            "the info pane should render when the config allows it, got: {rendered}"
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
 | 🌿 | Worktrees | One isolated git worktree per project agent, with fork and existing-worktree workflows |
 | ⇄ | Related work | Agents can split work into linked worktrees in other projects; each stays independently managed |
-| ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders and can be converted into projects later |
+| ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders with the diff pane hidden, and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
 | 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
 | 🎨 | Configuration | Fully commented config, rebindable keys, and a theme engine |
@@ -52,7 +52,7 @@ Recent fork additions include:
 - A searchable project and agent sidebar that narrows the tree as you type.
 - A searchable existing-worktree picker for creating or reconnecting agents.
 - Cleanup for inactive managed worktrees and unreferenced scratch workspaces.
-- An always-visible Scratch workspace for ad-hoc agents, with conversion into a new project or an existing project's worktree.
+- An always-visible Scratch workspace for ad-hoc agents, with the diff pane hidden and conversion into a new project or an existing project's worktree.
 - Always-visible diffs against the base branch, with easy rebasing.
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.
