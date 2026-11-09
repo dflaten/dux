@@ -97,6 +97,9 @@ fn session_fields(session: &AgentSession, project: &Project) -> SearchFields {
     if session.is_scratch() {
         fuzzy.push("scratch".to_string());
     }
+    if session.group_id.is_some() && session.parent_session_id.is_some() {
+        fuzzy.push("related".to_string());
+    }
     let mut literal = vec![
         session.worktree_path.to_lowercase(),
         project.path.to_lowercase(),
@@ -128,7 +131,9 @@ fn session_matches(session: &AgentSession, project: &Project, terms: &[String]) 
 pub(crate) fn build_filtered_left_items(
     projects: &[Project],
     sessions: &[AgentSession],
+    groups: &[AgentGroup],
     collapsed_projects: &HashSet<String>,
+    related_collapsed: bool,
     empty_project_separator_min_projects: u16,
     query: &str,
 ) -> Vec<LeftItem> {
@@ -137,7 +142,9 @@ pub(crate) fn build_filtered_left_items(
         return build_left_items(
             projects,
             sessions,
+            groups,
             collapsed_projects,
+            related_collapsed,
             empty_project_separator_min_projects,
         );
     }
@@ -152,12 +159,19 @@ pub(crate) fn build_filtered_left_items(
             .push(index);
     }
 
+    let mut project_hits: HashSet<&str> = HashSet::new();
+    for project in projects {
+        if !project.is_scratch() && project_matches(project, &terms) {
+            project_hits.insert(project.id.as_str());
+        }
+    }
+
     let mut items = Vec::new();
     for (project_index, project) in projects.iter().enumerate() {
         if project.is_scratch() {
             continue;
         }
-        let project_hit = project_matches(project, &terms);
+        let project_hit = project_hits.contains(project.id.as_str());
         // A project whose checkout is missing hides its agents in the regular
         // tree; keep that rule while filtering so search does not surface
         // rows that cannot be acted on.
@@ -167,6 +181,7 @@ pub(crate) fn build_filtered_left_items(
             matching_sessions(
                 project,
                 sessions,
+                groups,
                 sessions_by_project
                     .get(project.id.as_str())
                     .map(Vec::as_slice),
@@ -181,12 +196,67 @@ pub(crate) fn build_filtered_left_items(
         items.extend(matched.into_iter().map(LeftItem::Session));
     }
 
-    // Scratch always lives below the project groups.
+    // Related work is matched in its own section so a project header never
+    // appears with a hidden related member as its only child.
+    let mut related_items = Vec::new();
+    for group_index in crate::app::related_group_indices(groups, sessions) {
+        let group = &groups[group_index];
+        let group_label = crate::app::related_group_label_for(sessions, group);
+        let group_hit = terms
+            .iter()
+            .all(|term| term_matches(term, &group_label.to_lowercase()));
+        let mut members = Vec::new();
+        for (index, session) in sessions.iter().enumerate() {
+            if session.group_id.as_deref() != Some(group.id.as_str())
+                || session.parent_session_id.is_none()
+            {
+                continue;
+            }
+            let Some(project) = projects
+                .iter()
+                .find(|project| project.id == session.project_id)
+            else {
+                continue;
+            };
+            let member_hit = session_matches(session, project, &terms)
+                || project_hits.contains(project.id.as_str());
+            if group_hit || member_hit {
+                members.push(index);
+            }
+        }
+        if group_hit || !members.is_empty() {
+            related_items.push(LeftItem::RelatedGroupLabel(group_index));
+            if group_hit {
+                related_items.extend(
+                    sessions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, session)| {
+                            session.group_id.as_deref() == Some(group.id.as_str())
+                                && session.parent_session_id.is_some()
+                        })
+                        .map(|(index, _)| LeftItem::Session(index)),
+                );
+            } else {
+                related_items.extend(members.into_iter().map(LeftItem::Session));
+            }
+        }
+    }
+    if !related_items.is_empty() {
+        if !items.is_empty() {
+            items.push(LeftItem::RelatedSeparator);
+        }
+        items.push(LeftItem::RelatedHeader);
+        items.extend(related_items);
+    }
+
+    // Scratch always lives below the other groups.
     if let Some((_, project)) = projects.iter().enumerate().find(|(_, p)| p.is_scratch()) {
         let project_hit = project_matches(project, &terms);
         let matched = matching_sessions(
             project,
             sessions,
+            groups,
             sessions_by_project
                 .get(SCRATCH_PROJECT_ID)
                 .map(Vec::as_slice),
@@ -209,6 +279,7 @@ pub(crate) fn build_filtered_left_items(
 fn matching_sessions(
     project: &Project,
     sessions: &[AgentSession],
+    groups: &[AgentGroup],
     session_indices: Option<&[usize]>,
     terms: &[String],
     project_hit: bool,
@@ -219,6 +290,9 @@ fn matching_sessions(
     let mut matched = Vec::new();
     for &index in indices {
         let session = &sessions[index];
+        if related_group_index(groups, session).is_some() {
+            continue;
+        }
         if project_hit || session_matches(session, project, terms) {
             matched.push(index);
         }
@@ -378,6 +452,7 @@ impl App {
                 Some(LeftSelectionTarget::Session(session.id.clone()))
             }
             LeftItem::ScratchHeader => Some(LeftSelectionTarget::Scratch),
+            LeftItem::RelatedHeader => Some(LeftSelectionTarget::Related),
             _ => None,
         }
     }
@@ -403,6 +478,7 @@ impl App {
                 .find(|session| session.id == id)
                 .is_some_and(|session| session.project_id == project_id),
             Some(LeftSelectionTarget::Scratch) => project_id == SCRATCH_PROJECT_ID,
+            Some(LeftSelectionTarget::Related) => false,
             None => false,
         }
     }
@@ -456,10 +532,11 @@ impl App {
                 match target {
                     LeftSelectionTarget::Project(id) => &project.id == id,
                     LeftSelectionTarget::Scratch => project.is_scratch(),
-                    LeftSelectionTarget::Session(_) => false,
+                    LeftSelectionTarget::Session(_) | LeftSelectionTarget::Related => false,
                 }
             }
             LeftItem::ScratchHeader => matches!(target, LeftSelectionTarget::Scratch),
+            LeftItem::RelatedHeader => matches!(target, LeftSelectionTarget::Related),
             LeftItem::Session(index) => {
                 let Some(session) = self.sessions.get(*index) else {
                     return false;
@@ -495,7 +572,8 @@ mod tests {
     use super::build_filtered_left_items;
     use crate::app::LeftItem;
     use crate::model::{
-        AgentSession, Project, ProjectBranchStatus, ProviderKind, SCRATCH_PROJECT_ID, SessionStatus,
+        AgentGroup, AgentSession, Project, ProjectBranchStatus, ProviderKind, SCRATCH_PROJECT_ID,
+        SessionStatus,
     };
     use std::collections::HashSet;
 
@@ -538,6 +616,8 @@ mod tests {
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -556,7 +636,7 @@ mod tests {
     }
 
     fn filtered(projects: &[Project], sessions: &[AgentSession], query: &str) -> Vec<LeftItem> {
-        build_filtered_left_items(projects, sessions, &HashSet::new(), 5, query)
+        build_filtered_left_items(projects, sessions, &[], &HashSet::new(), false, 5, query)
     }
 
     #[test]
@@ -659,11 +739,20 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert("p1".to_string());
 
-        let items = build_filtered_left_items(&projects(), &sessions(), &collapsed, 5, "second");
+        let items = build_filtered_left_items(
+            &projects(),
+            &sessions(),
+            &[],
+            &collapsed,
+            false,
+            5,
+            "second",
+        );
         assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(1)]);
 
         // Without a filter the collapsed project keeps its collapsed shape.
-        let items = build_filtered_left_items(&projects(), &sessions(), &collapsed, 5, "");
+        let items =
+            build_filtered_left_items(&projects(), &sessions(), &[], &collapsed, false, 5, "");
         assert_eq!(
             items,
             vec![
@@ -681,7 +770,15 @@ mod tests {
 
         // The separator threshold is reached, but a filtered list has no
         // empty-project section.
-        let items = build_filtered_left_items(&projects, &sessions, &HashSet::new(), 1, "first");
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            &[],
+            &HashSet::new(),
+            false,
+            1,
+            "first",
+        );
         assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(0)]);
     }
 
@@ -720,6 +817,71 @@ mod tests {
             filtered(&projects(), &sessions, "treatment"),
             vec![LeftItem::Project(0), LeftItem::Session(0)]
         );
+    }
+
+    #[test]
+    fn related_members_move_to_the_related_section_and_remain_searchable() {
+        let projects = projects();
+        let mut sessions = sessions();
+        let mut group = AgentGroup::new("first".to_string(), Some("s1".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[2].group_id = Some(group.id.clone());
+        sessions[2].parent_session_id = Some("s1".to_string());
+
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+            "",
+        );
+        assert!(items.contains(&LeftItem::RelatedHeader));
+        assert!(items.contains(&LeftItem::RelatedGroupLabel(0)));
+        // The origin stays under its project; the child is only in Related work.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| **item == LeftItem::Session(0))
+                .count(),
+            1
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| **item == LeftItem::Session(2))
+                .count(),
+            1
+        );
+
+        // Searching by group label shows the group and all of its members.
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+            "first",
+        );
+        assert!(items.contains(&LeftItem::RelatedHeader));
+        assert!(items.contains(&LeftItem::Session(0)) || items.contains(&LeftItem::Session(2)));
+
+        // Searching by a related member does not leave an empty project header
+        // for a project that only has related members.
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+            "other",
+        );
+        assert!(items.contains(&LeftItem::RelatedHeader));
+        assert!(!items.contains(&LeftItem::Project(1)));
     }
 
     #[test]

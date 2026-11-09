@@ -4372,6 +4372,12 @@ impl App {
                                 project.name
                             )
                         }
+                        CreateAgentRequest::SplitOut { project, .. } => {
+                            format!(
+                                "Creating related worktree \"{name}\" in project \"{}\"...",
+                                project.name
+                            )
+                        }
                     };
                     set_create_agent_request_custom_name(&mut request, name);
                     self.dispatch_create_agent_request(request, msg)?;
@@ -6083,6 +6089,7 @@ impl App {
             CreateAgentRequest::ForkSession { .. }
             | CreateAgentRequest::ExistingManagedWorktree { .. }
             | CreateAgentRequest::ForkExternalWorktree { .. }
+            | CreateAgentRequest::SplitOut { .. }
             | CreateAgentRequest::Scratch { .. } => unreachable!(),
         };
         if let Err(e) = self.dispatch_create_agent_request(request, msg) {
@@ -6791,8 +6798,21 @@ impl App {
                     self.reconnect_selected_session()?;
                 }
             }
+            Some(LeftItem::RelatedHeader) => {
+                self.toggle_collapse_selected_project();
+                if !self.related_collapsed
+                    && let Some(pos) = self
+                        .left_items()
+                        .iter()
+                        .position(|item| matches!(item, LeftItem::Session(si) if self.session_is_related_member(&self.sessions[*si])))
+                {
+                    self.selected_left = pos;
+                }
+            }
             Some(LeftItem::EmptyProjectsSpacer) => {}
             Some(LeftItem::EmptyProjectsSeparator) => {}
+            Some(LeftItem::RelatedSeparator) => {}
+            Some(LeftItem::RelatedGroupLabel(_)) => {}
             Some(LeftItem::ScratchSeparator) => {}
             None => {}
         }
@@ -7928,7 +7948,8 @@ fn set_create_agent_request_custom_name(request: &mut CreateAgentRequest, name: 
         | CreateAgentRequest::ForkSession { custom_name, .. }
         | CreateAgentRequest::PullRequest { custom_name, .. }
         | CreateAgentRequest::ExistingManagedWorktree { custom_name, .. }
-        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => {
+        | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+        | CreateAgentRequest::SplitOut { custom_name, .. } => {
             *custom_name = Some(name);
         }
     }
@@ -8088,6 +8109,7 @@ mod tests {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -8134,6 +8156,8 @@ mod tests {
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -8147,6 +8171,7 @@ mod tests {
             session_store,
             projects: vec![project],
             sessions: vec![session],
+            groups: Vec::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -8186,6 +8211,12 @@ mod tests {
             clipboard: Clipboard::new(),
             worker_tx,
             worker_rx,
+            control_rx: None,
+            control_server: None,
+            pending_control_responses: std::collections::HashMap::new(),
+            split_out_in_flight: false,
+            split_out_create_started: false,
+            pending_split_out: None,
             providers: std::collections::HashMap::new(),
             provider_session_discovery_cancellations: std::collections::HashMap::new(),
             provider_session_discovery_lifetime: Arc::new(()),
@@ -8221,6 +8252,7 @@ mod tests {
             watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
+            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
@@ -9267,6 +9299,8 @@ not_a_real_action = ["x"]
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         });
@@ -9952,6 +9986,8 @@ not_a_real_action = ["x"]
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
+            group_id: None,
+            parent_session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9967,6 +10003,10 @@ not_a_real_action = ["x"]
                 repo_path: app.projects[0].path.clone(),
                 owns_worktree: false,
                 startup_result: None,
+                request_id: None,
+                focus_on_ready: true,
+                handoff_prompt: None,
+                project_added: false,
             },
         );
         app.worker_tx
@@ -11348,6 +11388,8 @@ not_a_real_action = ["x"]
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         });
@@ -18888,6 +18930,8 @@ cyan = "#00ffff"
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         });
@@ -19238,6 +19282,8 @@ cyan = "#00ffff"
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -19252,6 +19298,10 @@ cyan = "#00ffff"
                 repo_path: app.projects[0].path.clone(),
                 owns_worktree: false,
                 startup_result: None,
+                request_id: None,
+                focus_on_ready: true,
+                handoff_prompt: None,
+                project_added: false,
             },
         );
         app.worker_tx

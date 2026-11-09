@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -298,6 +298,27 @@ impl PtyClient {
         writer.flush().context("failed to flush PTY writer")?;
         self.dirty.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Write bytes from a background thread after a short delay. Used for
+    /// split-out handoff prompts so a large paste cannot block the UI thread.
+    pub fn write_bytes_delayed(&self, bytes: Vec<u8>, delay: Duration) {
+        let writer = Arc::clone(&self.writer);
+        let dirty = Arc::clone(&self.dirty);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let result = (|| -> Result<()> {
+                let mut writer = writer.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                writer.write_all(&bytes).context("failed to write to PTY")?;
+                writer.flush().context("failed to flush PTY writer")?;
+                Ok(())
+            })();
+            if result.is_ok() {
+                dirty.store(true, Ordering::Release);
+            } else if let Err(err) = result {
+                crate::logger::error(&format!("failed to write delayed PTY input: {err:#}"));
+            }
+        });
     }
 
     /// Get an owned snapshot of the currently visible terminal viewport.

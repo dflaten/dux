@@ -53,6 +53,8 @@ pub struct Theme {
     pub selection_bg: Color,
     pub project_icon: Color,
     pub project_missing_fg: Color,
+    /// Accent used for the Related work section, group labels, and link badges.
+    pub related_link_fg: Color,
     pub session_active: Color,
     pub session_detached: Color,
     pub session_exited: Color,
@@ -327,6 +329,7 @@ fn register_dux_defaults(theme: &mut OpalineTheme) {
     // Projects & sessions
     theme.register_default_token("dux.project_icon", accent_primary);
     theme.register_default_token("dux.project_missing_fg", warning);
+    theme.register_default_token("dux.related_link_fg", accent_secondary);
     theme.register_default_token("dux.session_active", text_primary);
     theme.register_default_token("dux.session_detached", warning);
     theme.register_default_token("dux.session_exited", text_dim);
@@ -463,6 +466,7 @@ impl Theme {
             selection_bg: pick("dux.selection_bg"),
             project_icon: pick("dux.project_icon"),
             project_missing_fg: pick("dux.project_missing_fg"),
+            related_link_fg: pick("dux.related_link_fg"),
             session_active: pick("dux.session_active"),
             session_detached: pick("dux.session_detached"),
             session_exited: pick("dux.session_exited"),
@@ -681,6 +685,7 @@ mod tests {
             selection_bg: Color::Cyan,
             project_icon: Color::Rgb(100, 149, 237),
             project_missing_fg: Color::Rgb(180, 160, 80),
+            related_link_fg: Color::Rgb(120, 170, 220),
             session_active: Color::Rgb(210, 210, 210),
             session_detached: Color::Yellow,
             session_exited: Color::Rgb(100, 100, 100),
@@ -783,6 +788,7 @@ mod tests {
         assert_field!(selection_bg);
         assert_field!(project_icon);
         assert_field!(project_missing_fg);
+        assert_field!(related_link_fg);
         assert_field!(session_active);
         assert_field!(session_detached);
         assert_field!(session_exited);

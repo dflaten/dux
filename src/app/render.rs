@@ -650,12 +650,20 @@ impl App {
                         ]))
                     }
                     LeftItem::EmptyProjectsSpacer => ListItem::new(Line::from("")),
-                    LeftItem::EmptyProjectsSeparator | LeftItem::ScratchSeparator => {
-                        ListItem::new(Line::from(Span::styled(
-                            "─",
-                            Style::default().fg(self.theme.header_separator_fg),
-                        )))
-                    }
+                    LeftItem::RelatedSeparator
+                    | LeftItem::EmptyProjectsSeparator
+                    | LeftItem::ScratchSeparator => ListItem::new(Line::from(Span::styled(
+                        "─",
+                        Style::default().fg(self.theme.header_separator_fg),
+                    ))),
+                    LeftItem::RelatedHeader => ListItem::new(Line::from(Span::styled(
+                        "⇄",
+                        Style::default().fg(self.theme.related_link_fg),
+                    ))),
+                    LeftItem::RelatedGroupLabel(_) => ListItem::new(Line::from(Span::styled(
+                        "·",
+                        Style::default().fg(self.theme.related_link_fg),
+                    ))),
                     LeftItem::ScratchHeader => {
                         let icon = if self.collapsed_projects.contains(SCRATCH_PROJECT_ID) {
                             "▸"
@@ -729,6 +737,14 @@ impl App {
             counts
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;
+        let related_counts: HashMap<String, usize> = self
+            .sessions
+            .iter()
+            .filter(|session| self.session_is_related_member(session))
+            .fold(HashMap::new(), |mut counts, session| {
+                *counts.entry(session.project_id.clone()).or_insert(0) += 1;
+                counts
+            });
         let project_count = self
             .projects
             .iter()
@@ -808,6 +824,14 @@ impl App {
                                 Style::default().fg(self.theme.provider_label_fg),
                             ));
                         }
+                        if let Some(related) = related_counts.get(&project.id)
+                            && *related > 0
+                        {
+                            spans.push(Span::styled(
+                                format!(" ⇄ {related}"),
+                                Style::default().fg(self.theme.related_link_fg),
+                            ));
+                        }
                         ListItem::new(Line::from(spans))
                     }
                 }
@@ -873,31 +897,118 @@ impl App {
                     } else {
                         format!(" ({})", session.provider.as_str())
                     };
+                    let is_related = self.session_is_related_member(session);
+                    let mut spans = vec![Span::styled(
+                        connector,
+                        Style::default().fg(self.theme.project_icon),
+                    )];
+                    if is_related {
+                        spans.push(Span::styled(
+                            "↳ ",
+                            Style::default().fg(self.theme.related_link_fg),
+                        ));
+                        let project_name = self
+                            .projects
+                            .iter()
+                            .find(|project| project.id == session.project_id)
+                            .map(|project| project.name.clone())
+                            .unwrap_or_else(|| session.project_id.clone());
+                        spans.push(Span::styled(
+                            format!("{project_name} · "),
+                            Style::default().fg(self.theme.hint_dim_desc_fg),
+                        ));
+                    }
+                    spans.push(Span::styled(format!("{dot} "), label_style));
+                    spans.push(Span::styled(label, label_style));
+                    spans.push(Span::styled(
+                        provider_label,
+                        if deleting {
+                            label_style
+                        } else {
+                            Style::default().fg(self.theme.provider_label_fg)
+                        },
+                    ));
+                    if !is_related && let Some(group) = self.group_for_session(session) {
+                        let related_count = self
+                            .sessions
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.group_id.as_deref() == Some(group.id.as_str())
+                                    && candidate.parent_session_id.is_some()
+                            })
+                            .count();
+                        if related_count > 0 {
+                            spans.push(Span::styled(
+                                format!(" ⇄ {related_count}"),
+                                Style::default().fg(self.theme.related_link_fg),
+                            ));
+                        }
+                    }
                     ListItem::new(Line::from(
-                        vec![
-                            Span::styled(connector, Style::default().fg(self.theme.project_icon)),
-                            Span::styled(format!("{dot} "), label_style),
-                            Span::styled(label, label_style),
-                            Span::styled(
-                                provider_label,
-                                if deleting {
-                                    label_style
-                                } else {
-                                    Style::default().fg(self.theme.provider_label_fg)
-                                },
-                            ),
-                        ]
-                        .into_iter()
-                        .chain(companion_terminal_row_badge(
-                            self.companion_terminal_status(&session.id),
-                            &self.theme,
-                        ))
-                        .chain(macro_delivery_row_badge(
-                            self.macro_deliveries.get(&session.id),
-                            &self.theme,
-                        ))
-                        .collect::<Vec<_>>(),
+                        spans
+                            .into_iter()
+                            .chain(companion_terminal_row_badge(
+                                self.companion_terminal_status(&session.id),
+                                &self.theme,
+                            ))
+                            .chain(macro_delivery_row_badge(
+                                self.macro_deliveries.get(&session.id),
+                                &self.theme,
+                            ))
+                            .collect::<Vec<_>>(),
                     ))
+                }
+                LeftItem::RelatedSeparator => ListItem::new(empty_projects_separator_line(
+                    projects_inner_width,
+                    &self.theme,
+                )),
+                LeftItem::RelatedHeader => {
+                    let count = self
+                        .sessions
+                        .iter()
+                        .filter(|session| self.session_is_related_member(session))
+                        .count();
+                    let icon = if self.related_collapsed {
+                        "▸ "
+                    } else {
+                        "▾ "
+                    };
+                    let mut spans = vec![
+                        Span::styled(icon, Style::default().fg(self.theme.related_link_fg)),
+                        Span::styled(
+                            "Related work",
+                            Style::default()
+                                .fg(self.theme.related_link_fg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if count > 0 {
+                        spans.push(Span::styled(
+                            format!(" ({count})"),
+                            Style::default().fg(self.theme.provider_label_fg),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
+                }
+                LeftItem::RelatedGroupLabel(group_index) => {
+                    let group = &self.groups[*group_index];
+                    let label = related_group_label_for(&self.sessions, group);
+                    let count = self
+                        .sessions
+                        .iter()
+                        .filter(|session| {
+                            session.group_id.as_deref() == Some(group.id.as_str())
+                                && session.parent_session_id.is_some()
+                        })
+                        .count();
+                    ListItem::new(Line::from(vec![
+                        Span::styled("  ⇄ ", Style::default().fg(self.theme.related_link_fg)),
+                        Span::styled(label, Style::default().fg(self.theme.hint_dim_desc_fg)),
+                        Span::styled(
+                            format!(" ({count})"),
+                            Style::default().fg(self.theme.provider_label_fg),
+                        ),
+                    ]))
                 }
                 LeftItem::ScratchSeparator => ListItem::new(empty_projects_separator_line(
                     projects_inner_width,

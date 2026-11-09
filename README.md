@@ -23,6 +23,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 
 - [Overview](#overview)
 - [Status](#status)
+- [Related Worktrees](#related-worktrees)
 - [Documentation](#documentation)
 - [Install](#install)
 - [Prerequisites](#prerequisites)
@@ -34,6 +35,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | --- | --- | --- |
 | 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
 | 🌿 | Worktrees | One isolated git worktree per project agent, with fork and existing-worktree workflows |
+| ⇄ | Related work | Agents can split work into linked worktrees in other projects; each stays independently managed |
 | ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
 | 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
@@ -55,6 +57,53 @@ Recent fork additions include:
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.
 - Cross-pane macros with short descriptions, auto-created targets, optional Enter submission, background delivery badges, and configurable focus.
+- Related worktrees: an agent can split cross-repository work into a linked dux project and manage it as an independent agent session.
+
+## Related Worktrees
+
+An agent running inside dux can ask dux to create work in another repository:
+
+```bash
+"$DUX_BIN" agent split-out \
+  --repo /path/to/other-repo \
+  --name fix-api-contract \
+  --prompt-file - \
+  --json
+```
+
+Dux creates a fresh worktree from the target project's leading branch, creates
+an independent agent session, optionally launches the child agent with a handoff
+prompt, and links the new session to the current agent. Linked sessions appear
+in the **Related work** section of the sidebar and can be jumped between from
+the command palette.
+
+The target repo can already be a dux project, or dux can register it
+automatically. Set `[agent_control] allow_unregistered_repos = false` in
+`config.toml` if agents should only target projects you have added manually.
+
+Agent control uses a user-only local socket at `<config_dir>/dux.sock`. Set
+`[agent_control] enabled = false` to disable it. The socket is not an agent
+protocol; it only lets the `dux` CLI request workspace changes from the running
+TUI.
+
+### Agent Skill
+
+Dux ships an optional skill that teaches agents how and when to use split-out:
+
+```text
+skills/dux-split-out/SKILL.md
+```
+
+Copy it into the global skill directory of the agent you use. For example:
+
+```bash
+mkdir -p ~/.config/opencode/skills/dux-split-out
+cp skills/dux-split-out/SKILL.md ~/.config/opencode/skills/dux-split-out/SKILL.md
+```
+
+OpenCode also discovers `~/.claude/skills` and `~/.agents/skills`. The skill is
+not installed automatically. Run `dux agent --help` for the authoritative
+command reference.
 
 ## Documentation
 

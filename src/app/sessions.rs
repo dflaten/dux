@@ -208,6 +208,7 @@ impl App {
         self.spawn_project_persistence(ProjectPersistenceAction::Add {
             project,
             status_message,
+            quiet: false,
         });
         self.set_busy(format!("Saving project \"{display_name}\" to workspace..."));
         Ok(())
@@ -584,6 +585,7 @@ impl App {
             self.spawn_project_persistence(ProjectPersistenceAction::Add {
                 project,
                 status_message: outcome.status_message,
+                quiet: false,
             });
             self.set_busy(format!(
                 "Saving converted project \"{project_name}\" and finishing the scratch conversion..."
@@ -706,7 +708,8 @@ impl App {
             CreateAgentRequest::NewProject { custom_name, .. }
             | CreateAgentRequest::Scratch { custom_name, .. }
             | CreateAgentRequest::ForkSession { custom_name, .. }
-            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. } => custom_name.clone(),
+            | CreateAgentRequest::ForkExternalWorktree { custom_name, .. }
+            | CreateAgentRequest::SplitOut { custom_name, .. } => custom_name.clone(),
             CreateAgentRequest::PullRequest {
                 custom_name,
                 head_branch,
@@ -824,11 +827,50 @@ impl App {
         let sessions = self.sessions.clone();
         let worker_tx = self.worker_tx.clone();
         let term_size = crossterm::terminal::size().unwrap_or((80, 24));
-        thread::spawn(move || {
-            super::workers::run_create_agent_job(
-                request, paths, config, sessions, worker_tx, term_size,
-            );
-        });
+        match request {
+            CreateAgentRequest::SplitOut {
+                request_id,
+                source_session_id,
+                group_id,
+                parent_session_id,
+                project,
+                custom_name,
+                base_branch,
+                provider,
+                handoff_prompt,
+                project_added,
+            } => {
+                let name = custom_name.unwrap_or_else(git::docker_style_name);
+                let base_branch = base_branch
+                    .or_else(|| project.leading_branch.clone())
+                    .unwrap_or_else(|| project.current_branch.clone());
+                let provider = provider.unwrap_or_else(|| project.default_provider.clone());
+                let request = SplitOutCreateRequest {
+                    request_id,
+                    source_session_id,
+                    group_id,
+                    parent_session_id,
+                    project,
+                    name,
+                    base_branch,
+                    provider,
+                    handoff_prompt,
+                    project_added,
+                };
+                thread::spawn(move || {
+                    super::workers::run_split_out_create_job(
+                        request, paths, config, worker_tx, term_size,
+                    );
+                });
+            }
+            request => {
+                thread::spawn(move || {
+                    super::workers::run_create_agent_job(
+                        request, paths, config, sessions, worker_tx, term_size,
+                    );
+                });
+            }
+        }
         Ok(())
     }
 
@@ -853,6 +895,10 @@ impl App {
             .find(|project| project.id == session.project_id)
             .and_then(|project| {
                 crate::config::resolve_agent_env(&self.config.env, &project.env).ok()
+            })
+            .map(|mut env| {
+                env.extend(super::control::agent_control_env(&self.paths, &session));
+                env
             })
             .unwrap_or_default();
         AgentLaunchRequest {
@@ -949,6 +995,10 @@ impl App {
             .find(|project| project.id == session.project_id)
             .and_then(|project| {
                 crate::config::resolve_agent_env(&self.config.env, &project.env).ok()
+            })
+            .map(|mut env| {
+                env.extend(super::control::agent_control_env(&self.paths, session));
+                env
             })
             .unwrap_or_default();
         PtyClient::spawn_with_env(
@@ -3058,6 +3108,9 @@ impl App {
                 .map(|p| p.path.clone()),
             Some(LeftItem::EmptyProjectsSpacer) => None,
             Some(LeftItem::EmptyProjectsSeparator) => None,
+            Some(LeftItem::RelatedHeader) => None,
+            Some(LeftItem::RelatedSeparator) => None,
+            Some(LeftItem::RelatedGroupLabel(_)) => None,
             Some(LeftItem::ScratchSeparator) => None,
             None => None,
         };
@@ -3742,6 +3795,7 @@ mod tests {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.clone().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.clone(),
         };
@@ -3758,6 +3812,7 @@ mod tests {
             session_store,
             projects,
             sessions,
+            groups: Vec::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -3797,6 +3852,12 @@ mod tests {
             clipboard: Clipboard::new(),
             worker_tx,
             worker_rx,
+            control_rx: None,
+            control_server: None,
+            pending_control_responses: std::collections::HashMap::new(),
+            split_out_in_flight: false,
+            split_out_create_started: false,
+            pending_split_out: None,
             providers: std::collections::HashMap::new(),
             provider_session_discovery_cancellations: std::collections::HashMap::new(),
             provider_session_discovery_lifetime: Arc::new(()),
@@ -3832,6 +3893,7 @@ mod tests {
             watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
+            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
@@ -3898,9 +3960,145 @@ mod tests {
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn split_out_plan_creates_a_linked_session_and_control_response() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "dux@example.com"]);
+        run_git(&["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
+
+        let project = make_project_at("project-1", "fake", &repo.to_string_lossy());
+        let source = make_session("source", "codex", "/tmp/source");
+        let mut app = test_app_with_sessions(vec![source.clone()], vec![project.clone()]);
+        app.config.providers.commands.insert(
+            "fake".to_string(),
+            crate::config::ProviderCommandConfig {
+                command: "true".to_string(),
+                oneshot_output: crate::config::OneshotOutput::Stdout,
+                ..Default::default()
+            },
+        );
+
+        let (response_tx, response_rx) = mpsc::channel();
+        app.pending_control_responses
+            .insert("request-1".to_string(), response_tx);
+        app.split_out_in_flight = true;
+        app.handle_split_out_prepared(SplitOutPlan {
+            request_id: "request-1".to_string(),
+            source_session_id: source.id.clone(),
+            project,
+            project_is_new: false,
+            base_branch: Some("main".to_string()),
+            name: Some("linked-work".to_string()),
+            provider: Some(ProviderKind::from_str("fake")),
+            prompt: Some("do the work".to_string()),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let response = loop {
+            app.drain_events();
+            if let Ok(response) = response_rx.try_recv() {
+                break response;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("split-out did not respond before the test deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(response.ok, "split-out failed: {response:?}");
+        let child = app
+            .sessions
+            .iter()
+            .find(|session| session.id == response.session_id.clone().unwrap())
+            .expect("child session");
+        assert_eq!(child.parent_session_id.as_deref(), Some("source"));
+        assert_eq!(child.group_id.as_deref(), response.group_id.as_deref());
+        assert_eq!(child.branch_name, "linked-work");
+        assert!(
+            app.groups
+                .iter()
+                .any(|group| group.id == child.group_id.clone().unwrap())
+        );
+        assert!(
+            app.left_items()
+                .iter()
+                .any(|item| matches!(item, LeftItem::RelatedHeader))
+        );
+        assert!(!app.split_out_in_flight);
+    }
+
+    #[test]
+    fn agent_control_env_exposes_session_context() {
+        let session = make_session("session-env", "codex", "/tmp/worktree-env");
+        let app = test_app_with_sessions(vec![session.clone()], Vec::new());
+        let env = super::control::agent_control_env(&app.paths, &session)
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env.get("DUX_SESSION_ID").map(String::as_str),
+            Some("session-env")
+        );
+        assert_eq!(
+            env.get("DUX_WORKTREE_PATH").map(String::as_str),
+            Some("/tmp/worktree-env")
+        );
+        let root = app.paths.root.to_string_lossy().to_string();
+        let socket = app.paths.control_socket_path.to_string_lossy().to_string();
+        assert_eq!(env.get("DUX_HOME").map(String::as_str), Some(root.as_str()));
+        assert_eq!(
+            env.get("DUX_SOCKET").map(String::as_str),
+            Some(socket.as_str())
+        );
+        assert!(env.contains_key("DUX_BIN"));
+    }
+
+    #[test]
+    fn related_agents_response_lists_the_group_members() {
+        let mut source = make_session("source", "codex", "/tmp/source");
+        let mut child = make_session("child", "codex", "/tmp/child");
+        let mut group =
+            crate::model::AgentGroup::new("source".to_string(), Some("source".to_string()));
+        group.id = "group-1".to_string();
+        source.group_id = Some(group.id.clone());
+        child.group_id = Some(group.id.clone());
+        child.parent_session_id = Some("source".to_string());
+        let mut app = test_app_with_sessions(
+            vec![source, child],
+            vec![make_project_at("project-1", "codex", "/tmp/project")],
+        );
+        app.groups.push(group);
+
+        let response = app.related_agents_response(Some("source"));
+        assert!(response.ok);
+        assert_eq!(response.group_id.as_deref(), Some("group-1"));
+        assert_eq!(response.related.len(), 2);
+        assert!(response.related.iter().any(|agent| agent.is_origin));
+        assert!(response.related.iter().any(|agent| !agent.is_origin));
     }
 
     #[test]
@@ -4865,6 +5063,7 @@ mod tests {
             ProjectPersistenceAction::Add {
                 project: new_project,
                 status_message: "Added project".to_string(),
+                quiet: false,
             },
             Ok(()),
         );

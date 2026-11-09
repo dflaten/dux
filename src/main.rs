@@ -7,6 +7,7 @@ mod diff;
 mod editor;
 mod git;
 mod io_retry;
+mod ipc;
 mod keybindings;
 mod lockfile;
 mod logger;
@@ -27,7 +28,10 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if matches!(
+        args.first().map(|arg| arg.as_str()),
+        None | Some("--help") | Some("-h")
+    ) {
         print_help();
         return Ok(());
     }
@@ -38,6 +42,10 @@ fn main() -> Result<()> {
     }
 
     let paths = config::DuxPaths::discover()?;
+
+    if args.first().map(|s| s.as_str()) == Some("agent") {
+        return cli::run_agent(&args[1..], &paths);
+    }
 
     if args.first().map(|s| s.as_str()) == Some("config") {
         let config_args = &args[1..];
@@ -87,7 +95,12 @@ fn print_help() {
          Usage:\n\
           dux              Launch the TUI\n\
           dux --version    Print the version\n\
+          dux agent        Create or inspect related agent worktrees\n\
           dux config       Manage the configuration file\n\n\
+         Agent subcommands:\n\
+          dux agent split-out     Create a related worktree in another project\n\
+          dux agent related       List agents related to the current agent\n\
+          dux agent --help        Full split-out and related options\n\n\
          Config subcommands:\n\
           dux config path          Print the config file path\n\
           dux config diff          Show settings that differ from defaults\n\
@@ -101,7 +114,8 @@ fn print_help() {
            DUX_HOME    Override the config directory (must be an absolute path).\n\
                        When unset, defaults to:\n\
                          macOS: ~/.dux/\n\
-                         Linux: $XDG_CONFIG_HOME/dux/ or ~/.config/dux/\n\n\
+                         Linux: $XDG_CONFIG_HOME/dux/ or ~/.config/dux/\n\
+           DUX_SOCKET  Override the agent control socket path (absolute).\n\n\
          First run writes a full default config to:\n\
            macOS: ~/.dux/config.toml\n\
            Linux: $XDG_CONFIG_HOME/dux/config.toml or ~/.config/dux/config.toml\n\

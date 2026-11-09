@@ -33,9 +33,19 @@ impl App {
                     self.create_agent_in_flight = false;
                     self.set_error(message);
                 }
+                WorkerEvent::SplitOutPrepared { plan } => {
+                    self.handle_split_out_prepared(*plan);
+                }
+                WorkerEvent::SplitOutFailed {
+                    request_id,
+                    code,
+                    message,
+                } => {
+                    self.fail_split_out(&request_id, code, message);
+                }
                 WorkerEvent::ScratchConversionCompleted { result } => {
                     self.scratch_conversion_in_flight = false;
-                    match result {
+                    match *result {
                         Ok(outcome) => self.finish_scratch_conversion(outcome),
                         Err(message) => self.set_error(message),
                     }
@@ -819,7 +829,15 @@ impl App {
                         }
                         _ => {}
                     }
+                    let pending_action = action.clone();
+                    let pending_result = result.clone();
                     self.apply_project_persistence_result(action, result);
+                    if matches!(pending_action, ProjectPersistenceAction::Add { .. }) {
+                        self.finish_pending_split_out_registration(
+                            &pending_action,
+                            &pending_result,
+                        );
+                    }
                 }
                 WorkerEvent::GlobalEnvPersistenceCompleted { env, result } => match result {
                     Ok(()) => {
@@ -1095,8 +1113,10 @@ impl App {
             ProjectPersistenceAction::Add {
                 project,
                 status_message,
+                quiet,
             } => {
                 let project_id = project.id.clone();
+                let selected_before = self.selected_left_target();
                 if let Some(existing) = self
                     .projects
                     .iter_mut()
@@ -1107,32 +1127,42 @@ impl App {
                     self.projects.push(project);
                 }
                 self.rebuild_left_items();
-                let selected_converted_session = self
-                    .left_items()
-                    .get(self.selected_left)
-                    .is_some_and(|item| match item {
-                        LeftItem::Session(index) => self.sessions[*index].project_id == project_id,
-                        _ => false,
-                    });
-                if !selected_converted_session
-                    && let Some(index) = self.left_items().iter().position(|item| {
-                        matches!(item, LeftItem::Project(project_index) if self.projects[*project_index].id == project_id)
-                    })
-                {
-                    self.selected_left = index;
+                if quiet {
+                    if let Some(target) = selected_before {
+                        self.select_left_target(&target);
+                    }
+                } else {
+                    let selected_converted_session = self
+                        .left_items()
+                        .get(self.selected_left)
+                        .is_some_and(|item| match item {
+                            LeftItem::Session(index) => {
+                                self.sessions[*index].project_id == project_id
+                            }
+                            _ => false,
+                        });
+                    if !selected_converted_session
+                        && let Some(index) = self.left_items().iter().position(|item| {
+                            matches!(item, LeftItem::Project(project_index) if self.projects[*project_index].id == project_id)
+                        })
+                    {
+                        self.selected_left = index;
+                    }
+                    // The freshly added project is now selected and has no agents,
+                    // so refresh the right-pane file lists. Without this, the
+                    // previously selected project's changed files linger and look
+                    // like they belong to the brand-new project.
+                    self.reload_changed_files();
                 }
-                // The freshly added project is now selected and has no agents,
-                // so refresh the right-pane file lists. Without this, the
-                // previously selected project's changed files linger and look
-                // like they belong to the brand-new project.
-                self.reload_changed_files();
                 if let Err(err) = self.persist_config_projects_from_runtime() {
                     self.set_error(format!(
                         "Project was saved to the database, but config.toml could not be updated: {err:#}"
                     ));
                     return;
                 }
-                self.set_info(status_message);
+                if !quiet {
+                    self.set_info(status_message);
+                }
             }
             ProjectPersistenceAction::Remove {
                 project_id,
@@ -1407,16 +1437,45 @@ impl App {
         self.agent_launches_in_flight.remove(&session_id);
         self.last_pty_size = request.pty_size;
 
-        if matches!(request.kind, AgentLaunchKind::Create { .. }) {
+        if let AgentLaunchKind::Create {
+            status_message,
+            repo_path,
+            owns_worktree,
+            startup_result,
+            request_id,
+            focus_on_ready,
+            handoff_prompt,
+            project_added,
+        } = request.kind.clone()
+        {
             self.create_agent_in_flight = false;
             if let Err(err) = self.session_store.upsert_session(&session) {
                 logger::error(&format!(
                     "session store upsert failed for {}: {err}",
                     session.id
                 ));
-                self.set_error(format!("Failed to persist session: {err}"));
+                if owns_worktree {
+                    let _ = git::remove_worktree(
+                        Path::new(&repo_path),
+                        Path::new(&session.worktree_path),
+                        &session.branch_name,
+                    );
+                }
+                if let Some(request_id) = request_id {
+                    self.fail_split_out(
+                        &request_id,
+                        "persistence_failed",
+                        format!(
+                            "Related agent \"{}\" was created but could not be saved: {err}",
+                            session.branch_name
+                        ),
+                    );
+                } else {
+                    self.set_error(format!("Failed to persist session: {err}"));
+                }
                 return;
             }
+            let selection_before = self.selected_left_target();
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
             self.providers.insert(session.id.clone(), client);
             self.sessions.insert(0, session.clone());
@@ -1431,35 +1490,78 @@ impl App {
                 );
             }
             self.update_branch_sync_sessions();
-            // A newly created agent must be visible and selected, so drop any
-            // sidebar filter that would hide it.
-            self.reset_left_search_state();
-            self.rebuild_left_items();
-            self.selected_left = self
-                .left_items()
-                .iter()
-                .position(|item| matches!(item, LeftItem::Session(index) if self.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session.id.as_str())))
-                .unwrap_or(0);
-            self.reload_changed_files();
-            self.show_agent_surface();
-            self.input_target = InputTarget::Agent;
-            self.fullscreen_overlay = FullscreenOverlay::Agent;
-            if let AgentLaunchKind::Create {
-                status_message,
-                startup_result,
-                ..
-            } = request.kind
-            {
-                if let Some(result) = startup_result
-                    && let Err(err) = result.status
-                {
-                    self.set_error(format!(
-                        "Startup command failed for agent \"{}\": {err}. Run read-startup-command-logs for details.",
-                        session.branch_name
-                    ));
-                } else {
-                    self.set_info(status_message);
+            if focus_on_ready {
+                // A newly created agent must be visible and selected, so drop
+                // any sidebar filter that would hide it.
+                self.reset_left_search_state();
+                self.rebuild_left_items();
+                self.selected_left = self
+                    .left_items()
+                    .iter()
+                    .position(|item| matches!(item, LeftItem::Session(index) if self.sessions.get(*index).map(|candidate| candidate.id.as_str()) == Some(session.id.as_str())))
+                    .unwrap_or(0);
+                self.reload_changed_files();
+                self.show_agent_surface();
+                self.input_target = InputTarget::Agent;
+                self.fullscreen_overlay = FullscreenOverlay::Agent;
+            } else {
+                // Agent-initiated split-out must not yank the user away from
+                // the source agent.
+                self.rebuild_left_items();
+                if let Some(target) = selection_before {
+                    self.select_left_target(&target);
                 }
+                self.reload_changed_files_quiet();
+            }
+
+            if let Some(prompt) = handoff_prompt.as_deref()
+                && let Some(provider) = self.providers.get(&session.id)
+            {
+                // A raw newline would submit the prompt early in most agent
+                // TUIs, so flatten it into a single instruction line.
+                let flattened = prompt.replace(['\r', '\n'], " ");
+                let mut payload = flattened.replace('\0', "").into_bytes();
+                if !payload.ends_with(b"\r") {
+                    payload.push(b'\r');
+                }
+                provider.write_bytes_delayed(payload, Duration::from_millis(250));
+            }
+
+            let startup_error = startup_result
+                .as_ref()
+                .and_then(|result| match &result.status {
+                    Err(err) => Some(err.clone()),
+                    Ok(()) => None,
+                });
+
+            if let Some(request_id) = request_id {
+                let project = self
+                    .projects
+                    .iter()
+                    .find(|project| project.id == session.project_id)
+                    .cloned()
+                    .unwrap_or_else(|| scrub_project_for_response(&session));
+                let mut response = self.control_response_for_session(
+                    &request_id,
+                    &session,
+                    &project,
+                    project_added,
+                );
+                if let Some(err) = startup_error.as_deref() {
+                    response.status = Some("launched_with_startup_warning".to_string());
+                    response.message = Some(format!(
+                        "Created related agent \"{}\" in project \"{}\", but its startup command failed: {err}. Open the agent and run read-startup-command-logs for details.",
+                        session.branch_name, project.name
+                    ));
+                }
+                self.complete_split_out(&request_id, response);
+            } else if let Some(err) = startup_error {
+                self.set_error(format!(
+                    "Startup command failed for agent \"{}\": {err}. Run read-startup-command-logs for details.",
+                    session.branch_name
+                ));
+            } else {
+                self.set_info(status_message);
             }
             return;
         }
@@ -1772,6 +1874,21 @@ impl App {
             if matches!(request.kind, AgentLaunchKind::Create { .. }) {
                 self.create_agent_in_flight = false;
             }
+            if let AgentLaunchKind::Create {
+                request_id: Some(request_id),
+                ..
+            } = &request.kind
+            {
+                let request_id = request_id.clone();
+                self.fail_split_out(
+                    &request_id,
+                    "launch_failed",
+                    format!(
+                        "Could not launch the related agent \"{}\": {message}",
+                        session.branch_name
+                    ),
+                );
+            }
             if matches!(request.kind, AgentLaunchKind::ResumeFallback { .. }) {
                 logger::error(&format!(
                     "fallback PTY spawn failed for {}: {}",
@@ -1783,9 +1900,20 @@ impl App {
         }
 
         match request.kind {
-            AgentLaunchKind::Create { .. } => {
+            AgentLaunchKind::Create { request_id, .. } => {
                 self.create_agent_in_flight = false;
-                self.set_error(message);
+                if let Some(request_id) = request_id {
+                    self.fail_split_out(
+                        &request_id,
+                        "launch_failed",
+                        format!(
+                            "Could not launch the related agent \"{}\": {message}",
+                            session.branch_name
+                        ),
+                    );
+                } else {
+                    self.set_error(message);
+                }
             }
             AgentLaunchKind::Reconnect { .. } => {
                 self.set_error(format!(
@@ -2836,7 +2964,8 @@ fn create_agent_worktree_from_existing_request(
         CreateAgentRequest::NewProject { .. }
         | CreateAgentRequest::Scratch { .. }
         | CreateAgentRequest::PullRequest { .. }
-        | CreateAgentRequest::ForkSession { .. } => None,
+        | CreateAgentRequest::ForkSession { .. }
+        | CreateAgentRequest::SplitOut { .. } => None,
     }
 }
 
@@ -2860,6 +2989,15 @@ pub(crate) fn run_create_agent_job(
         launch_with_resume,
         fork_provider_session_id,
     ) = match request {
+        CreateAgentRequest::SplitOut { request_id, .. } => {
+            send_split_out_failure(
+                &worker_tx,
+                &request_id,
+                "internal_error",
+                "Split-out requests must be dispatched through the dedicated split-out worker.",
+            );
+            return;
+        }
         CreateAgentRequest::NewProject {
             project,
             custom_name,
@@ -3415,6 +3553,8 @@ pub(crate) fn run_create_agent_job(
         desired_running: true,
         auto_reopen_enabled: true,
         status: SessionStatus::Active,
+        group_id: None,
+        parent_session_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -3459,7 +3599,10 @@ pub(crate) fn run_create_agent_job(
         return;
     }
     let env = match crate::config::resolve_agent_env(&config.env, &project.env) {
-        Ok(env) => env,
+        Ok(mut env) => {
+            env.extend(super::control::agent_control_env(&paths, &session));
+            env
+        }
         Err(err) => {
             if project.is_scratch() {
                 let _ = fs::remove_dir(Path::new(&session.worktree_path));
@@ -3539,6 +3682,10 @@ pub(crate) fn run_create_agent_job(
             repo_path: repo_path.to_string_lossy().to_string(),
             owns_worktree,
             startup_result,
+            request_id: None,
+            focus_on_ready: true,
+            handoff_prompt: None,
+            project_added: false,
         },
     };
     run_agent_launch_job(request, worker_tx);
@@ -3588,7 +3735,7 @@ pub(crate) fn run_scratch_conversion_job(
     let ScratchConversionRequest { session, target } = request;
     if !session.is_scratch() {
         let _ = worker_tx.send(WorkerEvent::ScratchConversionCompleted {
-            result: Err("Only scratch agents can be converted.".to_string()),
+            result: Box::new(Err("Only scratch agents can be converted.".to_string())),
         });
         return;
     }
@@ -3737,7 +3884,9 @@ pub(crate) fn run_scratch_conversion_job(
             })
         }
     };
-    let _ = worker_tx.send(WorkerEvent::ScratchConversionCompleted { result });
+    let _ = worker_tx.send(WorkerEvent::ScratchConversionCompleted {
+        result: Box::new(result),
+    });
 }
 
 fn prepare_new_project_from_scratch(
@@ -4286,6 +4435,579 @@ fn normalize_github_host(host: &str) -> &str {
     }
 }
 
+fn scrub_project_for_response(session: &AgentSession) -> Project {
+    Project {
+        id: session.project_id.clone(),
+        name: session.project_id.clone(),
+        path: session.project_path.clone().unwrap_or_default(),
+        explicit_default_provider: None,
+        default_provider: session.provider.clone(),
+        leading_branch: None,
+        auto_reopen_agents: None,
+        startup_command: None,
+        env: Default::default(),
+        current_branch: String::new(),
+        branch_status: ProjectBranchStatus::Unknown,
+        path_missing: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-initiated split-out
+// ---------------------------------------------------------------------------
+
+fn send_split_out_failure(
+    worker_tx: &Sender<WorkerEvent>,
+    request_id: &str,
+    code: &str,
+    message: impl Into<String>,
+) {
+    let _ = worker_tx.send(WorkerEvent::SplitOutFailed {
+        request_id: request_id.to_string(),
+        code: code.to_string(),
+        message: message.into(),
+    });
+}
+
+pub(crate) fn run_split_out_prepare_job(
+    request_id: String,
+    params: SplitOutParams,
+    source_session: Option<AgentSession>,
+    projects: Vec<Project>,
+    config: Config,
+    paths: DuxPaths,
+    worker_tx: Sender<WorkerEvent>,
+) {
+    let Some(source_session) = source_session else {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "invalid_source",
+            "split-out requires a source agent session.",
+        );
+        return;
+    };
+    let source_session_id = source_session.id.clone();
+
+    let (mut project, project_is_new) = if let Some(query) = params.project.as_deref() {
+        let found = projects
+            .iter()
+            .find(|project| project.id == query || project.name.eq_ignore_ascii_case(query));
+        match found {
+            Some(project) => (project.clone(), false),
+            None => {
+                send_split_out_failure(
+                    &worker_tx,
+                    &request_id,
+                    "project_not_found",
+                    format!(
+                        "No dux project matches \"{query}\". Pass --repo <path> to target a git checkout directly."
+                    ),
+                );
+                return;
+            }
+        }
+    } else if let Some(raw_repo) = params.repo.as_deref() {
+        let repo_path = match resolve_split_out_repo(raw_repo) {
+            Ok(path) => path,
+            Err(err) => {
+                send_split_out_failure(
+                    &worker_tx,
+                    &request_id,
+                    "invalid_repo",
+                    format!("Could not resolve target repository: {err:#}"),
+                );
+                return;
+            }
+        };
+        if git::is_under(&paths.root, &repo_path) {
+            send_split_out_failure(
+                &worker_tx,
+                &request_id,
+                "invalid_repo",
+                format!(
+                    "Target repository {} is inside dux's data directory. Pass the source checkout path instead.",
+                    repo_path.display()
+                ),
+            );
+            return;
+        }
+        if let Some(project) = projects.iter().find(|project| {
+            let project_path = PathBuf::from(&project.path);
+            let canonical = project_path
+                .canonicalize()
+                .unwrap_or_else(|_| project_path.clone());
+            canonical == repo_path
+        }) {
+            (project.clone(), false)
+        } else if !config.agent_control.allow_unregistered_repos {
+            send_split_out_failure(
+                &worker_tx,
+                &request_id,
+                "unregistered_repo",
+                format!(
+                    "Repository {} is not a dux project, and agent-initiated project registration is disabled. Add it in dux first or enable [agent_control] allow_unregistered_repos.",
+                    repo_path.display()
+                ),
+            );
+            return;
+        } else {
+            match build_project_for_repo(&repo_path, &config) {
+                Ok(project) => (project, true),
+                Err(err) => {
+                    send_split_out_failure(
+                        &worker_tx,
+                        &request_id,
+                        "invalid_repo",
+                        format!("Could not register target repository: {err:#}"),
+                    );
+                    return;
+                }
+            }
+        }
+    } else {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "invalid_request",
+            "split-out requires --repo <path> or --project <id|name>.",
+        );
+        return;
+    };
+
+    if project.is_scratch() {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "invalid_project",
+            "Scratch workspaces do not use git worktrees. Choose a project.",
+        );
+        return;
+    }
+    let repo_path = PathBuf::from(&project.path);
+    if !repo_path.is_dir() {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "project_missing",
+            format!(
+                "Project \"{}\" points to {}, which does not exist.",
+                project.name, project.path
+            ),
+        );
+        return;
+    }
+    if !git::is_git_repo(&repo_path) {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "invalid_project",
+            format!(
+                "Project \"{}\" is not a git repository: {}",
+                project.name, project.path
+            ),
+        );
+        return;
+    }
+
+    let base_branch = match resolve_split_out_base(&repo_path, &project, params.base.as_deref()) {
+        Ok(branch) => branch,
+        Err(err) => {
+            send_split_out_failure(&worker_tx, &request_id, "invalid_base", err.to_string());
+            return;
+        }
+    };
+    if project_is_new {
+        project.leading_branch = Some(base_branch.clone());
+    }
+
+    let name = match resolve_split_out_name(
+        &repo_path,
+        &paths.worktrees_root,
+        &project.name,
+        params.name.as_deref(),
+    ) {
+        Ok(name) => name,
+        Err(err) => {
+            send_split_out_failure(&worker_tx, &request_id, "invalid_name", err.to_string());
+            return;
+        }
+    };
+
+    let provider = match params.provider.as_deref() {
+        Some(name) => {
+            if config.providers.get(name).is_none() {
+                send_split_out_failure(
+                    &worker_tx,
+                    &request_id,
+                    "provider_not_configured",
+                    format!("Provider \"{name}\" is not configured in config.toml."),
+                );
+                return;
+            }
+            ProviderKind::from_str(name)
+        }
+        None => project.default_provider.clone(),
+    };
+    if config.providers.get(provider.as_str()).is_none() {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "provider_not_configured",
+            format!(
+                "Provider \"{}\" for project \"{}\" is not configured in config.toml.",
+                provider.as_str(),
+                project.name
+            ),
+        );
+        return;
+    }
+
+    let prompt = params
+        .prompt
+        .map(|prompt| prompt.trim_end().to_string())
+        .filter(|prompt| !prompt.trim().is_empty());
+    if let Some(prompt) = prompt.as_deref()
+        && prompt.len() > crate::ipc::MAX_CONTROL_MESSAGE_BYTES
+    {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "prompt_too_large",
+            format!(
+                "Handoff prompt is too large ({} bytes, limit {}).",
+                prompt.len(),
+                crate::ipc::MAX_CONTROL_MESSAGE_BYTES
+            ),
+        );
+        return;
+    }
+
+    let _ = source_session;
+    let _ = worker_tx.send(WorkerEvent::SplitOutPrepared {
+        plan: Box::new(SplitOutPlan {
+            request_id,
+            source_session_id,
+            project,
+            project_is_new,
+            base_branch: Some(base_branch),
+            name: Some(name),
+            provider: Some(provider),
+            prompt,
+        }),
+    });
+}
+
+fn resolve_split_out_repo(raw: &str) -> Result<PathBuf> {
+    let expanded = crate::config::expand_path(raw)
+        .or_else(|| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                Some(path.to_string_lossy().to_string())
+            } else {
+                std::env::current_dir()
+                    .ok()
+                    .map(|cwd| cwd.join(path).to_string_lossy().to_string())
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("path is not absolute and could not be resolved"))?;
+    let path = PathBuf::from(expanded);
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("path does not exist: {}", path.display()))?;
+    if !git::is_git_repo(&canonical) {
+        return Err(anyhow::anyhow!(
+            "{} is not a git repository",
+            canonical.display()
+        ));
+    }
+    git::main_worktree_root(&canonical)
+}
+
+fn build_project_for_repo(repo_path: &Path, config: &Config) -> Result<Project> {
+    let name = repo_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("project")
+        .to_string();
+    let current_branch = git::current_branch(repo_path)?;
+    let leading_branch = leading_branch_for_project(repo_path, &current_branch);
+    Ok(Project {
+        id: Uuid::new_v4().to_string(),
+        name,
+        path: repo_path.to_string_lossy().to_string(),
+        explicit_default_provider: None,
+        default_provider: config.default_provider(),
+        leading_branch: Some(leading_branch),
+        auto_reopen_agents: None,
+        startup_command: None,
+        env: Default::default(),
+        current_branch,
+        branch_status: ProjectBranchStatus::Unknown,
+        path_missing: false,
+    })
+}
+
+fn resolve_split_out_base(
+    repo_path: &Path,
+    project: &Project,
+    explicit_base: Option<&str>,
+) -> Result<String> {
+    if let Some(base) = explicit_base {
+        if !git::local_branch_exists(repo_path, base) {
+            return Err(anyhow::anyhow!(
+                "base branch \"{base}\" does not exist locally in {}",
+                repo_path.display()
+            ));
+        }
+        return Ok(base.to_string());
+    }
+    let candidates = [
+        project.leading_branch.clone(),
+        Some(project.current_branch.clone()),
+        Some("main".to_string()),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        if !candidate.trim().is_empty() && git::local_branch_exists(repo_path, &candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not find a local base branch in {}. Pass --base <branch>.",
+        repo_path.display()
+    ))
+}
+
+fn resolve_split_out_name(
+    repo_path: &Path,
+    worktrees_root: &Path,
+    project_name: &str,
+    explicit_name: Option<&str>,
+) -> Result<String> {
+    if let Some(name) = explicit_name {
+        if !git::is_valid_agent_name(name) {
+            return Err(anyhow::anyhow!(
+                "invalid agent name \"{name}\". Use letters, numbers, dashes, underscores, and slashes."
+            ));
+        }
+        if git::branch_exists(repo_path, name).is_some() {
+            return Err(anyhow::anyhow!(
+                "branch \"{name}\" already exists in {}. Choose another --name.",
+                repo_path.display()
+            ));
+        }
+        let worktree_path = worktrees_root.join(project_name).join(name);
+        if worktree_path.exists() {
+            return Err(anyhow::anyhow!(
+                "worktree path already exists: {}",
+                worktree_path.display()
+            ));
+        }
+        return Ok(name.to_string());
+    }
+
+    for _ in 0..100 {
+        let name = git::docker_style_name();
+        if git::branch_exists(repo_path, &name).is_none()
+            && !worktrees_root.join(project_name).join(&name).exists()
+        {
+            return Ok(name);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not generate a unique worktree name; pass --name explicitly"
+    ))
+}
+
+pub(crate) fn run_split_out_create_job(
+    request: SplitOutCreateRequest,
+    paths: DuxPaths,
+    config: Config,
+    worker_tx: Sender<WorkerEvent>,
+    term_size: (u16, u16),
+) {
+    let SplitOutCreateRequest {
+        request_id,
+        source_session_id,
+        group_id,
+        parent_session_id,
+        project,
+        name,
+        base_branch,
+        provider,
+        handoff_prompt,
+        project_added,
+    } = request;
+    let _ = source_session_id;
+    let repo_path = PathBuf::from(&project.path);
+    let progress = format!(
+        "Creating related worktree \"{name}\" in project \"{}\" from \"{base_branch}\"...",
+        project.name
+    );
+    let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(progress));
+
+    if git::branch_exists(&repo_path, &name).is_some() {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "branch_exists",
+            format!(
+                "Branch \"{name}\" already exists in project \"{}\".",
+                project.name
+            ),
+        );
+        return;
+    }
+
+    let (branch_name, worktree_path) = match git::create_worktree_from_start_point(
+        &repo_path,
+        &paths.worktrees_root,
+        &project.name,
+        Some(&base_branch),
+        Some(&name),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            send_split_out_failure(
+                &worker_tx,
+                &request_id,
+                "worktree_failed",
+                format!(
+                    "Failed to create related worktree for project \"{}\": {err:#}",
+                    project.name
+                ),
+            );
+            return;
+        }
+    };
+
+    let provider_cfg = provider_config(&config, &provider);
+    if config.providers.get(provider.as_str()).is_none() {
+        let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "provider_not_configured",
+            format!(
+                "Provider \"{}\" is not configured. Add a [providers.{}] block to config.toml.",
+                provider.as_str(),
+                provider.as_str()
+            ),
+        );
+        return;
+    }
+    if let Err(hint) = check_provider_available(&provider_cfg) {
+        let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+        send_split_out_failure(&worker_tx, &request_id, "provider_not_available", hint);
+        return;
+    }
+
+    let mut env = match crate::config::resolve_agent_env(&config.env, &project.env) {
+        Ok(env) => env,
+        Err(err) => {
+            let _ = git::remove_worktree(&repo_path, &worktree_path, &branch_name);
+            send_split_out_failure(
+                &worker_tx,
+                &request_id,
+                "env_failed",
+                format!(
+                    "Invalid environment variables for project \"{}\": {err:#}",
+                    project.name
+                ),
+            );
+            return;
+        }
+    };
+    let session = AgentSession {
+        id: Uuid::new_v4().to_string(),
+        project_id: project.id.clone(),
+        project_path: Some(project.path.clone()),
+        provider: provider.clone(),
+        source_branch: base_branch.clone(),
+        branch_name: branch_name.clone(),
+        worktree_path: worktree_path.to_string_lossy().to_string(),
+        title: None,
+        started_providers: Vec::new(),
+        provider_session_ids: Default::default(),
+        desired_running: true,
+        auto_reopen_enabled: true,
+        status: SessionStatus::Active,
+        group_id: Some(group_id),
+        parent_session_id: Some(parent_session_id),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    env.extend(super::control::agent_control_env(&paths, &session));
+
+    let startup_result = project
+        .startup_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(|command| {
+            let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+                "Running startup command for related agent \"{}\"...",
+                session.branch_name
+            )));
+            crate::startup::run_startup_command(
+                &paths,
+                crate::startup::StartupCommandRun {
+                    project: project.clone(),
+                    session: session.clone(),
+                    command: command.to_string(),
+                    terminal: config.startup_command_terminal.clone(),
+                    env: env.clone(),
+                },
+            )
+        });
+    if let Some(result) = &startup_result {
+        match &result.status {
+            Ok(()) => logger::info(&format!(
+                "split-out startup command succeeded for {} (log: {})",
+                result.session_id,
+                result.log_path.display()
+            )),
+            Err(err) => logger::error(&format!(
+                "split-out startup command failed for {}: {err} (log: {})",
+                result.session_id,
+                result.log_path.display()
+            )),
+        }
+    }
+
+    let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(format!(
+        "Launching {} in the related worktree...",
+        provider.as_str()
+    )));
+    let (cols, rows) = term_size;
+    let status_message = format!(
+        "Created related agent \"{}\" in project \"{}\". Find it under Related work.",
+        branch_name, project.name
+    );
+    let request = AgentLaunchRequest {
+        session,
+        provider_config: provider_cfg,
+        provider_session_id: None,
+        env,
+        resume: false,
+        fork_provider_session: false,
+        pty_size: (rows, cols),
+        scrollback_lines: config.ui.agent_scrollback_lines,
+        kind: AgentLaunchKind::Create {
+            status_message,
+            repo_path: repo_path.to_string_lossy().to_string(),
+            owns_worktree: true,
+            startup_result,
+            request_id: Some(request_id),
+            focus_on_ready: false,
+            handoff_prompt,
+            project_added,
+        },
+    };
+    run_agent_launch_job(request, worker_tx);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -4388,6 +5110,8 @@ mod tests {
             desired_running: true,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
+            group_id: None,
+            parent_session_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -4415,9 +5139,183 @@ mod tests {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
+            control_socket_path: root.to_path_buf().join("dux.sock"),
             lock_path: root.join("dux.lock"),
             root: root.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn split_out_prepare_registers_an_unregistered_repo() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("other-repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "dux@example.com"]);
+        run_git(&repo, &["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        let paths = test_paths(&tmp.path().join("dux-home"));
+        let source = test_session(&tmp.path().join("source"));
+        let (tx, rx) = mpsc::channel();
+        run_split_out_prepare_job(
+            "request-1".to_string(),
+            SplitOutParams {
+                source_session_id: Some(source.id.clone()),
+                repo: Some(repo.to_string_lossy().to_string()),
+                name: Some("cross-repo-work".to_string()),
+                ..Default::default()
+            },
+            Some(source),
+            Vec::new(),
+            Config::default(),
+            paths,
+            tx,
+        );
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).expect("event");
+        let WorkerEvent::SplitOutPrepared { plan } = event else {
+            panic!("expected SplitOutPrepared, got a different event");
+        };
+        assert!(plan.project_is_new);
+        assert_eq!(plan.project.name, "other-repo");
+        assert_eq!(plan.base_branch.as_deref(), Some("main"));
+        assert_eq!(plan.name.as_deref(), Some("cross-repo-work"));
+        assert_eq!(plan.source_session_id, "session-1");
+    }
+
+    #[test]
+    fn split_out_prepare_rejects_an_existing_branch_name() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "dux@example.com"]);
+        run_git(&repo, &["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        run_git(&repo, &["branch", "taken"]);
+
+        let paths = test_paths(tmp.path());
+        let source = test_session(&tmp.path().join("source"));
+        let project = test_project(&repo);
+        let (tx, rx) = mpsc::channel();
+        run_split_out_prepare_job(
+            "request-2".to_string(),
+            SplitOutParams {
+                source_session_id: Some(source.id.clone()),
+                project: Some(project.id.clone()),
+                name: Some("taken".to_string()),
+                ..Default::default()
+            },
+            Some(source),
+            vec![project],
+            Config::default(),
+            paths,
+            tx,
+        );
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).expect("event");
+        let WorkerEvent::SplitOutFailed {
+            code,
+            message,
+            request_id,
+        } = event
+        else {
+            panic!("expected SplitOutFailed, got a different event");
+        };
+        assert_eq!(request_id, "request-2");
+        assert_eq!(code, "invalid_name");
+        assert!(message.contains("already exists"));
+    }
+
+    #[test]
+    fn split_out_create_job_creates_a_linked_session_in_a_new_worktree() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "dux@example.com"]);
+        run_git(&repo, &["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        let mut config = Config::default();
+        config.providers.commands.insert(
+            "fake".to_string(),
+            crate::config::ProviderCommandConfig {
+                command: "true".to_string(),
+                oneshot_output: crate::config::OneshotOutput::Stdout,
+                ..Default::default()
+            },
+        );
+        let paths = test_paths(&tmp.path().join("dux-home"));
+        let mut project = test_project(&repo);
+        project.default_provider = ProviderKind::from_str("fake");
+        let mut source = test_session(&tmp.path().join("source"));
+        source.project_id = project.id.clone();
+
+        let (tx, rx) = mpsc::channel();
+        run_split_out_create_job(
+            SplitOutCreateRequest {
+                request_id: "request-1".to_string(),
+                source_session_id: source.id.clone(),
+                group_id: "group-1".to_string(),
+                parent_session_id: source.id.clone(),
+                project,
+                name: "linked-work".to_string(),
+                base_branch: "main".to_string(),
+                provider: ProviderKind::from_str("fake"),
+                handoff_prompt: Some("do the work".to_string()),
+                project_added: true,
+            },
+            paths,
+            config,
+            tx,
+            (80, 24),
+        );
+
+        let mut launched = None;
+        while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+            match event {
+                WorkerEvent::AgentLaunchReady(data) => {
+                    launched = Some(data);
+                    break;
+                }
+                WorkerEvent::SplitOutFailed {
+                    request_id,
+                    code,
+                    message,
+                } => panic!("split-out failed ({request_id}/{code}): {message}"),
+                _ => {}
+            }
+        }
+        let launched = launched.expect("agent launch event");
+        let session = &launched.request.session;
+        assert_eq!(session.group_id.as_deref(), Some("group-1"));
+        assert_eq!(session.parent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(session.branch_name, "linked-work");
+        assert!(Path::new(&session.worktree_path).exists());
+        let AgentLaunchKind::Create {
+            request_id,
+            focus_on_ready,
+            handoff_prompt,
+            project_added,
+            owns_worktree,
+            ..
+        } = &launched.request.kind
+        else {
+            panic!("expected a create launch");
+        };
+        assert_eq!(request_id.as_deref(), Some("request-1"));
+        assert!(!focus_on_ready);
+        assert_eq!(handoff_prompt.as_deref(), Some("do the work"));
+        assert!(*project_added);
+        assert!(*owns_worktree);
     }
 
     #[test]
@@ -4520,7 +5418,7 @@ mod tests {
         let outcome = loop {
             match rx.recv().expect("worker event") {
                 WorkerEvent::ScratchConversionCompleted { result } => {
-                    break result.expect("conversion succeeds");
+                    break (*result).expect("conversion succeeds");
                 }
                 WorkerEvent::CreateAgentProgress(_) => continue,
                 _ => panic!("unexpected event"),
@@ -4636,7 +5534,7 @@ mod tests {
         let outcome = loop {
             match rx.recv().expect("worker event") {
                 WorkerEvent::ScratchConversionCompleted { result } => {
-                    break result.expect("conversion succeeds");
+                    break (*result).expect("conversion succeeds");
                 }
                 WorkerEvent::CreateAgentProgress(_) => continue,
                 _ => panic!("unexpected event"),
@@ -4938,6 +5836,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
+            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
             lock_path: tmp.path().join("dux.lock"),
             root: tmp.path().to_path_buf(),
         };
@@ -4970,6 +5869,8 @@ mod tests {
             desired_running: false,
             auto_reopen_enabled: true,
             status: SessionStatus::Active,
+            group_id: None,
+            parent_session_id: None,
             created_at: now,
             updated_at: now,
         };
@@ -5005,6 +5906,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
+            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
             lock_path: tmp.path().join("dux.lock"),
             root: tmp.path().to_path_buf(),
         };
@@ -5077,6 +5979,7 @@ mod tests {
             config_path: work.path().join("config.toml"),
             sessions_db_path: work.path().join("sessions.sqlite3"),
             worktrees_root: work.path().join("worktrees"),
+            control_socket_path: work.path().to_path_buf().join("dux.sock"),
             lock_path: work.path().join("dux.lock"),
             root: work.path().to_path_buf(),
         };

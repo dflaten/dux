@@ -116,6 +116,7 @@ pub enum Action {
     ChangeTheme,
     ReloadConfig,
     RecoverDeletedAgent,
+    NextRelatedAgent,
 }
 
 /// Where a binding's key combo is matched.
@@ -315,6 +316,7 @@ impl Action {
             Action::ChangeTheme => "change_theme",
             Action::ReloadConfig => "reload_config",
             Action::RecoverDeletedAgent => "recover_deleted_agent",
+            Action::NextRelatedAgent => "next_related_agent",
         }
     }
 
@@ -474,6 +476,9 @@ impl Action {
             Action::ChangeTheme => "Open a picker to switch the dux color theme.",
             Action::ReloadConfig => "Reload the configuration file.",
             Action::RecoverDeletedAgent => "Search and recover recently deleted agent sessions.",
+            Action::NextRelatedAgent => {
+                "Jump to the next agent in the selected agent's related-work group."
+            }
         }
     }
 
@@ -579,7 +584,8 @@ impl Action {
             | Action::ChangeProjectDefaultProvider
             | Action::ChangeTheme
             | Action::ReloadConfig
-            | Action::RecoverDeletedAgent => None,
+            | Action::RecoverDeletedAgent
+            | Action::NextRelatedAgent => None,
         }
     }
 }
@@ -1756,6 +1762,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "recover-deleted-agent",
             description: "Search and recover recently deleted agent sessions",
+        }),
+    },
+    BindingDef {
+        action: Action::NextRelatedAgent,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "next-related-agent",
+            description: "Jump to the next agent in the selected agent's related-work group",
         }),
     },
     BindingDef {

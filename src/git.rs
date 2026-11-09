@@ -115,6 +115,38 @@ pub fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve any path inside a repository or linked worktree to the main
+/// checkout that owns it.
+pub fn main_worktree_root(path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--show-toplevel",
+        ])
+        .output()
+        .with_context(|| format!("failed to resolve git root for {}", path.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{} is not inside a git checkout: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if toplevel.is_empty() {
+        return Err(anyhow!("{} has no git checkout root", path.display()));
+    }
+    let toplevel = PathBuf::from(toplevel);
+    let worktrees = list_worktrees(&toplevel)?;
+    let root = worktrees
+        .first()
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or(toplevel);
+    Ok(root.canonicalize().unwrap_or(root))
+}
+
 pub fn list_worktrees(repo_path: &Path) -> Result<Vec<GitWorktree>> {
     let output = Command::new("git")
         .args([
@@ -465,6 +497,9 @@ pub fn create_worktree_existing_branch(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(branch_name);
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let repo = repo_path.to_string_lossy();
     let worktree = worktree_path.to_string_lossy();
     let output = Command::new("git")
@@ -515,6 +550,9 @@ pub fn create_worktree_from_start_point(
     let project_root = worktrees_root.join(project_name);
     fs::create_dir_all(&project_root)?;
     let worktree_path = project_root.join(&branch_name);
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let repo = repo_path.to_string_lossy();
     let worktree = worktree_path.to_string_lossy();
     let mut command = Command::new("git");

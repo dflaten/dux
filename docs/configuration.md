@@ -5,6 +5,7 @@
 ## Table Of Contents
 
 - [Configuration File](#configuration-file)
+- [Agent Control](#agent-control)
 - [Themes](#themes)
 - [Keybindings](#keybindings)
 
@@ -22,6 +23,27 @@ dux config regenerate    # Preview a fresh default config
 ```
 
 Override the config directory with the `DUX_HOME` environment variable.
+
+## Agent Control
+
+dux exposes a user-only Unix socket at `<config_dir>/dux.sock` so agents running
+inside dux can request related worktrees through `dux agent split-out`.
+
+```toml
+[agent_control]
+enabled = true
+allow_unregistered_repos = true
+```
+
+- `enabled` allows agent-initiated workspace changes. Set it to `false` to reject
+  control requests.
+- `allow_unregistered_repos` lets `--repo <path>` add an unregistered git
+  checkout as a project before creating the related worktree. Set it to `false`
+  if agents should only target projects you added manually.
+
+The bundled `skills/dux-split-out/SKILL.md` teaches supported agents how to use
+the command. Dux does not install skills automatically; copy the file into your
+agent's global skill directory.
 
 ## Themes
 

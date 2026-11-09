@@ -64,6 +64,7 @@ ansi_darkgray = "#808080"
 # ── Project & session indicators ─────────────────────────────────────
 "dux.project_icon"         = "#6495ed"
 "dux.project_missing_fg"   = "#b4a050"
+"dux.related_link_fg"      = "#78aadc"
 "dux.session_active"       = "#d2d2d2"
 "dux.session_detached"     = "ansi_yellow"
 "dux.session_exited"       = "#646464"
