@@ -66,10 +66,9 @@ pub enum ControlCommand {
 pub struct SplitOutParams {
     /// Defaults to the `DUX_SESSION_ID` inherited from the dux-launched agent.
     pub source_session_id: Option<String>,
-    /// Target git checkout. Mutually exclusive with `project`, though `project`
-    /// wins when both are supplied and agree.
+    /// Target git checkout. Ignored when `project` is also supplied.
     pub repo: Option<String>,
-    /// Registered project id or name.
+    /// Registered project id or name. Takes precedence over `repo`.
     pub project: Option<String>,
     /// Branch and worktree name. Generated when omitted.
     pub name: Option<String>,
@@ -302,8 +301,16 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
 }
 
 fn handle_connection(stream: UnixStream, tx: Sender<IncomingControlRequest>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    if let Err(err) = prepare_connection(&stream) {
+        let _ = write_response(
+            stream,
+            &ControlResponse::error(
+                "io_error",
+                format!("failed to configure the control connection: {err}"),
+            ),
+        );
+        return;
+    }
 
     let request = match read_request(&stream) {
         Ok(request) => request,
@@ -365,6 +372,20 @@ fn handle_connection(stream: UnixStream, tx: Sender<IncomingControlRequest>) {
             );
         }
     }
+}
+
+/// Put an accepted connection into blocking mode with bounded I/O timeouts.
+///
+/// The listener is nonblocking so the accept loop can poll for shutdown. On
+/// Linux the accepted socket starts blocking, but BSD-derived systems
+/// (including macOS) inherit `O_NONBLOCK` from the listener. Without resetting
+/// it, the first read can return `WouldBlock` before the client's request
+/// arrives, and timeout configuration is not enough to fix that.
+fn prepare_connection(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    Ok(())
 }
 
 fn read_request(stream: &UnixStream) -> Result<ControlRequest> {
@@ -580,6 +601,28 @@ mod tests {
         let (server, _rx) = test_server(dir.path());
         let mode = fs::metadata(server.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn prepared_connections_block_until_the_client_sends_data() {
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        // Simulate BSD/macOS accept(), which inherits O_NONBLOCK from the
+        // nonblocking listener.
+        server.set_nonblocking(true).expect("set nonblocking");
+        prepare_connection(&server).expect("prepare connection");
+
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            (&client)
+                .write_all(b"{\"protocol\":1}\n")
+                .expect("client write");
+        });
+
+        let mut reader = BufReader::new(server);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("blocking read");
+        assert_eq!(line, "{\"protocol\":1}\n");
+        writer.join().expect("writer thread");
     }
 
     #[test]

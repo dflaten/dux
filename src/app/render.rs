@@ -623,8 +623,10 @@ impl App {
                                 Style::default().fg(self.theme.project_missing_fg),
                             )))
                         } else {
-                            let has_sessions =
-                                self.sessions.iter().any(|s| s.project_id == project.id);
+                            let has_sessions = self.sessions.iter().any(|s| {
+                                s.project_id == project.id
+                                    && related_group_index(&self.groups, s).is_none()
+                            });
                             let icon =
                                 if !has_sessions || self.collapsed_projects.contains(&project.id) {
                                     "▸"
@@ -730,11 +732,7 @@ impl App {
             }
             counts
         } else {
-            let mut counts = HashMap::new();
-            for session in &self.sessions {
-                *counts.entry(session.project_id.clone()).or_insert(0) += 1;
-            }
-            counts
+            project_visible_session_counts(&self.sessions, &self.groups)
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;
         let related_counts: HashMap<String, usize> = self

@@ -28,10 +28,7 @@ use anyhow::Result;
 fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
-    if matches!(
-        args.first().map(|arg| arg.as_str()),
-        None | Some("--help") | Some("-h")
-    ) {
+    if wants_top_level_help(&args) {
         print_help();
         return Ok(());
     }
@@ -88,6 +85,16 @@ fn main() -> Result<()> {
     app.run()
 }
 
+/// Only the help flags as the first argument print top-level help. Running
+/// `dux` with no arguments must launch the TUI, and subcommands such as
+/// `dux agent --help` and `dux config diff --help` handle their own help.
+fn wants_top_level_help(args: &[String]) -> bool {
+    matches!(
+        args.first().map(|arg| arg.as_str()),
+        Some("--help") | Some("-h")
+    )
+}
+
 fn print_help() {
     println!(
         "dux\n\n\
@@ -132,5 +139,35 @@ fn acquire_lock_or_exit(path: &Path) -> lockfile::SingleInstanceLock {
             eprintln!("{err}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_arguments_launches_the_tui_instead_of_printing_help() {
+        assert!(!wants_top_level_help(&[]));
+    }
+
+    #[test]
+    fn help_flags_as_the_first_argument_print_top_level_help() {
+        assert!(wants_top_level_help(&["--help".to_string()]));
+        assert!(wants_top_level_help(&["-h".to_string()]));
+    }
+
+    #[test]
+    fn help_flags_after_a_subcommand_are_left_to_the_subcommand() {
+        assert!(!wants_top_level_help(&[
+            "config".to_string(),
+            "diff".to_string(),
+            "--help".to_string(),
+        ]));
+        assert!(!wants_top_level_help(&[
+            "agent".to_string(),
+            "split-out".to_string(),
+            "--help".to_string(),
+        ]));
     }
 }

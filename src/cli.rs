@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,6 +16,10 @@ use crate::storage::SessionStore;
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_config_help();
+        return Ok(());
+    }
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "reset" => {
@@ -88,7 +93,7 @@ fn run_reset(paths: &DuxPaths, all: bool) -> Result<()> {
 
     remove_file_with_message(&log_path)?;
     prune_empty_ancestors(&log_path, &paths.root)?;
-    let _ = remove_file_with_message(&paths.control_socket_path);
+    remove_socket_with_message(&paths.control_socket_path)?;
     remove_file_with_message(&paths.config_path)?;
     prune_empty_ancestors(&paths.config_path, &paths.root)?;
 
@@ -162,6 +167,20 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         "defaults.commit_prompt",
         defaults.defaults.commit_prompt.as_deref(),
         current.defaults.commit_prompt.as_deref(),
+    );
+
+    // [agent_control]
+    diff_bool(
+        &mut changes,
+        "agent_control.enabled",
+        defaults.agent_control.enabled,
+        current.agent_control.enabled,
+    );
+    diff_bool(
+        &mut changes,
+        "agent_control.allow_unregistered_repos",
+        defaults.agent_control.allow_unregistered_repos,
+        current.agent_control.allow_unregistered_repos,
     );
 
     // [logging]
@@ -869,6 +888,17 @@ fn remove_file_with_message(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove the agent control socket if it still exists. `DUX_SOCKET` may point
+/// anywhere, so never delete a regular file that happens to live at that path.
+fn remove_socket_with_message(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => remove_file_with_message(path),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
 fn remove_dir_with_message(path: &Path) -> Result<()> {
     if remove_dir_if_present(path)? {
         println!("removed {}", path.display());
@@ -1071,6 +1101,39 @@ mod tests {
         };
         let result = run(&["path".to_string()], &paths);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn config_help_flag_works_after_a_subcommand() {
+        let harness = ResetHarness::new();
+        let result = run(&["diff".to_string(), "--help".to_string()], &harness.paths);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reset_keeps_regular_files_at_the_control_socket_path() {
+        let harness = ResetHarness::new();
+        fs::write(&harness.paths.control_socket_path, "keep me").expect("regular file");
+
+        run_reset(&harness.paths, false).expect("reset");
+
+        assert_eq!(
+            fs::read_to_string(&harness.paths.control_socket_path).expect("file survives"),
+            "keep me"
+        );
+    }
+
+    #[test]
+    fn reset_removes_a_stale_control_socket() {
+        let harness = ResetHarness::new();
+        let listener = std::os::unix::net::UnixListener::bind(&harness.paths.control_socket_path)
+            .expect("bind socket");
+        drop(listener);
+        assert!(harness.paths.control_socket_path.exists());
+
+        run_reset(&harness.paths, false).expect("reset");
+
+        assert!(!harness.paths.control_socket_path.exists());
     }
 
     struct ResetHarness {

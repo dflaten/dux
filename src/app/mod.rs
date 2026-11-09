@@ -1725,6 +1725,23 @@ pub(crate) fn related_group_indices(
     indices
 }
 
+/// Per-project session counts for rows rendered under the project tree.
+/// Related members live in the Related work section, so they must not make a
+/// project look expanded or inflate its agent count.
+pub(crate) fn project_visible_session_counts(
+    sessions: &[AgentSession],
+    groups: &[AgentGroup],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for session in sessions {
+        if related_group_index(groups, session).is_some() {
+            continue;
+        }
+        *counts.entry(session.project_id.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
 pub(crate) fn related_group_label_for(sessions: &[AgentSession], group: &AgentGroup) -> String {
     if let Some(origin_id) = group.origin_session_id.as_deref()
         && let Some(origin) = sessions.iter().find(|session| session.id == origin_id)
@@ -3311,8 +3328,10 @@ impl App {
         let Some(project_id) = self.selected_project().map(|project| project.id.clone()) else {
             return;
         };
-        let has_sessions = self.sessions.iter().any(|s| s.project_id == project_id);
-        if !has_sessions {
+        let has_visible_sessions = self.sessions.iter().any(|session| {
+            session.project_id == project_id && related_group_index(&self.groups, session).is_none()
+        });
+        if !has_visible_sessions {
             return;
         }
         if self.collapsed_projects.contains(&project_id) {
@@ -4657,6 +4676,24 @@ mod tests {
         );
         assert!(collapsed.contains(&LeftItem::RelatedHeader));
         assert!(!collapsed.contains(&LeftItem::RelatedGroupLabel(0)));
+    }
+
+    #[test]
+    fn project_visible_session_counts_exclude_related_members() {
+        let mut sessions = vec![
+            test_session("origin", "alpha", 0),
+            test_session("plain", "alpha", -1),
+            test_session("child", "beta", -2),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[2].group_id = Some(group.id.clone());
+        sessions[2].parent_session_id = Some("origin".to_string());
+
+        let counts = project_visible_session_counts(&sessions, std::slice::from_ref(&group));
+        assert_eq!(counts.get("alpha"), Some(&2));
+        assert_eq!(counts.get("beta"), None);
     }
 
     #[test]

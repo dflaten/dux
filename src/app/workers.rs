@@ -1524,7 +1524,11 @@ impl App {
                 if !payload.ends_with(b"\r") {
                     payload.push(b'\r');
                 }
-                provider.write_bytes_delayed(payload, Duration::from_millis(250));
+                provider.write_bytes_after_first_output(
+                    payload,
+                    Duration::from_secs(10),
+                    Duration::from_millis(150),
+                );
             }
 
             let startup_error = startup_result
@@ -1541,12 +1545,8 @@ impl App {
                     .find(|project| project.id == session.project_id)
                     .cloned()
                     .unwrap_or_else(|| scrub_project_for_response(&session));
-                let mut response = self.control_response_for_session(
-                    &request_id,
-                    &session,
-                    &project,
-                    project_added,
-                );
+                let mut response =
+                    self.control_response_for_session(&session, &project, project_added);
                 if let Some(err) = startup_error.as_deref() {
                     response.status = Some("launched_with_startup_warning".to_string());
                     response.message = Some(format!(

@@ -224,6 +224,7 @@ impl App {
         );
         self.set_busy(busy.clone());
         self.split_out_create_started = true;
+        let request_id = plan.request_id.clone();
         let request = CreateAgentRequest::SplitOut {
             request_id: plan.request_id,
             source_session_id: source_session.id.clone(),
@@ -237,10 +238,11 @@ impl App {
             project_added: plan.project_is_new,
         };
         if let Err(err) = self.dispatch_create_agent_request(request, busy) {
-            self.split_out_in_flight = false;
-            self.set_error(format!(
-                "Could not start related worktree creation: {err:#}"
-            ));
+            self.fail_split_out(
+                &request_id,
+                "dispatch_failed",
+                format!("Could not start related worktree creation: {err:#}"),
+            );
         }
     }
 
@@ -341,7 +343,6 @@ impl App {
 
     pub(crate) fn control_response_for_session(
         &self,
-        request_id: &str,
         session: &AgentSession,
         project: &Project,
         project_added: bool,
@@ -363,7 +364,6 @@ impl App {
         response.worktree = Some(session.worktree_path.clone());
         response.provider = Some(session.provider.as_str().to_string());
         response.status = Some("launched".to_string());
-        let _ = request_id;
         response
     }
 

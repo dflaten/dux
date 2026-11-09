@@ -1,5 +1,5 @@
 ---
-name: Dux Split Out
+name: dux-split-out
 description: Create a related worktree in another dux project when the work you are doing requires changes in a different repository.
 ---
 
@@ -49,9 +49,11 @@ PROMPT
   copied. If the other repository has local work that matters, ask the user to
   commit it or choose the appropriate base branch first.
 - The child agent is launched automatically and receives the handoff prompt.
-  Dux flattens newlines to spaces before typing it into the child terminal, so
-  write the prompt as one continuous instruction. This agent should not wait for
-  it or edit the child worktree.
+  Dux flattens newlines to spaces before typing it into the child terminal once
+  the child starts producing output, so write the prompt as one continuous
+  instruction. A provider's first-run trust or onboarding prompt can consume the
+  typed text; if the child does not start the work, open it and send the prompt
+  again. This agent should not wait for the child or edit its worktree.
 - Use `--name` for deterministic retries. If you are unsure whether a previous
   request succeeded after a timeout, run `dux agent related --json` before
   retrying so you do not create duplicate worktrees.
