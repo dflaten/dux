@@ -642,6 +642,12 @@ impl App {
                     }
                     LeftItem::Session(index) => {
                         let session = &self.sessions[*index];
+                        if self.session_is_related_origin(session) {
+                            return ListItem::new(Line::from(Span::styled(
+                                "⇄",
+                                Style::default().fg(self.theme.related_link_fg),
+                            )));
+                        }
                         let (dot, dot_color) = self.theme.session_dot(&session.status);
                         let is_last = !collapsed_left_items
                             .get(i + 1)
@@ -727,6 +733,8 @@ impl App {
             for item in left_items {
                 if let LeftItem::Session(index) = item
                     && let Some(session) = self.sessions.get(*index)
+                    && !self.session_is_related_member(session)
+                    && !self.session_is_related_origin(session)
                 {
                     *counts.entry(session.project_id.clone()).or_insert(0) += 1;
                 }
@@ -739,7 +747,9 @@ impl App {
         let related_counts: HashMap<String, usize> = self
             .sessions
             .iter()
-            .filter(|session| self.session_is_related_member(session))
+            .filter(|session| {
+                self.session_is_related_member(session) || self.session_is_related_origin(session)
+            })
             .fold(HashMap::new(), |mut counts, session| {
                 *counts.entry(session.project_id.clone()).or_insert(0) += 1;
                 counts
@@ -897,15 +907,25 @@ impl App {
                         format!(" ({})", session.provider.as_str())
                     };
                     let is_related = self.session_is_related_member(session);
-                    let mut spans = vec![Span::styled(
-                        connector,
-                        Style::default().fg(self.theme.project_icon),
-                    )];
-                    if is_related {
-                        spans.push(Span::styled(
-                            "↳ ",
+                    let is_related_origin = self.session_is_related_origin(session);
+                    let mut spans = if is_related_origin {
+                        vec![Span::styled(
+                            "  ⇄ ",
                             Style::default().fg(self.theme.related_link_fg),
-                        ));
+                        )]
+                    } else {
+                        vec![Span::styled(
+                            connector,
+                            Style::default().fg(self.theme.project_icon),
+                        )]
+                    };
+                    if is_related || is_related_origin {
+                        if is_related {
+                            spans.push(Span::styled(
+                                "↳ ",
+                                Style::default().fg(self.theme.related_link_fg),
+                            ));
+                        }
                         let project_name = self
                             .projects
                             .iter()
@@ -960,13 +980,16 @@ impl App {
                 LeftItem::RelatedSeparator => ListItem::new(left_section_separator_line(
                     projects_inner_width,
                     &self.theme,
-                    "Related work",
+                    "Multi-repo work",
                 )),
                 LeftItem::RelatedHeader => {
                     let count = self
                         .sessions
                         .iter()
-                        .filter(|session| self.session_is_related_member(session))
+                        .filter(|session| {
+                            self.session_is_related_member(session)
+                                || self.session_is_related_origin(session)
+                        })
                         .count();
                     let icon = if self.related_collapsed {
                         "▸ "
@@ -976,7 +999,7 @@ impl App {
                     let mut spans = vec![
                         Span::styled(icon, Style::default().fg(self.theme.related_link_fg)),
                         Span::styled(
-                            "Related work",
+                            "Multi-repo work",
                             Style::default()
                                 .fg(self.theme.related_link_fg)
                                 .add_modifier(Modifier::BOLD),
@@ -8851,8 +8874,8 @@ mod tests {
             "────────── Scratch ───────────"
         );
         assert_eq!(
-            line_text(&left_section_separator_line(30, &theme, "Related work")),
-            "──────── Related work ────────"
+            line_text(&left_section_separator_line(30, &theme, "Multi-repo work")),
+            "────── Multi-repo work ───────"
         );
     }
 

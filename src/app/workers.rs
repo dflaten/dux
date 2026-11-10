@@ -4982,7 +4982,7 @@ pub(crate) fn run_split_out_create_job(
     )));
     let (cols, rows) = term_size;
     let status_message = format!(
-        "Created related agent \"{}\" in project \"{}\". Find it under Related work.",
+        "Created related agent \"{}\" in project \"{}\". Find it under Multi-repo work.",
         branch_name, project.name
     );
     let request = AgentLaunchRequest {

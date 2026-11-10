@@ -1594,7 +1594,7 @@ pub(crate) enum LeftSelectionTarget {
     Project(String),
     /// An agent session, identified by its session id.
     Session(String),
-    /// The collapsible Related work section header.
+    /// The collapsible Multi-repo work section header.
     Related,
     /// The built-in scratch workspace header.
     Scratch,
@@ -1614,6 +1614,8 @@ pub(crate) fn build_left_items(
         .count();
     let split_empty_projects = empty_project_separator_min_projects > 0
         && project_count >= usize::from(empty_project_separator_min_projects);
+    let related_groups = related_group_indices(groups, sessions);
+    let related_group_ids = related_section_group_ids(groups, &related_groups);
     let mut items = Vec::new();
     let mut empty_projects = Vec::new();
 
@@ -1621,9 +1623,10 @@ pub(crate) fn build_left_items(
         if project.is_scratch() {
             continue;
         }
-        let has_sessions = sessions
-            .iter()
-            .any(|session| session.project_id == project.id);
+        let has_sessions = sessions.iter().any(|session| {
+            session.project_id == project.id
+                && !session_in_related_section(session, &related_group_ids)
+        });
         if split_empty_projects && !has_sessions {
             empty_projects.push(project_index);
             continue;
@@ -1633,7 +1636,7 @@ pub(crate) fn build_left_items(
             project_index,
             project,
             sessions,
-            groups,
+            &related_group_ids,
             collapsed_projects,
         );
     }
@@ -1648,7 +1651,7 @@ pub(crate) fn build_left_items(
                 project_index,
                 project,
                 sessions,
-                groups,
+                &related_group_ids,
                 collapsed_projects,
             );
         }
@@ -1660,13 +1663,12 @@ pub(crate) fn build_left_items(
                 project_index,
                 project,
                 sessions,
-                groups,
+                &related_group_ids,
                 collapsed_projects,
             );
         }
     }
 
-    let related_groups = related_group_indices(groups, sessions);
     if !related_groups.is_empty() {
         if !items.is_empty() {
             items.push(LeftItem::RelatedSeparator);
@@ -1674,10 +1676,15 @@ pub(crate) fn build_left_items(
         items.push(LeftItem::RelatedHeader);
         if !related_collapsed {
             for group_index in related_groups {
-                items.push(LeftItem::RelatedGroupLabel(group_index));
+                let group = &groups[group_index];
+                let origin_index = related_origin_session_index(sessions, group);
+                match origin_index {
+                    Some(index) => items.push(LeftItem::Session(index)),
+                    None => items.push(LeftItem::RelatedGroupLabel(group_index)),
+                }
                 for (session_index, session) in sessions.iter().enumerate() {
-                    if session.group_id.as_deref() == Some(groups[group_index].id.as_str())
-                        && session.parent_session_id.is_some()
+                    if session.group_id.as_deref() == Some(group.id.as_str())
+                        && Some(session_index) != origin_index
                     {
                         items.push(LeftItem::Session(session_index));
                     }
@@ -1694,7 +1701,8 @@ pub(crate) fn build_left_items(
         items.push(LeftItem::ScratchHeader);
         if !collapsed_projects.contains(SCRATCH_PROJECT_ID) {
             for (session_index, session) in sessions.iter().enumerate() {
-                if session.is_scratch() && related_group_index(groups, session).is_none() {
+                if session.is_scratch() && !session_in_related_section(session, &related_group_ids)
+                {
                     items.push(LeftItem::Session(session_index));
                 }
             }
@@ -1725,16 +1733,61 @@ pub(crate) fn related_group_indices(
     indices
 }
 
+/// The ids of groups that currently have at least one split-out child and
+/// therefore render under the Multi-repo work section.
+pub(crate) fn related_section_group_ids<'a>(
+    groups: &'a [AgentGroup],
+    related_groups: &[usize],
+) -> HashSet<&'a str> {
+    related_groups
+        .iter()
+        .filter_map(|index| groups.get(*index).map(|group| group.id.as_str()))
+        .collect()
+}
+
+/// Whether a session is displayed under Multi-repo work instead of its
+/// project tree.
+pub(crate) fn session_in_related_section(
+    session: &AgentSession,
+    group_ids: &HashSet<&str>,
+) -> bool {
+    session
+        .group_id
+        .as_deref()
+        .is_some_and(|group_id| group_ids.contains(group_id))
+}
+
+/// The session that anchors a related group, if it still exists in that group.
+pub(crate) fn related_origin_session_index(
+    sessions: &[AgentSession],
+    group: &AgentGroup,
+) -> Option<usize> {
+    if let Some(origin_id) = group.origin_session_id.as_deref()
+        && let Some(index) = sessions.iter().position(|session| session.id == origin_id)
+        && sessions[index].group_id.as_deref() == Some(group.id.as_str())
+        && sessions[index].parent_session_id.is_none()
+    {
+        return Some(index);
+    }
+    sessions.iter().position(|session| {
+        session.group_id.as_deref() == Some(group.id.as_str())
+            && session.parent_session_id.is_none()
+    })
+}
+
 /// Per-project session counts for rows rendered under the project tree.
-/// Related members live in the Related work section, so they must not make a
-/// project look expanded or inflate its agent count.
+/// Multi-repo work sessions (origins and split-out children) live in their own
+/// section, so they must not make a project look expanded or inflate its agent
+/// count.
 pub(crate) fn project_visible_session_counts(
     sessions: &[AgentSession],
     groups: &[AgentGroup],
 ) -> HashMap<String, usize> {
+    let related_groups = related_group_indices(groups, sessions);
+    let related_group_ids = related_section_group_ids(groups, &related_groups);
     let mut counts = HashMap::new();
     for session in sessions {
-        if related_group_index(groups, session).is_some() {
+        if session_in_related_section(session, &related_group_ids) {
             continue;
         }
         *counts.entry(session.project_id.clone()).or_insert(0) += 1;
@@ -1753,7 +1806,7 @@ pub(crate) fn related_group_label_for(sessions: &[AgentSession], group: &AgentGr
             .unwrap_or_else(|| origin.branch_name.clone());
     }
     if group.label.trim().is_empty() {
-        "Related work".to_string()
+        "Multi-repo work".to_string()
     } else {
         group.label.clone()
     }
@@ -1764,7 +1817,7 @@ fn push_project_left_items(
     project_index: usize,
     project: &Project,
     sessions: &[AgentSession],
-    groups: &[AgentGroup],
+    related_group_ids: &HashSet<&str>,
     collapsed_projects: &HashSet<String>,
 ) {
     items.push(LeftItem::Project(project_index));
@@ -1772,7 +1825,9 @@ fn push_project_left_items(
         return;
     }
     for (session_index, session) in sessions.iter().enumerate() {
-        if session.project_id == project.id && related_group_index(groups, session).is_none() {
+        if session.project_id == project.id
+            && !session_in_related_section(session, related_group_ids)
+        {
             items.push(LeftItem::Session(session_index));
         }
     }
@@ -4656,7 +4711,7 @@ mod tests {
     }
 
     #[test]
-    fn build_left_items_shows_related_members_below_projects() {
+    fn build_left_items_moves_the_origin_into_multi_repo_work() {
         let projects = vec![test_project("alpha"), test_project("beta")];
         let mut sessions = vec![
             test_session("origin", "alpha", 0),
@@ -4676,13 +4731,22 @@ mod tests {
             false,
             5,
         );
-        assert!(items.contains(&LeftItem::RelatedHeader));
-        assert!(items.contains(&LeftItem::RelatedGroupLabel(0)));
-        // The origin stays in its project tree, the child is only in Related work.
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::Project(1),
+                LeftItem::RelatedSeparator,
+                LeftItem::RelatedHeader,
+                LeftItem::Session(0),
+                LeftItem::Session(1),
+            ]
+        );
+        // The origin is only in Multi-repo work, never in its project tree.
         assert_eq!(
             items
                 .iter()
-                .filter(|item| **item == LeftItem::Session(1))
+                .filter(|item| **item == LeftItem::Session(0))
                 .count(),
             1
         );
@@ -4695,12 +4759,68 @@ mod tests {
             true,
             5,
         );
-        assert!(collapsed.contains(&LeftItem::RelatedHeader));
-        assert!(!collapsed.contains(&LeftItem::RelatedGroupLabel(0)));
+        assert_eq!(
+            collapsed,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::Project(1),
+                LeftItem::RelatedSeparator,
+                LeftItem::RelatedHeader,
+            ]
+        );
     }
 
     #[test]
-    fn project_visible_session_counts_exclude_related_members() {
+    fn origin_stays_in_its_project_until_the_group_has_a_child() {
+        let projects = vec![test_project("alpha"), test_project("beta")];
+        let mut sessions = vec![test_session("origin", "alpha", 0)];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+
+        let items = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::Session(0),
+                LeftItem::Project(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn related_group_without_an_origin_uses_its_fallback_label() {
+        let projects = vec![test_project("alpha"), test_project("beta")];
+        let mut sessions = vec![test_session("child", "beta", 0)];
+        sessions[0].group_id = Some("group-1".to_string());
+        sessions[0].parent_session_id = Some("deleted-origin".to_string());
+        let mut group = AgentGroup::new("gone".to_string(), Some("deleted-origin".to_string()));
+        group.id = "group-1".to_string();
+
+        let items = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+        );
+
+        assert!(items.contains(&LeftItem::RelatedGroupLabel(0)));
+        assert!(items.contains(&LeftItem::Session(0)));
+    }
+
+    #[test]
+    fn project_visible_session_counts_exclude_multi_repo_work() {
         let mut sessions = vec![
             test_session("origin", "alpha", 0),
             test_session("plain", "alpha", -1),
@@ -4713,8 +4833,58 @@ mod tests {
         sessions[2].parent_session_id = Some("origin".to_string());
 
         let counts = project_visible_session_counts(&sessions, std::slice::from_ref(&group));
-        assert_eq!(counts.get("alpha"), Some(&2));
+        assert_eq!(counts.get("alpha"), Some(&1));
         assert_eq!(counts.get("beta"), None);
+    }
+
+    #[test]
+    fn origin_only_project_is_grouped_with_empty_projects() {
+        let projects = (0..5)
+            .map(|index| test_project(&format!("project-{index}")))
+            .collect::<Vec<_>>();
+        let mut sessions = vec![
+            test_session("origin", "project-0", 0),
+            test_session("child", "project-4", -1),
+            test_session("plain-1", "project-1", -2),
+            test_session("plain-2", "project-2", -3),
+            test_session("plain-3", "project-3", -4),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[1].group_id = Some(group.id.clone());
+        sessions[1].parent_session_id = Some("origin".to_string());
+
+        let items = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            false,
+            5,
+        );
+
+        let separator = items
+            .iter()
+            .position(|item| matches!(item, LeftItem::EmptyProjectsSeparator))
+            .expect("empty project separator");
+        let origin_project = items
+            .iter()
+            .position(|item| matches!(item, LeftItem::Project(0)))
+            .expect("origin project");
+        let child_project = items
+            .iter()
+            .position(|item| matches!(item, LeftItem::Project(4)))
+            .expect("child project");
+        let related_header = items
+            .iter()
+            .position(|item| matches!(item, LeftItem::RelatedHeader))
+            .expect("multi-repo header");
+        assert!(separator < origin_project);
+        assert!(separator < child_project);
+        assert!(origin_project < related_header);
+        assert!(child_project < related_header);
+        assert!(related_header < items.len() - 1);
     }
 
     #[test]

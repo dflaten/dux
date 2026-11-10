@@ -12,7 +12,7 @@
 - [Git Integration](#git-integration)
 - [Companion Terminals](#companion-terminals)
 - [Forking Sessions](#forking-sessions)
-- [Related Worktrees](#related-worktrees)
+- [Multi-Repo Worktrees](#multi-repo-worktrees)
 - [Command Palette](#command-palette)
 - [Logging](#logging)
 
@@ -148,18 +148,20 @@ When an agent prints a command or script you want to run, select the text in the
 
 See an agent going down the wrong path? Fork it. dux creates a new worktree with the current files copied over so you can try a different approach without losing the original session. It's branching, but for your AI conversations.
 
-## Related Worktrees
+## Multi-Repo Worktrees
 
 When work in one repository requires changes in another, an agent can ask dux to
-split that work into a separate worktree. The new agent appears in the **Related
-work** section of the sidebar, linked to the agent that requested it, while still
-living under its own project. Use `dux agent split-out --help` for the command,
-or install the bundled `skills/dux-split-out/SKILL.md` skill so supported agents
-know when and how to use it.
+split that work into a separate worktree. The origin agent and its new split-out
+children appear together in the **Multi-repo work** section of the sidebar. The
+origin agent is removed from its project tree while its project header stays in
+place, and the origin becomes the selectable heading for the group. Use
+`dux agent split-out --help` for the command, or install the bundled
+`skills/dux-split-out/SKILL.md` skill so supported agents know when and how to
+use it.
 
-Related worktrees are independent sessions. Selecting one from **Related work**
-or using the `next-related-agent` command switches between members of the same
-group without moving them out of their projects.
+Multi-repo worktrees are still independent sessions. Selecting the origin from
+**Multi-repo work**, or using the `next-related-agent` command, switches between
+members of the same group.
 
 ## Command Palette
 
