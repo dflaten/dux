@@ -10,7 +10,7 @@ repository and the user wants that work managed as an independent dux agent.
 
 Dux owns worktrees and agent sessions. Do not run `git worktree add` yourself for
 this. Ask the running dux instance to create the related worktree so it appears
-in the sidebar under **Related work** and stays linked to this agent.
+in the sidebar under **Multi-repo work** and stays linked to this agent.
 
 ## Workflow
 

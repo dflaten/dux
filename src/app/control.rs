@@ -352,7 +352,7 @@ impl App {
             .as_deref()
             .and_then(|id| self.groups.iter().find(|group| group.id == id));
         let mut response = ControlResponse::success().with_message(format!(
-            "Created related agent \"{}\" in project \"{}\". It is linked under Related work.",
+            "Created related agent \"{}\" in project \"{}\". It is linked under Multi-repo work.",
             session.branch_name, project.name
         ));
         response.session_id = Some(session.id.clone());
@@ -427,6 +427,18 @@ impl App {
 
     pub(crate) fn session_is_related_member(&self, session: &AgentSession) -> bool {
         session.parent_session_id.is_some() && self.group_for_session(session).is_some()
+    }
+
+    /// Whether the session is the origin agent of a group that has split-out
+    /// children and therefore renders under Multi-repo work.
+    pub(crate) fn session_is_related_origin(&self, session: &AgentSession) -> bool {
+        session.parent_session_id.is_none()
+            && self.group_for_session(session).is_some_and(|group| {
+                self.sessions.iter().any(|candidate| {
+                    candidate.group_id.as_deref() == Some(group.id.as_str())
+                        && candidate.parent_session_id.is_some()
+                })
+            })
     }
 
     pub(crate) fn group_for_session(&self, session: &AgentSession) -> Option<&AgentGroup> {

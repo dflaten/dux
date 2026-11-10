@@ -53,7 +53,7 @@ pub struct Theme {
     pub selection_bg: Color,
     pub project_icon: Color,
     pub project_missing_fg: Color,
-    /// Accent used for the Related work section, group labels, and link badges.
+    /// Accent used for the Multi-repo work section, group labels, and link badges.
     pub related_link_fg: Color,
     pub session_active: Color,
     pub session_detached: Color,

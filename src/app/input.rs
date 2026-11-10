@@ -6800,10 +6800,18 @@ impl App {
             Some(LeftItem::RelatedHeader) => {
                 self.toggle_collapse_selected_project();
                 if !self.related_collapsed
+                    && let Some(header_index) = self
+                        .left_items()
+                        .iter()
+                        .position(|item| matches!(item, LeftItem::RelatedHeader))
                     && let Some(pos) = self
                         .left_items()
                         .iter()
-                        .position(|item| matches!(item, LeftItem::Session(si) if self.session_is_related_member(&self.sessions[*si])))
+                        .enumerate()
+                        .skip(header_index + 1)
+                        .find_map(|(index, item)| {
+                            matches!(item, LeftItem::Session(_)).then_some(index)
+                        })
                 {
                     self.selected_left = pos;
                 }

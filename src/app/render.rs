@@ -277,6 +277,74 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16, trim: bool) -> u16 {
     total
 }
 
+/// Icon shown for a project row while the sidebar is in collapsed mode.
+fn collapsed_project_icon(has_visible_sessions: bool, collapsed: bool) -> &'static str {
+    if !has_visible_sessions || collapsed {
+        "▸"
+    } else {
+        "▾"
+    }
+}
+
+/// Whether two consecutive session rows belong to the same visual group.
+///
+/// Sessions in the Multi-repo work section are grouped by their group id;
+/// sessions in the project tree are grouped by their project id. Rows from
+/// different containers end the current connector run.
+fn session_rows_share_container(
+    current: &AgentSession,
+    next: &AgentSession,
+    related_group_ids: &HashSet<&str>,
+) -> bool {
+    let current_related = session_in_related_section(current, related_group_ids);
+    let next_related = session_in_related_section(next, related_group_ids);
+    match (current_related, next_related) {
+        (true, true) => current.group_id.is_some() && current.group_id == next.group_id,
+        (false, false) => current.project_id == next.project_id,
+        _ => false,
+    }
+}
+
+/// Whether the session row at `item_index` is the last row of its connector run.
+fn session_row_is_last(
+    items: &[LeftItem],
+    item_index: usize,
+    current: &AgentSession,
+    sessions: &[AgentSession],
+    related_group_ids: &HashSet<&str>,
+) -> bool {
+    let Some(LeftItem::Session(next_index)) = items.get(item_index + 1) else {
+        return true;
+    };
+    let Some(next) = sessions.get(*next_index) else {
+        return true;
+    };
+    !session_rows_share_container(current, next, related_group_ids)
+}
+
+/// The trailing `⇄ N` badge for a plain project-tree session row.
+///
+/// Origins and split-out members are rendered inside the Multi-repo work
+/// section, so they never carry this badge; it only belongs on a session that
+/// is still shown under its project header.
+fn project_tree_related_badge_count(
+    session: &AgentSession,
+    sessions: &[AgentSession],
+    related_group_ids: &HashSet<&str>,
+) -> Option<usize> {
+    if session_in_related_section(session, related_group_ids) {
+        return None;
+    }
+    let group_id = session.group_id.as_deref()?;
+    let count = sessions
+        .iter()
+        .filter(|candidate| {
+            candidate.group_id.as_deref() == Some(group_id) && candidate.parent_session_id.is_some()
+        })
+        .count();
+    (count > 0).then_some(count)
+}
+
 fn left_section_separator_line(width: u16, theme: &Theme, label: &str) -> Line<'static> {
     let padded_label = format!(" {label} ");
 
@@ -608,6 +676,8 @@ impl App {
 
     fn render_left(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == FocusPane::Left;
+        let related_groups = related_group_indices(&self.groups, &self.sessions);
+        let related_group_ids = related_section_group_ids(&self.groups, &related_groups);
 
         if self.left_collapsed {
             self.mouse_layout.left_list = self.themed_block("", focused).inner(area);
@@ -624,16 +694,15 @@ impl App {
                                 Style::default().fg(self.theme.project_missing_fg),
                             )))
                         } else {
-                            let has_sessions = self.sessions.iter().any(|s| {
-                                s.project_id == project.id
-                                    && related_group_index(&self.groups, s).is_none()
-                            });
-                            let icon =
-                                if !has_sessions || self.collapsed_projects.contains(&project.id) {
-                                    "▸"
-                                } else {
-                                    "▾"
-                                };
+                            let has_sessions = project_has_visible_sessions(
+                                &self.sessions,
+                                &project.id,
+                                &related_group_ids,
+                            );
+                            let icon = collapsed_project_icon(
+                                has_sessions,
+                                self.collapsed_projects.contains(&project.id),
+                            );
                             ListItem::new(Line::from(Span::styled(
                                 icon,
                                 Style::default().fg(self.theme.project_icon),
@@ -642,10 +711,20 @@ impl App {
                     }
                     LeftItem::Session(index) => {
                         let session = &self.sessions[*index];
+                        if self.session_is_related_origin(session) {
+                            return ListItem::new(Line::from(Span::styled(
+                                "⇄",
+                                Style::default().fg(self.theme.related_link_fg),
+                            )));
+                        }
                         let (dot, dot_color) = self.theme.session_dot(&session.status);
-                        let is_last = !collapsed_left_items
-                            .get(i + 1)
-                            .is_some_and(|next| matches!(next, LeftItem::Session(_)));
+                        let is_last = session_row_is_last(
+                            collapsed_left_items,
+                            i,
+                            session,
+                            &self.sessions,
+                            &related_group_ids,
+                        );
                         let connector = if is_last { "└" } else { "├" };
                         ListItem::new(Line::from(vec![
                             Span::styled(connector, Style::default().fg(self.theme.project_icon)),
@@ -727,6 +806,8 @@ impl App {
             for item in left_items {
                 if let LeftItem::Session(index) = item
                     && let Some(session) = self.sessions.get(*index)
+                    && !self.session_is_related_member(session)
+                    && !self.session_is_related_origin(session)
                 {
                     *counts.entry(session.project_id.clone()).or_insert(0) += 1;
                 }
@@ -736,6 +817,10 @@ impl App {
             project_visible_session_counts(&self.sessions, &self.groups)
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;
+        // Only split-out members count toward a project's related badge. Origins
+        // are the heading of their Multi-repo work group, so counting them here
+        // would put a `⇄ 1` badge on a project that is listed as having no
+        // agents.
         let related_counts: HashMap<String, usize> = self
             .sessions
             .iter()
@@ -837,9 +922,13 @@ impl App {
                 LeftItem::EmptyProjectsSpacer => ListItem::new(Line::from("")),
                 LeftItem::Session(index) => {
                     let session = &self.sessions[*index];
-                    let is_last = !left_items
-                        .get(i + 1)
-                        .is_some_and(|next| matches!(next, LeftItem::Session(_)));
+                    let is_last = session_row_is_last(
+                        left_items,
+                        i,
+                        session,
+                        &self.sessions,
+                        &related_group_ids,
+                    );
                     let connector = if is_last { "└ " } else { "├ " };
                     let label = session
                         .title
@@ -897,15 +986,25 @@ impl App {
                         format!(" ({})", session.provider.as_str())
                     };
                     let is_related = self.session_is_related_member(session);
-                    let mut spans = vec![Span::styled(
-                        connector,
-                        Style::default().fg(self.theme.project_icon),
-                    )];
-                    if is_related {
-                        spans.push(Span::styled(
-                            "↳ ",
+                    let is_related_origin = self.session_is_related_origin(session);
+                    let mut spans = if is_related_origin {
+                        vec![Span::styled(
+                            "  ⇄ ",
                             Style::default().fg(self.theme.related_link_fg),
-                        ));
+                        )]
+                    } else {
+                        vec![Span::styled(
+                            connector,
+                            Style::default().fg(self.theme.project_icon),
+                        )]
+                    };
+                    if is_related || is_related_origin {
+                        if is_related {
+                            spans.push(Span::styled(
+                                "↳ ",
+                                Style::default().fg(self.theme.related_link_fg),
+                            ));
+                        }
                         let project_name = self
                             .projects
                             .iter()
@@ -927,21 +1026,15 @@ impl App {
                             Style::default().fg(self.theme.provider_label_fg)
                         },
                     ));
-                    if !is_related && let Some(group) = self.group_for_session(session) {
-                        let related_count = self
-                            .sessions
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.group_id.as_deref() == Some(group.id.as_str())
-                                    && candidate.parent_session_id.is_some()
-                            })
-                            .count();
-                        if related_count > 0 {
-                            spans.push(Span::styled(
-                                format!(" ⇄ {related_count}"),
-                                Style::default().fg(self.theme.related_link_fg),
-                            ));
-                        }
+                    if let Some(related_count) = project_tree_related_badge_count(
+                        session,
+                        &self.sessions,
+                        &related_group_ids,
+                    ) {
+                        spans.push(Span::styled(
+                            format!(" ⇄ {related_count}"),
+                            Style::default().fg(self.theme.related_link_fg),
+                        ));
                     }
                     ListItem::new(Line::from(
                         spans
@@ -960,13 +1053,16 @@ impl App {
                 LeftItem::RelatedSeparator => ListItem::new(left_section_separator_line(
                     projects_inner_width,
                     &self.theme,
-                    "Related work",
+                    "Multi-repo work",
                 )),
                 LeftItem::RelatedHeader => {
                     let count = self
                         .sessions
                         .iter()
-                        .filter(|session| self.session_is_related_member(session))
+                        .filter(|session| {
+                            self.session_is_related_member(session)
+                                || self.session_is_related_origin(session)
+                        })
                         .count();
                     let icon = if self.related_collapsed {
                         "▸ "
@@ -976,7 +1072,7 @@ impl App {
                     let mut spans = vec![
                         Span::styled(icon, Style::default().fg(self.theme.related_link_fg)),
                         Span::styled(
-                            "Related work",
+                            "Multi-repo work",
                             Style::default()
                                 .fg(self.theme.related_link_fg)
                                 .add_modifier(Modifier::BOLD),
@@ -8842,6 +8938,154 @@ mod tests {
             .collect()
     }
 
+    fn test_session(id: &str, project_id: &str) -> AgentSession {
+        let now = chrono::Utc::now();
+        AgentSession {
+            id: id.to_string(),
+            project_id: project_id.to_string(),
+            project_path: Some(format!("/tmp/{project_id}")),
+            provider: ProviderKind::from_str("codex"),
+            source_branch: "main".to_string(),
+            branch_name: id.to_string(),
+            worktree_path: format!("/tmp/{project_id}/worktrees/{id}"),
+            title: None,
+            started_providers: Vec::new(),
+            provider_session_ids: Default::default(),
+            desired_running: false,
+            auto_reopen_enabled: true,
+            status: SessionStatus::Detached,
+            group_id: None,
+            parent_session_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn test_group(id: &str, origin: &str) -> AgentGroup {
+        let mut group = AgentGroup::new(origin.to_string(), Some(origin.to_string()));
+        group.id = id.to_string();
+        group
+    }
+
+    #[test]
+    fn collapsed_project_icon_does_not_mark_an_origin_only_project_expanded() {
+        let mut origin = test_session("origin", "p1");
+        origin.group_id = Some("g1".to_string());
+        let mut child = test_session("child", "p2");
+        child.group_id = Some("g1".to_string());
+        child.parent_session_id = Some("origin".to_string());
+        let sessions = vec![origin, child];
+        let groups = vec![test_group("g1", "origin")];
+        let related_groups = related_group_indices(&groups, &sessions);
+        let related_group_ids = related_section_group_ids(&groups, &related_groups);
+
+        let has_visible_sessions =
+            project_has_visible_sessions(&sessions, "p1", &related_group_ids);
+
+        assert!(
+            !has_visible_sessions,
+            "the origin moved into Multi-repo work, so its project has no visible sessions"
+        );
+        assert_eq!(collapsed_project_icon(has_visible_sessions, false), "▸");
+        assert_eq!(collapsed_project_icon(has_visible_sessions, true), "▸");
+        assert_eq!(collapsed_project_icon(true, false), "▾");
+    }
+
+    #[test]
+    fn last_child_of_a_multi_repo_group_gets_the_last_connector() {
+        let mut origin_a = test_session("a-origin", "p1");
+        origin_a.group_id = Some("g1".to_string());
+        let mut child_a = test_session("a-child", "p2");
+        child_a.group_id = Some("g1".to_string());
+        child_a.parent_session_id = Some("a-origin".to_string());
+        let mut origin_b = test_session("b-origin", "p1");
+        origin_b.group_id = Some("g2".to_string());
+        let mut child_b = test_session("b-child", "p3");
+        child_b.group_id = Some("g2".to_string());
+        child_b.parent_session_id = Some("b-origin".to_string());
+        let sessions = vec![origin_a, child_a, origin_b, child_b];
+        let related_group_ids: HashSet<&str> = ["g1", "g2"].into_iter().collect();
+        let items = vec![
+            LeftItem::Session(0),
+            LeftItem::Session(1),
+            LeftItem::Session(2),
+            LeftItem::Session(3),
+        ];
+
+        assert!(!session_row_is_last(
+            &items,
+            0,
+            &sessions[0],
+            &sessions,
+            &related_group_ids
+        ));
+        assert!(
+            session_row_is_last(&items, 1, &sessions[1], &sessions, &related_group_ids),
+            "the last child of group g1 ends its connector run before g2's origin"
+        );
+        assert!(!session_row_is_last(
+            &items,
+            2,
+            &sessions[2],
+            &sessions,
+            &related_group_ids
+        ));
+        assert!(session_row_is_last(
+            &items,
+            3,
+            &sessions[3],
+            &sessions,
+            &related_group_ids
+        ));
+    }
+
+    #[test]
+    fn a_project_session_run_is_not_broken_by_a_childless_group() {
+        let mut first = test_session("first", "p1");
+        first.group_id = Some("solo".to_string());
+        let second = test_session("second", "p1");
+        let sessions = vec![first, second];
+        let items = vec![LeftItem::Session(0), LeftItem::Session(1)];
+        let related_group_ids = HashSet::new();
+
+        assert!(!session_row_is_last(
+            &items,
+            0,
+            &sessions[0],
+            &sessions,
+            &related_group_ids
+        ));
+        assert!(session_row_is_last(
+            &items,
+            1,
+            &sessions[1],
+            &sessions,
+            &related_group_ids
+        ));
+    }
+
+    #[test]
+    fn origin_rows_do_not_render_a_trailing_related_count() {
+        let mut origin = test_session("origin", "p1");
+        origin.group_id = Some("g1".to_string());
+        let mut child = test_session("child", "p2");
+        child.group_id = Some("g1".to_string());
+        child.parent_session_id = Some("origin".to_string());
+        let sessions = vec![origin, child];
+        let related_group_ids: HashSet<&str> = ["g1"].into_iter().collect();
+
+        assert_eq!(
+            project_tree_related_badge_count(&sessions[0], &sessions, &related_group_ids),
+            None,
+            "the origin heading already marks the group and lists its children"
+        );
+        assert_eq!(
+            project_tree_related_badge_count(&sessions[1], &sessions, &related_group_ids),
+            None,
+            "split-out members are already inside Multi-repo work"
+        );
+    }
+
     #[test]
     fn left_section_separator_line_uses_the_requested_label() {
         let theme = Theme::default_dark();
@@ -8851,8 +9095,8 @@ mod tests {
             "────────── Scratch ───────────"
         );
         assert_eq!(
-            line_text(&left_section_separator_line(30, &theme, "Related work")),
-            "──────── Related work ────────"
+            line_text(&left_section_separator_line(30, &theme, "Multi-repo work")),
+            "────── Multi-repo work ───────"
         );
     }
 

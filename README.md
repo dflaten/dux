@@ -23,7 +23,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 
 - [Overview](#overview)
 - [Status](#status)
-- [Related Worktrees](#related-worktrees)
+- [Multi-Repo Worktrees](#multi-repo-worktrees)
 - [Documentation](#documentation)
 - [Install](#install)
 - [Prerequisites](#prerequisites)
@@ -35,7 +35,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | --- | --- | --- |
 | 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
 | 🌿 | Worktrees | One isolated git worktree per project agent, with fork and existing-worktree workflows |
-| ⇄ | Related work | Agents can split work into linked worktrees in other projects; each stays independently managed |
+| ⇄ | Multi-repo work | Agents can split work into linked worktrees in other projects; the origin agent moves into this section with them |
 | ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders with the diff pane hidden, and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
 | 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
@@ -57,9 +57,9 @@ Recent fork additions include:
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.
 - Cross-pane macros with short descriptions, auto-created targets, optional Enter submission, background delivery badges, and configurable focus.
-- Related worktrees: an agent can split cross-repository work into a linked dux project and manage it as an independent agent session.
+- Multi-repo worktrees: an agent can split cross-repository work into a linked dux project and manage it as an independent agent session.
 
-## Related Worktrees
+## Multi-Repo Worktrees
 
 An agent running inside dux can ask dux to create work in another repository:
 
@@ -73,9 +73,10 @@ An agent running inside dux can ask dux to create work in another repository:
 
 Dux creates a fresh worktree from the target project's leading branch, creates
 an independent agent session, optionally launches the child agent with a handoff
-prompt, and links the new session to the current agent. Linked sessions appear
-in the **Related work** section of the sidebar and can be jumped between from
-the command palette.
+prompt, and links the new session to the current agent. The origin agent moves
+into the **Multi-repo work** section of the sidebar along with its split-out
+children; selecting the origin heading jumps back to the original agent, and
+members can be cycled with the `next-related-agent` command.
 
 The target repo can already be a dux project, or dux can register it
 automatically. Set `[agent_control] allow_unregistered_repos = false` in
