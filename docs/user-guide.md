@@ -153,11 +153,12 @@ See an agent going down the wrong path? Fork it. dux creates a new worktree with
 When work in one repository requires changes in another, an agent can ask dux to
 split that work into a separate worktree. The origin agent and its new split-out
 children appear together in the **Multi-repo work** section of the sidebar. The
-origin agent is removed from its project tree while its project header stays in
-place, and the origin becomes the selectable heading for the group. Use
-`dux agent split-out --help` for the command, or install the bundled
-`skills/dux-split-out/SKILL.md` skill so supported agents know when and how to
-use it.
+origin agent is removed from its project tree and becomes the selectable heading
+for the group. Its project header stays in the sidebar, and moves under the
+**Projects with no agents** separator when the project has no other agents and
+that grouping is enabled. Use `dux agent split-out --help` for the command, or
+install the bundled `skills/dux-split-out/SKILL.md` skill so supported agents
+know when and how to use it.
 
 Multi-repo worktrees are still independent sessions. Selecting the origin from
 **Multi-repo work**, or using the `next-related-agent` command, switches between

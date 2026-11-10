@@ -1623,10 +1623,7 @@ pub(crate) fn build_left_items(
         if project.is_scratch() {
             continue;
         }
-        let has_sessions = sessions.iter().any(|session| {
-            session.project_id == project.id
-                && !session_in_related_section(session, &related_group_ids)
-        });
+        let has_sessions = project_has_visible_sessions(sessions, &project.id, &related_group_ids);
         if split_empty_projects && !has_sessions {
             empty_projects.push(project_index);
             continue;
@@ -1755,6 +1752,19 @@ pub(crate) fn session_in_related_section(
         .group_id
         .as_deref()
         .is_some_and(|group_id| group_ids.contains(group_id))
+}
+
+/// Whether a project still has at least one session rendered under its own
+/// project header. Multi-repo work origins and split-out members live in their
+/// own section, so they do not count as visible project sessions.
+pub(crate) fn project_has_visible_sessions(
+    sessions: &[AgentSession],
+    project_id: &str,
+    related_group_ids: &HashSet<&str>,
+) -> bool {
+    sessions.iter().any(|session| {
+        session.project_id == project_id && !session_in_related_section(session, related_group_ids)
+    })
 }
 
 /// The session that anchors a related group, if it still exists in that group.
@@ -3381,9 +3391,10 @@ impl App {
         let Some(project_id) = self.selected_project().map(|project| project.id.clone()) else {
             return;
         };
-        let has_visible_sessions = self.sessions.iter().any(|session| {
-            session.project_id == project_id && related_group_index(&self.groups, session).is_none()
-        });
+        let related_groups = related_group_indices(&self.groups, &self.sessions);
+        let related_group_ids = related_section_group_ids(&self.groups, &related_groups);
+        let has_visible_sessions =
+            project_has_visible_sessions(&self.sessions, &project_id, &related_group_ids);
         if !has_visible_sessions {
             return;
         }

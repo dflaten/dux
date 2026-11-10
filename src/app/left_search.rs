@@ -82,7 +82,11 @@ fn project_fields(project: &Project) -> SearchFields {
 }
 
 /// The fields of an agent session that participate in matching.
-fn session_fields(session: &AgentSession, project: &Project) -> SearchFields {
+fn session_fields(
+    session: &AgentSession,
+    project: &Project,
+    related_group_ids: &HashSet<&str>,
+) -> SearchFields {
     let label = session
         .title
         .as_deref()
@@ -97,7 +101,7 @@ fn session_fields(session: &AgentSession, project: &Project) -> SearchFields {
     if session.is_scratch() {
         fuzzy.push("scratch".to_string());
     }
-    if session.group_id.is_some() {
+    if session_in_related_section(session, related_group_ids) {
         fuzzy.push("related".to_string());
         fuzzy.push("multi-repo".to_string());
     }
@@ -117,8 +121,13 @@ fn project_matches(project: &Project, terms: &[String]) -> bool {
 }
 
 /// Whether the whole query matches the session.
-fn session_matches(session: &AgentSession, project: &Project, terms: &[String]) -> bool {
-    fields_match(&session_fields(session, project), terms)
+fn session_matches(
+    session: &AgentSession,
+    project: &Project,
+    terms: &[String],
+    related_group_ids: &HashSet<&str>,
+) -> bool {
+    fields_match(&session_fields(session, project, related_group_ids), terms)
 }
 
 /// Builds the left pane item list, narrowed to the rows matching `query`.
@@ -215,7 +224,7 @@ pub(crate) fn build_filtered_left_items(
                 .iter()
                 .find(|project| project.id == sessions[index].project_id)
                 .is_some_and(|project| {
-                    session_matches(&sessions[index], project, &terms)
+                    session_matches(&sessions[index], project, &terms, &related_group_ids)
                         || project_hits.contains(project.id.as_str())
                 })
         });
@@ -232,7 +241,7 @@ pub(crate) fn build_filtered_left_items(
             else {
                 continue;
             };
-            let member_hit = session_matches(session, project, &terms)
+            let member_hit = session_matches(session, project, &terms, &related_group_ids)
                 || project_hits.contains(project.id.as_str());
             if show_all_members || member_hit {
                 members.push(index);
@@ -310,7 +319,7 @@ fn matching_sessions(
         if crate::app::session_in_related_section(session, related_group_ids) {
             continue;
         }
-        if project_hit || session_matches(session, project, terms) {
+        if project_hit || session_matches(session, project, terms, related_group_ids) {
             matched.push(index);
         }
     }
@@ -923,6 +932,53 @@ mod tests {
             ]
         );
         assert!(!items.contains(&LeftItem::Project(1)));
+    }
+
+    #[test]
+    fn related_search_keywords_only_match_sessions_in_the_multi_repo_section() {
+        let projects = projects();
+
+        // An origin whose group has no children stays in its project tree and
+        // must not be discoverable through the section keywords.
+        let mut sessions = sessions();
+        let mut childless_group = AgentGroup::new("first".to_string(), Some("s1".to_string()));
+        childless_group.id = "g1".to_string();
+        sessions[0].group_id = Some("g1".to_string());
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&childless_group),
+            &HashSet::new(),
+            false,
+            5,
+            "multi-repo",
+        );
+        assert!(
+            items.is_empty(),
+            "an origin that is still in its project tree is not multi-repo work: {items:?}"
+        );
+
+        // Once the group has a split-out child, the origin moves into the
+        // section and the keyword should reveal the whole group.
+        sessions[2].group_id = Some("g1".to_string());
+        sessions[2].parent_session_id = Some("s1".to_string());
+        let items = build_filtered_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&childless_group),
+            &HashSet::new(),
+            false,
+            5,
+            "multi-repo",
+        );
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::RelatedHeader,
+                LeftItem::Session(0),
+                LeftItem::Session(2),
+            ]
+        );
     }
 
     #[test]
