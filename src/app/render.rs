@@ -392,6 +392,19 @@ fn left_section_separator_line(width: u16, theme: &Theme, label: &str) -> Line<'
     ])
 }
 
+/// The repository-name prefix on a Multi-repo work session row.
+///
+/// Origins and split-out members both carry this prefix so the user can tell
+/// which repo each agent belongs to. It uses the same body-text color as the
+/// project tree so the repo names stay as legible as project headers instead
+/// of fading into the de-emphasized hint color.
+fn related_repo_name_span(project_name: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(
+        format!("{project_name} · "),
+        Style::default().fg(theme.text_fg),
+    )
+}
+
 fn macro_edit_text_inner_area(popup: Rect) -> Rect {
     let outer_inner = Block::bordered().inner(popup);
     let [_, bordered_area, _] = Layout::default()
@@ -1012,10 +1025,7 @@ impl App {
                             .find(|project| project.id == session.project_id)
                             .map(|project| project.name.clone())
                             .unwrap_or_else(|| session.project_id.clone());
-                        spans.push(Span::styled(
-                            format!("{project_name} · "),
-                            Style::default().fg(self.theme.hint_dim_desc_fg),
-                        ));
+                        spans.push(related_repo_name_span(&project_name, &self.theme));
                     }
                     spans.push(Span::styled(format!("{dot} "), label_style));
                     let title_style = if is_related_origin {
@@ -9091,6 +9101,21 @@ mod tests {
         assert_eq!(
             line_text(&left_section_separator_line(0, &theme, "Scratch")),
             ""
+        );
+    }
+
+    #[test]
+    fn related_repo_names_use_the_project_name_color() {
+        let theme = Theme::default_dark();
+
+        let span = related_repo_name_span("alpha", &theme);
+
+        assert_eq!(span.content.as_ref(), "alpha · ");
+        assert_eq!(span.style.fg, Some(theme.text_fg));
+        assert_ne!(
+            span.style.fg,
+            Some(theme.hint_dim_desc_fg),
+            "repo names in Multi-repo work must not be faded like hint text"
         );
     }
 
