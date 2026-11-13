@@ -738,10 +738,6 @@ impl App {
                         "─",
                         Style::default().fg(self.theme.header_separator_fg),
                     ))),
-                    LeftItem::RelatedHeader => ListItem::new(Line::from(Span::styled(
-                        "⇄",
-                        Style::default().fg(self.theme.related_link_fg),
-                    ))),
                     LeftItem::RelatedGroupLabel(_) => ListItem::new(Line::from(Span::styled(
                         "·",
                         Style::default().fg(self.theme.related_link_fg),
@@ -989,10 +985,15 @@ impl App {
                     let is_related_origin = self.session_is_related_origin(session);
                     let mut spans = if is_related_origin {
                         vec![Span::styled(
-                            "  ⇄ ",
+                            "⇄ ",
                             Style::default().fg(self.theme.related_link_fg),
                         )]
                     } else {
+                        let connector = if is_related {
+                            format!("  {connector}")
+                        } else {
+                            connector.to_string()
+                        };
                         vec![Span::styled(
                             connector,
                             Style::default().fg(self.theme.project_icon),
@@ -1017,7 +1018,12 @@ impl App {
                         ));
                     }
                     spans.push(Span::styled(format!("{dot} "), label_style));
-                    spans.push(Span::styled(label, label_style));
+                    let title_style = if is_related_origin {
+                        label_style.add_modifier(Modifier::BOLD)
+                    } else {
+                        label_style
+                    };
+                    spans.push(Span::styled(label, title_style));
                     spans.push(Span::styled(
                         provider_label,
                         if deleting {
@@ -1055,37 +1061,6 @@ impl App {
                     &self.theme,
                     "Multi-repo work",
                 )),
-                LeftItem::RelatedHeader => {
-                    let count = self
-                        .sessions
-                        .iter()
-                        .filter(|session| {
-                            self.session_is_related_member(session)
-                                || self.session_is_related_origin(session)
-                        })
-                        .count();
-                    let icon = if self.related_collapsed {
-                        "▸ "
-                    } else {
-                        "▾ "
-                    };
-                    let mut spans = vec![
-                        Span::styled(icon, Style::default().fg(self.theme.related_link_fg)),
-                        Span::styled(
-                            "Multi-repo work",
-                            Style::default()
-                                .fg(self.theme.related_link_fg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if count > 0 {
-                        spans.push(Span::styled(
-                            format!(" ({count})"),
-                            Style::default().fg(self.theme.provider_label_fg),
-                        ));
-                    }
-                    ListItem::new(Line::from(spans))
-                }
                 LeftItem::RelatedGroupLabel(group_index) => {
                     let group = &self.groups[*group_index];
                     let label = related_group_label_for(&self.sessions, group);
@@ -1098,8 +1073,13 @@ impl App {
                         })
                         .count();
                     ListItem::new(Line::from(vec![
-                        Span::styled("  ⇄ ", Style::default().fg(self.theme.related_link_fg)),
-                        Span::styled(label, Style::default().fg(self.theme.hint_dim_desc_fg)),
+                        Span::styled("⇄ ", Style::default().fg(self.theme.related_link_fg)),
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(self.theme.hint_dim_desc_fg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(
                             format!(" ({count})"),
                             Style::default().fg(self.theme.provider_label_fg),

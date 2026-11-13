@@ -177,7 +177,6 @@ pub struct App {
     pub(crate) watched_worktree: Arc<Mutex<Option<WatchedWorktree>>>,
     pub(crate) has_active_processes: Arc<AtomicBool>,
     pub(crate) collapsed_projects: HashSet<String>,
-    pub(crate) related_collapsed: bool,
     pub(crate) left_items_cache: Vec<LeftItem>,
     pub(crate) mouse_layout: MouseLayoutState,
     pub(crate) overlay_layout: OverlayMouseLayoutState,
@@ -1563,7 +1562,6 @@ pub(crate) enum LeftItem {
     Session(usize),
     EmptyProjectsSpacer,
     EmptyProjectsSeparator,
-    RelatedHeader,
     RelatedSeparator,
     RelatedGroupLabel(usize),
     ScratchHeader,
@@ -1574,10 +1572,7 @@ impl LeftItem {
     pub(crate) fn is_selectable(self) -> bool {
         matches!(
             self,
-            LeftItem::Project(_)
-                | LeftItem::Session(_)
-                | LeftItem::RelatedHeader
-                | LeftItem::ScratchHeader
+            LeftItem::Project(_) | LeftItem::Session(_) | LeftItem::ScratchHeader
         )
     }
 }
@@ -1594,8 +1589,6 @@ pub(crate) enum LeftSelectionTarget {
     Project(String),
     /// An agent session, identified by its session id.
     Session(String),
-    /// The collapsible Multi-repo work section header.
-    Related,
     /// The built-in scratch workspace header.
     Scratch,
 }
@@ -1605,7 +1598,6 @@ pub(crate) fn build_left_items(
     sessions: &[AgentSession],
     groups: &[AgentGroup],
     collapsed_projects: &HashSet<String>,
-    related_collapsed: bool,
     empty_project_separator_min_projects: u16,
 ) -> Vec<LeftItem> {
     let project_count = projects
@@ -1670,21 +1662,18 @@ pub(crate) fn build_left_items(
         if !items.is_empty() {
             items.push(LeftItem::RelatedSeparator);
         }
-        items.push(LeftItem::RelatedHeader);
-        if !related_collapsed {
-            for group_index in related_groups {
-                let group = &groups[group_index];
-                let origin_index = related_origin_session_index(sessions, group);
-                match origin_index {
-                    Some(index) => items.push(LeftItem::Session(index)),
-                    None => items.push(LeftItem::RelatedGroupLabel(group_index)),
-                }
-                for (session_index, session) in sessions.iter().enumerate() {
-                    if session.group_id.as_deref() == Some(group.id.as_str())
-                        && Some(session_index) != origin_index
-                    {
-                        items.push(LeftItem::Session(session_index));
-                    }
+        for group_index in related_groups {
+            let group = &groups[group_index];
+            let origin_index = related_origin_session_index(sessions, group);
+            match origin_index {
+                Some(index) => items.push(LeftItem::Session(index)),
+                None => items.push(LeftItem::RelatedGroupLabel(group_index)),
+            }
+            for (session_index, session) in sessions.iter().enumerate() {
+                if session.group_id.as_deref() == Some(group.id.as_str())
+                    && Some(session_index) != origin_index
+                {
+                    items.push(LeftItem::Session(session_index));
                 }
             }
         }
@@ -2370,7 +2359,6 @@ impl App {
             watched_worktree: Arc::clone(&watched_worktree),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: HashSet::new(),
-            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
@@ -3274,7 +3262,6 @@ impl App {
             &self.sessions,
             &self.groups,
             &self.collapsed_projects,
-            self.related_collapsed,
             self.config.ui.empty_project_separator_min_projects,
             self.left_search_query(),
         );
@@ -3370,21 +3357,6 @@ impl App {
             );
             return;
         }
-        if matches!(
-            self.selected_left_target(),
-            Some(LeftSelectionTarget::Related)
-        ) {
-            self.related_collapsed = !self.related_collapsed;
-            self.rebuild_left_items();
-            if let Some(index) = self
-                .left_items()
-                .iter()
-                .position(|item| matches!(item, LeftItem::RelatedHeader))
-            {
-                self.selected_left = index;
-            }
-            return;
-        }
         // `selected_project` resolves the parent group for a selected session
         // row as well as for project and scratch headers, so toggling works
         // from anywhere inside a group.
@@ -3429,7 +3401,6 @@ impl App {
             }
             Some(LeftItem::EmptyProjectsSpacer)
             | Some(LeftItem::EmptyProjectsSeparator)
-            | Some(LeftItem::RelatedHeader)
             | Some(LeftItem::RelatedSeparator)
             | Some(LeftItem::RelatedGroupLabel(_))
             | Some(LeftItem::ScratchSeparator) => None,
@@ -4605,7 +4576,7 @@ mod tests {
         ];
         let sessions = vec![test_session("session-1", "project-2", 0)];
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 5);
 
         assert_eq!(
             items,
@@ -4657,7 +4628,7 @@ mod tests {
         let projects = vec![test_project("project-1"), test_scratch_project()];
         let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 1);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 1);
 
         assert_eq!(
             items,
@@ -4675,17 +4646,17 @@ mod tests {
         let projects = vec![test_project("project-1"), test_scratch_project()];
         let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
 
-        let expanded = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 1);
+        let expanded = build_left_items(&projects, &sessions, &[], &HashSet::new(), 1);
         assert!(expanded.contains(&LeftItem::ScratchHeader));
         assert!(expanded.contains(&LeftItem::Session(0)));
 
         let mut collapsed = HashSet::new();
         collapsed.insert(SCRATCH_PROJECT_ID.to_string());
-        let collapsed_items = build_left_items(&projects, &sessions, &[], &collapsed, false, 1);
+        let collapsed_items = build_left_items(&projects, &sessions, &[], &collapsed, 1);
         assert!(collapsed_items.contains(&LeftItem::ScratchHeader));
         assert!(!collapsed_items.contains(&LeftItem::Session(0)));
 
-        let empty_items = build_left_items(&projects, &[], &[], &HashSet::new(), false, 1);
+        let empty_items = build_left_items(&projects, &[], &[], &HashSet::new(), 1);
         assert!(empty_items.contains(&LeftItem::ScratchHeader));
     }
 
@@ -4703,7 +4674,7 @@ mod tests {
             test_session("session-2", "project-4", 0),
         ];
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 5);
 
         assert_eq!(
             items,
@@ -4739,7 +4710,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
         );
         assert_eq!(
@@ -4748,12 +4718,12 @@ mod tests {
                 LeftItem::Project(0),
                 LeftItem::Project(1),
                 LeftItem::RelatedSeparator,
-                LeftItem::RelatedHeader,
                 LeftItem::Session(0),
                 LeftItem::Session(1),
             ]
         );
-        // The origin is only in Multi-repo work, never in its project tree.
+        // The origin is on the section's first level, directly under the
+        // separator; its split-out member follows underneath it.
         assert_eq!(
             items
                 .iter()
@@ -4761,23 +4731,48 @@ mod tests {
                 .count(),
             1
         );
+    }
 
-        let collapsed = build_left_items(
+    #[test]
+    fn each_multi_repo_origin_leads_its_own_members() {
+        let projects = vec![test_project("alpha"), test_project("beta")];
+        let mut sessions = vec![
+            test_session("origin-a", "alpha", 0),
+            test_session("child-a", "beta", -1),
+            test_session("origin-b", "alpha", -2),
+            test_session("child-b", "beta", -3),
+        ];
+        let mut group_a = AgentGroup::new("origin-a".to_string(), Some("origin-a".to_string()));
+        group_a.id = "group-a".to_string();
+        let mut group_b = AgentGroup::new("origin-b".to_string(), Some("origin-b".to_string()));
+        group_b.id = "group-b".to_string();
+        sessions[0].group_id = Some(group_a.id.clone());
+        sessions[1].group_id = Some(group_a.id.clone());
+        sessions[1].parent_session_id = Some("origin-a".to_string());
+        sessions[2].group_id = Some(group_b.id.clone());
+        sessions[3].group_id = Some(group_b.id.clone());
+        sessions[3].parent_session_id = Some("origin-b".to_string());
+
+        let items = build_left_items(
             &projects,
             &sessions,
-            std::slice::from_ref(&group),
+            &[group_a, group_b],
             &HashSet::new(),
-            true,
             5,
         );
+
         assert_eq!(
-            collapsed,
+            items,
             vec![
                 LeftItem::Project(0),
                 LeftItem::Project(1),
                 LeftItem::RelatedSeparator,
-                LeftItem::RelatedHeader,
-            ]
+                LeftItem::Session(0),
+                LeftItem::Session(1),
+                LeftItem::Session(2),
+                LeftItem::Session(3),
+            ],
+            "each driver should sit directly above its own split-out agents"
         );
     }
 
@@ -4794,7 +4789,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
         );
 
@@ -4822,7 +4816,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
         );
 
@@ -4871,7 +4864,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
         );
 
@@ -4887,15 +4879,16 @@ mod tests {
             .iter()
             .position(|item| matches!(item, LeftItem::Project(4)))
             .expect("child project");
-        let related_header = items
+        let related_section = items
             .iter()
-            .position(|item| matches!(item, LeftItem::RelatedHeader))
-            .expect("multi-repo header");
+            .position(|item| matches!(item, LeftItem::RelatedSeparator))
+            .expect("multi-repo section separator");
         assert!(separator < origin_project);
         assert!(separator < child_project);
-        assert!(origin_project < related_header);
-        assert!(child_project < related_header);
-        assert!(related_header < items.len() - 1);
+        assert!(origin_project < related_section);
+        assert!(child_project < related_section);
+        assert_eq!(items[related_section + 1], LeftItem::Session(0));
+        assert_eq!(items[related_section + 2], LeftItem::Session(1));
     }
 
     #[test]
@@ -4913,7 +4906,7 @@ mod tests {
             test_session("session-3", "project-3", 0),
         ];
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 5);
 
         assert_eq!(
             items,
@@ -4948,7 +4941,7 @@ mod tests {
         ];
         sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 5);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 5);
 
         assert_eq!(
             items,
@@ -4978,7 +4971,7 @@ mod tests {
         ];
         let sessions = vec![test_session("session-1", "project-2", 0)];
 
-        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), false, 0);
+        let items = build_left_items(&projects, &sessions, &[], &HashSet::new(), 0);
 
         assert!(!items.contains(&LeftItem::EmptyProjectsSeparator));
         assert!(!items.contains(&LeftItem::EmptyProjectsSpacer));
@@ -4995,7 +4988,7 @@ mod tests {
             test_project("project-5"),
         ];
 
-        let items = build_left_items(&projects, &[], &[], &HashSet::new(), false, 5);
+        let items = build_left_items(&projects, &[], &[], &HashSet::new(), 5);
 
         assert_eq!(
             items,

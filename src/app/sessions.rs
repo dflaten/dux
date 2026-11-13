@@ -3108,7 +3108,6 @@ impl App {
                 .map(|p| p.path.clone()),
             Some(LeftItem::EmptyProjectsSpacer) => None,
             Some(LeftItem::EmptyProjectsSeparator) => None,
-            Some(LeftItem::RelatedHeader) => None,
             Some(LeftItem::RelatedSeparator) => None,
             Some(LeftItem::RelatedGroupLabel(_)) => None,
             Some(LeftItem::ScratchSeparator) => None,
@@ -3893,7 +3892,6 @@ mod tests {
             watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
-            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),
@@ -4044,10 +4042,28 @@ mod tests {
                 .iter()
                 .any(|group| group.id == child.group_id.clone().unwrap())
         );
-        assert!(
-            app.left_items()
-                .iter()
-                .any(|item| matches!(item, LeftItem::RelatedHeader))
+        let origin_index = app
+            .sessions
+            .iter()
+            .position(|session| session.id == "source")
+            .expect("origin session");
+        let child_index = app
+            .sessions
+            .iter()
+            .position(|session| session.id == child.id)
+            .expect("child session");
+        let separator = app
+            .left_items()
+            .iter()
+            .position(|item| matches!(item, LeftItem::RelatedSeparator))
+            .expect("multi-repo separator");
+        assert_eq!(
+            &app.left_items()[separator + 1..separator + 3],
+            &[
+                LeftItem::Session(origin_index),
+                LeftItem::Session(child_index),
+            ],
+            "the origin should be the first-level row with the child underneath it"
         );
         assert!(!app.split_out_in_flight);
     }
