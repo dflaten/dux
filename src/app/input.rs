@@ -6797,25 +6797,6 @@ impl App {
                     self.reconnect_selected_session()?;
                 }
             }
-            Some(LeftItem::RelatedHeader) => {
-                self.toggle_collapse_selected_project();
-                if !self.related_collapsed
-                    && let Some(header_index) = self
-                        .left_items()
-                        .iter()
-                        .position(|item| matches!(item, LeftItem::RelatedHeader))
-                    && let Some(pos) = self
-                        .left_items()
-                        .iter()
-                        .enumerate()
-                        .skip(header_index + 1)
-                        .find_map(|(index, item)| {
-                            matches!(item, LeftItem::Session(_)).then_some(index)
-                        })
-                {
-                    self.selected_left = pos;
-                }
-            }
             Some(LeftItem::EmptyProjectsSpacer) => {}
             Some(LeftItem::EmptyProjectsSeparator) => {}
             Some(LeftItem::RelatedSeparator) => {}
@@ -8259,7 +8240,6 @@ mod tests {
             watched_worktree: Arc::new(Mutex::new(None::<WatchedWorktree>)),
             has_active_processes: Arc::new(AtomicBool::new(false)),
             collapsed_projects: std::collections::HashSet::new(),
-            related_collapsed: false,
             left_items_cache: Vec::new(),
             mouse_layout: MouseLayoutState::default(),
             overlay_layout: OverlayMouseLayoutState::default(),

@@ -143,7 +143,6 @@ pub(crate) fn build_filtered_left_items(
     sessions: &[AgentSession],
     groups: &[AgentGroup],
     collapsed_projects: &HashSet<String>,
-    related_collapsed: bool,
     empty_project_separator_min_projects: u16,
     query: &str,
 ) -> Vec<LeftItem> {
@@ -154,7 +153,6 @@ pub(crate) fn build_filtered_left_items(
             sessions,
             groups,
             collapsed_projects,
-            related_collapsed,
             empty_project_separator_min_projects,
         );
     }
@@ -272,7 +270,6 @@ pub(crate) fn build_filtered_left_items(
         if !items.is_empty() {
             items.push(LeftItem::RelatedSeparator);
         }
-        items.push(LeftItem::RelatedHeader);
         items.extend(related_items);
     }
 
@@ -478,7 +475,6 @@ impl App {
                 Some(LeftSelectionTarget::Session(session.id.clone()))
             }
             LeftItem::ScratchHeader => Some(LeftSelectionTarget::Scratch),
-            LeftItem::RelatedHeader => Some(LeftSelectionTarget::Related),
             _ => None,
         }
     }
@@ -504,7 +500,6 @@ impl App {
                 .find(|session| session.id == id)
                 .is_some_and(|session| session.project_id == project_id),
             Some(LeftSelectionTarget::Scratch) => project_id == SCRATCH_PROJECT_ID,
-            Some(LeftSelectionTarget::Related) => false,
             None => false,
         }
     }
@@ -558,11 +553,10 @@ impl App {
                 match target {
                     LeftSelectionTarget::Project(id) => &project.id == id,
                     LeftSelectionTarget::Scratch => project.is_scratch(),
-                    LeftSelectionTarget::Session(_) | LeftSelectionTarget::Related => false,
+                    LeftSelectionTarget::Session(_) => false,
                 }
             }
             LeftItem::ScratchHeader => matches!(target, LeftSelectionTarget::Scratch),
-            LeftItem::RelatedHeader => matches!(target, LeftSelectionTarget::Related),
             LeftItem::Session(index) => {
                 let Some(session) = self.sessions.get(*index) else {
                     return false;
@@ -662,7 +656,7 @@ mod tests {
     }
 
     fn filtered(projects: &[Project], sessions: &[AgentSession], query: &str) -> Vec<LeftItem> {
-        build_filtered_left_items(projects, sessions, &[], &HashSet::new(), false, 5, query)
+        build_filtered_left_items(projects, sessions, &[], &HashSet::new(), 5, query)
     }
 
     #[test]
@@ -765,20 +759,12 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert("p1".to_string());
 
-        let items = build_filtered_left_items(
-            &projects(),
-            &sessions(),
-            &[],
-            &collapsed,
-            false,
-            5,
-            "second",
-        );
+        let items =
+            build_filtered_left_items(&projects(), &sessions(), &[], &collapsed, 5, "second");
         assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(1)]);
 
         // Without a filter the collapsed project keeps its collapsed shape.
-        let items =
-            build_filtered_left_items(&projects(), &sessions(), &[], &collapsed, false, 5, "");
+        let items = build_filtered_left_items(&projects(), &sessions(), &[], &collapsed, 5, "");
         assert_eq!(
             items,
             vec![
@@ -796,15 +782,8 @@ mod tests {
 
         // The separator threshold is reached, but a filtered list has no
         // empty-project section.
-        let items = build_filtered_left_items(
-            &projects,
-            &sessions,
-            &[],
-            &HashSet::new(),
-            false,
-            1,
-            "first",
-        );
+        let items =
+            build_filtered_left_items(&projects, &sessions, &[], &HashSet::new(), 1, "first");
         assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(0)]);
     }
 
@@ -860,7 +839,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
             "",
         );
@@ -871,7 +849,6 @@ mod tests {
                 LeftItem::Session(1),
                 LeftItem::Project(1),
                 LeftItem::RelatedSeparator,
-                LeftItem::RelatedHeader,
                 LeftItem::Session(0),
                 LeftItem::Session(2),
             ]
@@ -898,18 +875,10 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
             "first",
         );
-        assert_eq!(
-            items,
-            vec![
-                LeftItem::RelatedHeader,
-                LeftItem::Session(0),
-                LeftItem::Session(2),
-            ]
-        );
+        assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Session(2)]);
 
         // Searching by a related member still shows the origin heading, but
         // does not leave an empty project header for a project that only has
@@ -919,18 +888,10 @@ mod tests {
             &sessions,
             std::slice::from_ref(&group),
             &HashSet::new(),
-            false,
             5,
             "other",
         );
-        assert_eq!(
-            items,
-            vec![
-                LeftItem::RelatedHeader,
-                LeftItem::Session(0),
-                LeftItem::Session(2),
-            ]
-        );
+        assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Session(2)]);
         assert!(!items.contains(&LeftItem::Project(1)));
     }
 
@@ -949,7 +910,6 @@ mod tests {
             &sessions,
             std::slice::from_ref(&childless_group),
             &HashSet::new(),
-            false,
             5,
             "multi-repo",
         );
@@ -967,18 +927,10 @@ mod tests {
             &sessions,
             std::slice::from_ref(&childless_group),
             &HashSet::new(),
-            false,
             5,
             "multi-repo",
         );
-        assert_eq!(
-            items,
-            vec![
-                LeftItem::RelatedHeader,
-                LeftItem::Session(0),
-                LeftItem::Session(2),
-            ]
-        );
+        assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Session(2)]);
     }
 
     #[test]
