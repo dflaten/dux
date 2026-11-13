@@ -1630,34 +1630,6 @@ pub(crate) fn build_left_items(
         );
     }
 
-    if !items.is_empty() && !empty_projects.is_empty() {
-        items.push(LeftItem::EmptyProjectsSpacer);
-        items.push(LeftItem::EmptyProjectsSeparator);
-        for project_index in empty_projects {
-            let project = &projects[project_index];
-            push_project_left_items(
-                &mut items,
-                project_index,
-                project,
-                sessions,
-                &related_group_ids,
-                collapsed_projects,
-            );
-        }
-    } else {
-        for project_index in empty_projects {
-            let project = &projects[project_index];
-            push_project_left_items(
-                &mut items,
-                project_index,
-                project,
-                sessions,
-                &related_group_ids,
-                collapsed_projects,
-            );
-        }
-    }
-
     if !related_groups.is_empty() {
         if !items.is_empty() {
             items.push(LeftItem::RelatedSeparator);
@@ -1679,7 +1651,8 @@ pub(crate) fn build_left_items(
         }
     }
 
-    // Scratch is always visible and always lives below the project groups.
+    // Scratch sits below the projects that have agents and the multi-repo work
+    // section, but above the projects that have no agents.
     if projects.iter().any(|project| project.is_scratch()) {
         if !items.is_empty() {
             items.push(LeftItem::ScratchSeparator);
@@ -1692,6 +1665,25 @@ pub(crate) fn build_left_items(
                     items.push(LeftItem::Session(session_index));
                 }
             }
+        }
+    }
+
+    // Projects with no agents are always the last group in the list.
+    if !empty_projects.is_empty() {
+        if !items.is_empty() {
+            items.push(LeftItem::EmptyProjectsSpacer);
+            items.push(LeftItem::EmptyProjectsSeparator);
+        }
+        for project_index in empty_projects {
+            let project = &projects[project_index];
+            push_project_left_items(
+                &mut items,
+                project_index,
+                project,
+                sessions,
+                &related_group_ids,
+                collapsed_projects,
+            );
         }
     }
 
@@ -4624,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn build_left_items_always_shows_scratch_group_below_projects() {
+    fn build_left_items_places_scratch_above_empty_projects() {
         let projects = vec![test_project("project-1"), test_scratch_project()];
         let sessions = vec![test_session("scratch-session", SCRATCH_PROJECT_ID, 0)];
 
@@ -4633,11 +4625,60 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                LeftItem::Project(0),
-                LeftItem::ScratchSeparator,
                 LeftItem::ScratchHeader,
                 LeftItem::Session(0),
+                LeftItem::EmptyProjectsSpacer,
+                LeftItem::EmptyProjectsSeparator,
+                LeftItem::Project(0),
             ]
+        );
+    }
+
+    #[test]
+    fn build_left_items_orders_projects_multi_repo_scratch_and_empty_projects() {
+        let projects = vec![
+            test_project("alpha"),
+            test_project("beta"),
+            test_project("gamma"),
+            test_scratch_project(),
+        ];
+        let mut sessions = vec![
+            test_session("plain", "alpha", 0),
+            test_session("origin", "beta", -1),
+            test_session("child", "alpha", -2),
+            test_session("scratch-session", SCRATCH_PROJECT_ID, -3),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[1].group_id = Some(group.id.clone());
+        sessions[2].group_id = Some(group.id.clone());
+        sessions[2].parent_session_id = Some("origin".to_string());
+
+        let items = build_left_items(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &HashSet::new(),
+            3,
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::Session(0),
+                LeftItem::RelatedSeparator,
+                LeftItem::Session(1),
+                LeftItem::Session(2),
+                LeftItem::ScratchSeparator,
+                LeftItem::ScratchHeader,
+                LeftItem::Session(3),
+                LeftItem::EmptyProjectsSpacer,
+                LeftItem::EmptyProjectsSeparator,
+                LeftItem::Project(1),
+                LeftItem::Project(2),
+            ],
+            "projects with agents come first, then multi-repo work, then scratch, then projects with no agents"
         );
     }
 
@@ -4842,7 +4883,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_only_project_is_grouped_with_empty_projects() {
+    fn origin_only_project_is_grouped_with_empty_projects_at_the_bottom() {
         let projects = (0..5)
             .map(|index| test_project(&format!("project-{index}")))
             .collect::<Vec<_>>();
@@ -4883,10 +4924,9 @@ mod tests {
             .iter()
             .position(|item| matches!(item, LeftItem::RelatedSeparator))
             .expect("multi-repo section separator");
+        assert!(related_section < separator);
         assert!(separator < origin_project);
         assert!(separator < child_project);
-        assert!(origin_project < related_section);
-        assert!(child_project < related_section);
         assert_eq!(items[related_section + 1], LeftItem::Session(0));
         assert_eq!(items[related_section + 2], LeftItem::Session(1));
     }
