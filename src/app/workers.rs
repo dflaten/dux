@@ -2210,10 +2210,12 @@ impl App {
         use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 
         let tx = self.worker_tx.clone();
-        // Build a reverse map of watched paths for event routing.
-        let path_to_session: Arc<Mutex<HashMap<PathBuf, String>>> =
+        // Build a reverse map of watched paths for event routing. Linked
+        // worktrees share the main checkout's refs directory, so one path can
+        // route to multiple sessions.
+        let path_to_sessions: Arc<Mutex<HashMap<PathBuf, Vec<String>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let path_map = Arc::clone(&path_to_session);
+        let path_map = Arc::clone(&path_to_sessions);
         let debounce_map: Arc<Mutex<HashMap<String, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let debounce = Arc::clone(&debounce_map);
@@ -2235,10 +2237,14 @@ impl App {
                 };
                 for event_path in &event.paths {
                     // Walk up from the event path to find a watched parent dir.
-                    for (watched, session_id) in map.iter() {
-                        if event_path.starts_with(watched) {
-                            // Debounce: skip if we already sent an event within the last 5s.
-                            let now = Instant::now();
+                    for (watched, session_ids) in map.iter() {
+                        if !event_path.starts_with(watched) {
+                            continue;
+                        }
+                        let now = Instant::now();
+                        for session_id in session_ids {
+                            // Debounce: skip if we already sent an event for
+                            // this session within the last 5s.
                             if let Some(last) = debounce_guard.get(session_id)
                                 && now.duration_since(*last) < Duration::from_secs(5)
                             {
@@ -2246,7 +2252,7 @@ impl App {
                             }
                             debounce_guard.insert(session_id.clone(), now);
                             logger::debug(&format!(
-                                "[gh-integration] refs watcher: detected change at {}, debouncing for session {}",
+                                "[gh-integration] refs watcher: detected change at {}, checking session {}",
                                 event_path.display(),
                                 session_id,
                             ));
@@ -2262,25 +2268,47 @@ impl App {
             Ok(watcher) => {
                 self.refs_watcher = Some(Arc::new(Mutex::new(watcher)));
                 self.refs_watch_paths.clear();
-                // Populate the path map and start watching existing sessions.
-                let mut paths = HashMap::new();
+
+                // Linked worktrees store refs in the main checkout's git dir,
+                // so prefer the project's `.git/refs/heads` and fall back to
+                // the worktree path for standalone/test checkouts.
+                let mut paths: HashMap<PathBuf, Vec<String>> = HashMap::new();
                 for session in &self.sessions {
-                    let refs_dir = PathBuf::from(&session.worktree_path)
-                        .join(".git")
-                        .join("refs")
-                        .join("heads");
-                    if refs_dir.is_dir()
-                        && let Some(ref watcher_arc) = self.refs_watcher
-                        && let Ok(mut w) = watcher_arc.lock()
-                    {
-                        match w.watch(&refs_dir, RecursiveMode::NonRecursive) {
+                    let from_project = self
+                        .projects
+                        .iter()
+                        .find(|project| project.id == session.project_id)
+                        .map(|project| {
+                            PathBuf::from(&project.path)
+                                .join(".git")
+                                .join("refs")
+                                .join("heads")
+                        })
+                        .filter(|path| path.is_dir());
+                    let from_worktree = || {
+                        let path = PathBuf::from(&session.worktree_path)
+                            .join(".git")
+                            .join("refs")
+                            .join("heads");
+                        path.is_dir().then_some(path)
+                    };
+                    let Some(refs_dir) = from_project.or_else(from_worktree) else {
+                        continue;
+                    };
+                    paths.entry(refs_dir).or_default().push(session.id.clone());
+                }
+
+                if let Some(watcher_arc) = self.refs_watcher.clone()
+                    && let Ok(mut watcher) = watcher_arc.lock()
+                {
+                    for (refs_dir, session_ids) in &paths {
+                        match watcher.watch(refs_dir, RecursiveMode::Recursive) {
                             Ok(()) => {
                                 logger::debug(&format!(
-                                    "[gh-integration] refs watcher: watching {} for session {}",
+                                    "[gh-integration] refs watcher: watching {} for {} session(s)",
                                     refs_dir.display(),
-                                    session.id,
+                                    session_ids.len(),
                                 ));
-                                paths.insert(refs_dir.clone(), session.id.clone());
                             }
                             Err(e) => {
                                 logger::debug(&format!(
@@ -2292,13 +2320,15 @@ impl App {
                         }
                     }
                 }
+                let watched_sessions = paths.values().map(Vec::len).sum::<usize>();
                 self.refs_watch_paths = paths.clone();
                 // Populate the closure's path map so events can route to sessions.
-                if let Ok(mut map) = path_to_session.lock() {
+                if let Ok(mut map) = path_to_sessions.lock() {
                     *map = paths;
                 }
                 logger::info(&format!(
-                    "[gh-integration] refs watcher: initialized, watching {} session(s)",
+                    "[gh-integration] refs watcher: initialized, watching {} session(s) across {} refs dir(s)",
+                    watched_sessions,
                     self.refs_watch_paths.len(),
                 ));
             }

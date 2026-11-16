@@ -247,9 +247,10 @@ pub struct App {
     /// File-system watcher for `.git/refs/heads/` directories. `None` if the
     /// watcher could not be created (graceful fallback to poll-only).
     pub(crate) refs_watcher: Option<Arc<Mutex<notify::RecommendedWatcher>>>,
-    /// Maps watched worktree paths back to session IDs so the refs watcher
-    /// can route change events.
-    pub(crate) refs_watch_paths: HashMap<PathBuf, String>,
+    /// Maps watched refs directories back to session IDs so the refs watcher
+    /// can route change events. A shared repository refs directory maps to
+    /// every worktree session in that project.
+    pub(crate) refs_watch_paths: HashMap<PathBuf, Vec<String>>,
     /// Session IDs spawned with resume args and the wall-clock time the resume
     /// attempt began. Used for one-shot fallbacks when resume exits quickly or
     /// hangs without rendering visible output.
