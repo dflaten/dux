@@ -38,7 +38,6 @@ pub enum Action {
     PasteSelectionToTerminal,
     PasteSelectionToAgent,
     OpenCurrentPullRequest,
-    CreatePullRequest,
     CopyPullRequestUrl,
     GoToPullRequestAgent,
     LinkStackParent,
@@ -250,7 +249,6 @@ impl Action {
             Action::PasteSelectionToTerminal => "paste_selection_to_terminal",
             Action::PasteSelectionToAgent => "paste_selection_to_agent",
             Action::OpenCurrentPullRequest => "open_current_pull_request",
-            Action::CreatePullRequest => "create_pull_request",
             Action::CopyPullRequestUrl => "copy_pull_request_url",
             Action::GoToPullRequestAgent => "go_to_pull_request_agent",
             Action::LinkStackParent => "link_stack_parent",
@@ -395,9 +393,6 @@ impl Action {
             }
             Action::OpenCurrentPullRequest => {
                 "Open the selected agent's current pull request in the default browser."
-            }
-            Action::CreatePullRequest => {
-                "Create a GitHub pull request for the selected agent's branch."
             }
             Action::CopyPullRequestUrl => {
                 "Copy the selected pull request URL from the right-pane section."
@@ -546,7 +541,6 @@ impl Action {
             | Action::ScrollToBottom
             | Action::ScrollToTop => Some("Scrolling"),
             Action::OpenDiff
-            | Action::CreatePullRequest
             | Action::CopyPullRequestUrl
             | Action::GoToPullRequestAgent
             | Action::LinkStackParent
@@ -1202,20 +1196,6 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "open-current-pr",
             description: "Open the selected agent's current pull request in the default browser",
-        }),
-    },
-    BindingDef {
-        action: Action::CreatePullRequest,
-        default_keys: &[],
-        scopes: &[],
-        help: Some(HelpEntry {
-            section: "Files pane",
-            description: "Create a pull request for the selected agent",
-        }),
-        hint_contexts: &[],
-        palette: Some(PaletteEntry {
-            name: "create-pull-request",
-            description: "Create a GitHub pull request for the selected agent's branch",
         }),
     },
     BindingDef {

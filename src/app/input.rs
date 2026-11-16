@@ -8262,6 +8262,7 @@ mod tests {
             session_store,
             projects: vec![project],
             sessions: vec![session],
+            archived_sessions: Vec::new(),
             groups: Vec::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -8376,6 +8377,7 @@ mod tests {
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
             pr_poller_running: Arc::new(AtomicBool::new(false)),
+            pr_poll_interval_secs: Arc::new(std::sync::atomic::AtomicU64::new(45)),
             pr_last_checked: std::collections::HashMap::new(),
             pr_base_lookups: std::collections::HashSet::new(),
             pr_base_last_checked: std::collections::HashMap::new(),
@@ -8428,6 +8430,21 @@ mod tests {
             commit_area: Some(Rect::new(77, 14, 23, 6)),
             commit_text_area: Some(Rect::new(78, 15, 21, 4)),
         };
+    }
+
+    #[test]
+    fn mouse_hits_in_the_pr_section_route_to_pr_rows() {
+        let mut app = test_app(default_bindings());
+        app.mouse_layout.pr_list = Some(Rect::new(80, 1, 20, 5));
+
+        assert!(matches!(
+            app.mouse_target(81, 1),
+            Some(MouseTarget::PullRequestRow(_))
+        ));
+        assert!(!matches!(
+            app.mouse_target(79, 1),
+            Some(MouseTarget::PullRequestRow(_))
+        ));
     }
 
     #[test]
@@ -9662,6 +9679,7 @@ not_a_real_action = ["x"]
                 title: "Fix issue".to_string(),
                 state: "OPEN".to_string(),
                 head_branch: "feature/pr-42".to_string(),
+                base_branch: "main".to_string(),
                 custom_name: Some("feature/pr-42".to_string()),
                 use_existing_branch: false,
             },
@@ -12008,6 +12026,7 @@ not_a_real_action = ["x"]
                     title: "Fix issue".to_string(),
                     state: "OPEN".to_string(),
                     head_ref_name: "feature/pr-42".to_string(),
+                    base_ref_name: "main".to_string(),
                 }),
             })
             .expect("send PR resolution");

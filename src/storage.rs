@@ -834,6 +834,37 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Remove stack edges whose endpoints are gone, then remove canonical PRs
+    /// that are neither linked to a worktree nor part of a stack.
+    pub fn prune_orphaned_pull_requests(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            delete from pull_request_stacks
+            where (child_host, child_owner_repo, child_number) not in (
+                    select host, owner_repo, number from pull_requests
+                  )
+               or (parent_host, parent_owner_repo, parent_number) not in (
+                    select host, owner_repo, number from pull_requests
+                  );
+            delete from pull_requests
+            where not exists (
+                    select 1 from worktree_pull_requests links
+                    where links.host = pull_requests.host
+                      and links.owner_repo = pull_requests.owner_repo
+                      and links.number = pull_requests.number
+                  )
+              and not exists (
+                    select 1 from pull_request_stacks stacks
+                    where (stacks.child_host, stacks.child_owner_repo, stacks.child_number)
+                          = (pull_requests.host, pull_requests.owner_repo, pull_requests.number)
+                       or (stacks.parent_host, stacks.parent_owner_repo, stacks.parent_number)
+                          = (pull_requests.host, pull_requests.owner_repo, pull_requests.number)
+                  );
+            "#,
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
         self.conn.execute(
             UPSERT_SESSION_SQL,
@@ -934,6 +965,7 @@ impl SessionStore {
             params![id],
         )?;
         transaction.commit()?;
+        self.prune_orphaned_pull_requests()?;
         Ok(())
     }
 
@@ -971,6 +1003,7 @@ impl SessionStore {
             params![cutoff.to_rfc3339()],
         )?;
         transaction.commit()?;
+        self.prune_orphaned_pull_requests()?;
         Ok(deleted)
     }
 
@@ -1686,6 +1719,58 @@ mod pr_tests {
         assert_eq!(store.load_pr_links().unwrap().len(), 1);
         store.permanently_delete_session("s1").unwrap();
         assert!(store.load_pr_links().unwrap().is_empty());
+    }
+
+    #[test]
+    fn permanent_delete_prunes_orphaned_prs_but_keeps_stack_parents() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.upsert_session(&session).unwrap();
+        let child = PrKey::new("github.com", "owner/repo", 2);
+        let parent = PrKey::new("github.com", "owner/repo", 1);
+        store
+            .upsert_pull_request(&spr(1, "github.com", "owner/repo", "OPEN", "b1", "main"))
+            .unwrap();
+        store
+            .upsert_pull_request(&spr(2, "github.com", "owner/repo", "OPEN", "b2", "b1"))
+            .unwrap();
+        store
+            .link_pull_request("s1", &child, PrLinkSource::Discovered)
+            .unwrap();
+        store
+            .upsert_pr_stack(&child, &parent, PrRelationSource::Detected)
+            .unwrap();
+
+        let mut store = store;
+        store.permanently_delete_session("s1").unwrap();
+        let prs = store.load_pull_requests().unwrap();
+        assert_eq!(
+            prs.len(),
+            2,
+            "a child with no links but a stack edge must not be pruned"
+        );
+
+        let lone = PrKey::new("github.com", "owner/repo", 9);
+        store
+            .upsert_pull_request(&spr(9, "github.com", "owner/repo", "OPEN", "b9", "main"))
+            .unwrap();
+        // Link the lone PR to a live session, then delete that session to
+        // exercise the orphan-pruning path.
+        let session2 = test_session("s2", now, now);
+        store.upsert_session(&session2).unwrap();
+        store
+            .link_pull_request("s2", &lone, PrLinkSource::Discovered)
+            .unwrap();
+        store.permanently_delete_session("s2").unwrap();
+        assert!(
+            !store
+                .load_pull_requests()
+                .unwrap()
+                .iter()
+                .any(|pr| pr.number == 9),
+            "an unlinked PR outside any stack should be pruned"
+        );
     }
 
     #[test]

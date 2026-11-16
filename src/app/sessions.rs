@@ -998,6 +998,7 @@ impl App {
             fork_provider_session: false,
             pty_size: self.pty_size_for_launch(),
             scrollback_lines: self.config.ui.agent_scrollback_lines,
+            source_pr: None,
             kind,
         }
     }
@@ -1826,8 +1827,19 @@ impl App {
                 session.project_id.clone(),
                 session.id.clone(),
             );
+            self.archived_sessions
+                .retain(|archived| archived.id != session.id);
         } else {
             self.session_store.archive_and_delete_session(&session)?;
+            if let Some(existing) = self
+                .archived_sessions
+                .iter_mut()
+                .find(|archived| archived.id == session.id)
+            {
+                *existing = session.clone();
+            } else {
+                self.archived_sessions.push(session.clone());
+            }
         }
 
         self.cancel_provider_session_id_discovery(&session.id);
@@ -3899,6 +3911,7 @@ mod tests {
             session_store,
             projects,
             sessions,
+            archived_sessions: Vec::new(),
             groups: Vec::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -4013,6 +4026,7 @@ mod tests {
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
             pr_poller_running: Arc::new(AtomicBool::new(false)),
+            pr_poll_interval_secs: Arc::new(std::sync::atomic::AtomicU64::new(45)),
             pr_last_checked: std::collections::HashMap::new(),
             pr_base_lookups: std::collections::HashSet::new(),
             pr_base_last_checked: std::collections::HashMap::new(),
@@ -6091,53 +6105,6 @@ mod tests {
     }
 
     #[test]
-    fn default_pr_base_uses_stacked_source_branch_when_it_has_a_pr() {
-        let mut session = make_session("s1", "codex", "/tmp/worktree");
-        session.source_branch = "feature-a".to_string();
-        session.branch_name = "feature-b".to_string();
-        let project = make_project("project-1", "codex");
-        let mut app = test_app_with_sessions(vec![session], vec![project]);
-        app.github_integration_enabled = true;
-        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "OPEN"));
-        app.reload_pull_request_state();
-
-        assert_eq!(
-            app.default_pr_base_for_session(&app.sessions[0]),
-            "feature-a",
-            "a child PR should stack on the PR opened for its source branch"
-        );
-    }
-
-    #[test]
-    fn default_pr_base_ignores_terminal_source_pr() {
-        let mut session = make_session("s1", "codex", "/tmp/worktree");
-        session.source_branch = "feature-a".to_string();
-        session.branch_name = "feature-b".to_string();
-        let project = make_project("project-1", "codex");
-        let mut app = test_app_with_sessions(vec![session], vec![project]);
-        app.github_integration_enabled = true;
-        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "MERGED"));
-        app.reload_pull_request_state();
-
-        assert_eq!(
-            app.default_pr_base_for_session(&app.sessions[0]),
-            "main",
-            "a merged source PR should not become the base for a new PR"
-        );
-    }
-
-    #[test]
-    fn default_pr_base_falls_back_to_project_leading_branch() {
-        let session = make_session("s1", "codex", "/tmp/worktree");
-        let project = make_project("project-1", "codex");
-        let mut app = test_app_with_sessions(vec![session], vec![project]);
-        app.sessions[0].source_branch = "feature-a".to_string();
-        app.projects[0].leading_branch = Some("main".to_string());
-
-        assert_eq!(app.default_pr_base_for_session(&app.sessions[0]), "main");
-    }
-
-    #[test]
     fn pr_section_visibility_respects_config_and_selection() {
         let session = make_session("s1", "codex", "/tmp/worktree");
         let project = make_project("project-1", "codex");
@@ -6151,6 +6118,207 @@ mod tests {
         assert!(app.pr_section_visible());
         app.config.ui.pr_section = false;
         assert!(!app.pr_section_visible());
+    }
+
+    fn render_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render frame");
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn row_containing(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|row| row.contains(needle))
+    }
+
+    #[test]
+    fn pr_section_renders_above_changes() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let rows = render_rows(&mut app, 120, 30);
+        let pr_row = row_containing(&rows, "Pull Requests (1)").expect("PR section title");
+        let changes_row = row_containing(&rows, "Changes").expect("Changes title");
+        assert!(
+            pr_row < changes_row,
+            "PR section should render above Changes:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn imported_pr_is_linked_immediately_with_imported_source() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let branch = session.branch_name.clone();
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        let pr = crate::model::PrInfo {
+            number: 12,
+            state: crate::model::PrState::Open,
+            title: "From PR".to_string(),
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            url: "https://github.com/owner/repo/pull/12".to_string(),
+            is_draft: false,
+            head_ref: branch.clone(),
+            base_ref: "main".to_string(),
+            head_repo: String::new(),
+        };
+        app.link_imported_pull_request("s1", &pr).unwrap();
+
+        assert_eq!(
+            app.current_pr_key_for_session("s1", &branch)
+                .map(|key| key.number),
+            Some(12)
+        );
+        let links = app.session_store.load_pr_links().unwrap();
+        assert!(links.iter().any(|link| {
+            link.session_id == "s1"
+                && link.key.number == 12
+                && link.source == crate::model::PrLinkSource::Imported
+        }));
+    }
+
+    #[test]
+    fn pull_requests_control_response_lists_session_prs() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(7, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let response = app.pull_requests_response(Some("s1"));
+        assert!(response.ok);
+        assert_eq!(response.pull_requests.len(), 1);
+        assert_eq!(response.pull_requests[0].number, 7);
+        assert_eq!(response.pull_requests[0].session_id, "s1");
+        assert!(response.pull_requests[0].is_current);
+    }
+
+    #[test]
+    fn pr_tracking_caches_prune_stale_sessions_and_bases() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(1, "branch-s1", "feature-a", "OPEN"),
+        );
+        app.reload_pull_request_state();
+
+        let now = std::time::Instant::now();
+        app.pr_last_checked.insert("s1".to_string(), now);
+        app.pr_last_checked.insert("ghost".to_string(), now);
+        app.pr_base_last_checked.insert(
+            (
+                "github.com".to_string(),
+                "owner/repo".to_string(),
+                "feature-a".to_string(),
+            ),
+            now,
+        );
+        app.pr_base_last_checked.insert(
+            (
+                "github.com".to_string(),
+                "owner/repo".to_string(),
+                "stale".to_string(),
+            ),
+            now,
+        );
+        app.prune_pr_tracking_caches();
+
+        assert!(app.pr_last_checked.contains_key("s1"));
+        assert!(!app.pr_last_checked.contains_key("ghost"));
+        assert!(app.pr_base_last_checked.contains_key(&(
+            "github.com".to_string(),
+            "owner/repo".to_string(),
+            "feature-a".to_string()
+        )));
+        assert!(!app.pr_base_last_checked.contains_key(&(
+            "github.com".to_string(),
+            "owner/repo".to_string(),
+            "stale".to_string()
+        )));
+    }
+
+    #[test]
+    fn archived_sessions_contribute_prs_to_project_and_related_views() {
+        let mut first = make_session("s1", "codex", "/tmp/worktree-1");
+        first.group_id = Some("group-1".to_string());
+        let mut archived = make_session("s2", "codex", "/tmp/worktree-2");
+        archived.group_id = Some("group-1".to_string());
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![first], vec![project]);
+        app.archived_sessions.push(archived);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s2", stored_pr(2, "branch-s2", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let project_prs = app.prs_for_project("project-1");
+        assert!(project_prs.iter().any(|pr| pr.number == 2));
+        let rows = app.pr_section_rows_for_session(&app.sessions[0]);
+        assert!(rows.iter().any(|row| row.key.number == 2 && row.is_related));
+    }
+
+    #[test]
+    fn project_pr_badge_counts_only_active_prs() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s1", stored_pr(2, "old-branch", "main", "MERGED"));
+        app.reload_pull_request_state();
+
+        let rows = render_rows(&mut app, 120, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("PR 1")),
+            "project row should show the active PR count:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("PR 2")),
+            "merged history should not inflate the project badge:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn pr_section_is_hidden_without_associated_prs() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+
+        let rows = render_rows(&mut app, 120, 30);
+        assert!(
+            !rows.iter().any(|row| row.contains("Pull Requests")),
+            "empty PR section should be hidden:\n{}",
+            rows.join("\n")
+        );
     }
 
     #[test]

@@ -136,7 +136,7 @@ The right pane lists changed files, opens syntax-highlighted diffs, and keeps qu
 
 **AI commit messages:** Stage your changes, hit a key, and dux sends the diff to your provider in oneshot mode. It drafts a commit message using Conventional Commits, you tweak it (or don't), and commit. The prompt is customizable once in `config.toml` for the whole app.
 
-**PR tracking:** With the `gh` CLI installed, dux tracks pull requests for your agent branches and shows status pills right in the interface. The right pane gets a focusable **Pull Requests** section above Changes that lists the selected worktree's PRs, its detected stack, and PRs from related agents in other repos. Stack parents are detected automatically from each PR's base branch; the command palette can link a parent manually when a stack was created outside dux. You can also create a PR for the selected agent from the palette.
+**PR tracking:** With the `gh` CLI installed, dux tracks pull requests for your agent branches and shows status pills right in the interface. The right pane gets a focusable **Pull Requests** section above Changes that lists the selected worktree's PRs, its detected stack, and PRs from related agents in other repos. Stack parents are detected automatically from each PR's base branch; the command palette can link a parent manually when a stack was created outside dux. dux tracks PRs created by your agents, so agent skills and prompts remain in control of the PR title, body, and base branch. Agents can also run `dux pr list` to inspect related PRs and `dux pr link <url|#num>` to associate a PR with their worktree explicitly.
 
 ## Companion Terminals
 

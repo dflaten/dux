@@ -46,10 +46,82 @@ impl App {
                 let response = self.related_agents_response(source_session_id.as_deref());
                 let _ = respond.send(response);
             }
+            ControlCommand::PullRequests { source_session_id } => {
+                let response = self.pull_requests_response(source_session_id.as_deref());
+                let _ = respond.send(response);
+            }
+            ControlCommand::LinkPullRequest {
+                source_session_id,
+                input,
+            } => {
+                self.handle_link_pull_request(source_session_id, input, respond);
+            }
             ControlCommand::SplitOut(params) => {
                 self.handle_split_out_request(params, respond);
             }
         }
+    }
+
+    fn handle_link_pull_request(
+        &mut self,
+        source_session_id: Option<String>,
+        input: String,
+        respond: Sender<ControlResponse>,
+    ) {
+        let Some(source_session_id) = source_session_id else {
+            let _ = respond.send(ControlResponse::error(
+                "invalid_source",
+                "No source session was supplied. Set DUX_SESSION_ID or pass --session.",
+            ));
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id == source_session_id)
+            .cloned()
+        else {
+            let response = if self
+                .archived_sessions
+                .iter()
+                .any(|session| session.id == source_session_id)
+            {
+                ControlResponse::error(
+                    "invalid_source",
+                    "That agent is archived. Restore it before linking a pull request.",
+                )
+            } else {
+                ControlResponse::error(
+                    "invalid_source",
+                    format!("Agent session \"{source_session_id}\" no longer exists."),
+                )
+            };
+            let _ = respond.send(response);
+            return;
+        };
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == session.project_id)
+            .cloned()
+        else {
+            let _ = respond.send(ControlResponse::error(
+                "invalid_project",
+                "The agent's project is no longer registered.",
+            ));
+            return;
+        };
+        let request_id = Uuid::new_v4().to_string();
+        self.pending_control_responses
+            .insert(request_id.clone(), respond);
+        self.set_busy(format!(
+            "Linking a pull request to agent \"{}\"...",
+            session.branch_name
+        ));
+        let worker_tx = self.worker_tx.clone();
+        thread::spawn(move || {
+            super::workers::run_pr_link_job(request_id, session.id, project, input, worker_tx);
+        });
     }
 
     fn handle_split_out_request(

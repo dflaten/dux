@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,6 +83,9 @@ pub struct App {
     pub(crate) session_store: SessionStore,
     pub(crate) projects: Vec<Project>,
     pub(crate) sessions: Vec<AgentSession>,
+    /// Archived agent sessions retained for recovery. PR views include their
+    /// associations so project and related-work history stays visible.
+    pub(crate) archived_sessions: Vec<AgentSession>,
     pub(crate) groups: Vec<AgentGroup>,
     pub(crate) staged_files: Vec<ChangedFile>,
     pub(crate) unstaged_files: Vec<ChangedFile>,
@@ -231,6 +234,9 @@ pub struct App {
     pub(crate) pr_sync_enabled: Arc<AtomicBool>,
     /// Guards against spawning more than one long-lived poller.
     pub(crate) pr_poller_running: Arc<AtomicBool>,
+    /// Current poll interval in seconds, shared with the running poller so a
+    /// config reload takes effect without restarting the thread.
+    pub(crate) pr_poll_interval_secs: Arc<AtomicU64>,
     /// Timestamps of the last PR check per session, to avoid hammering on rapid
     /// state transitions.
     pub(crate) pr_last_checked: HashMap<String, Instant>,
@@ -790,6 +796,7 @@ pub(crate) struct ResolvedPullRequest {
     pub(crate) title: String,
     pub(crate) state: String,
     pub(crate) head_ref_name: String,
+    pub(crate) base_ref_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1928,6 +1935,8 @@ pub(crate) struct AgentLaunchRequest {
     pub(crate) fork_provider_session: bool,
     pub(crate) pty_size: (u16, u16),
     pub(crate) scrollback_lines: usize,
+    /// Source PR when this agent was created from a pull request.
+    pub(crate) source_pr: Option<crate::model::PrInfo>,
     pub(crate) kind: AgentLaunchKind,
 }
 
@@ -1963,6 +1972,7 @@ pub(crate) enum CreateAgentRequest {
         title: String,
         state: String,
         head_branch: String,
+        base_branch: String,
         custom_name: Option<String>,
         use_existing_branch: bool,
     },
@@ -2146,7 +2156,8 @@ pub(crate) enum WorkerEvent {
         child: crate::model::PrKey,
         result: Result<crate::model::PrInfo, String>,
     },
-    PullRequestCreated {
+    PrLinkResolved {
+        request_id: String,
         session_id: String,
         result: Result<crate::model::PrInfo, String>,
     },
@@ -2316,6 +2327,11 @@ impl App {
         )?;
         projects.push(scratch_project(&paths, &config)?);
         let sessions = session_store.load_sessions()?;
+        let archived_sessions = session_store
+            .load_deleted_sessions()?
+            .into_iter()
+            .map(|entry| entry.session)
+            .collect::<Vec<_>>();
         session_store.purge_empty_groups()?;
         let groups = session_store.load_groups()?;
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -2333,6 +2349,7 @@ impl App {
         }
         let gh_integration_val = config.ui.github_integration;
         let pr_banner_at_bottom = config.ui.pr_banner_position == "bottom";
+        let pr_poll_interval_secs = config.ui.github_poll_interval_seconds.max(15);
         let mut app = Self {
             show_diff_line_numbers: config.ui.show_diff_line_numbers,
             left_width_pct: config.ui.left_width_pct,
@@ -2346,6 +2363,7 @@ impl App {
             session_store,
             projects,
             sessions,
+            archived_sessions,
             groups,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -2455,6 +2473,7 @@ impl App {
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
             pr_poller_running: Arc::new(AtomicBool::new(false)),
+            pr_poll_interval_secs: Arc::new(AtomicU64::new(u64::from(pr_poll_interval_secs))),
             pr_last_checked: HashMap::new(),
             pr_base_lookups: HashSet::new(),
             pr_base_last_checked: HashMap::new(),
@@ -2841,12 +2860,6 @@ impl App {
     fn is_palette_action_available(&self, action: Action) -> bool {
         match action {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
-            Action::CreatePullRequest => {
-                self.github_pr_agent_command_available()
-                    && self
-                        .selected_session()
-                        .is_some_and(|session| !session.is_scratch())
-            }
             Action::CopyPullRequestUrl
             | Action::GoToPullRequestAgent
             | Action::LinkStackParent
@@ -3010,7 +3023,6 @@ impl App {
             "open-worktree" => self.open_selected_worktree_in_default_editor(),
             "open-worktree-with" => self.open_worktree_editor_picker(),
             "open-current-pr" => self.open_current_pr_in_browser(),
-            "create-pull-request" => self.create_pull_request_for_selected_session(),
             "copy-pr-url" => self.copy_selected_pr_url(),
             "go-to-pr-agent" => self.go_to_selected_pr_agent(),
             "link-stack-parent" => self.open_link_pr_stack_parent_prompt(),

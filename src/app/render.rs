@@ -918,24 +918,15 @@ impl App {
                                 Style::default().fg(self.theme.provider_label_fg),
                             ));
                         }
-                        let project_prs = self.prs_for_project(&project.id);
-                        if !project_prs.is_empty() {
-                            let color = if project_prs
-                                .iter()
-                                .any(|pr| pr.state == crate::model::PrState::Open)
-                            {
-                                self.theme.pr_open_label
-                            } else if project_prs
-                                .iter()
-                                .any(|pr| pr.state == crate::model::PrState::Merged)
-                            {
-                                self.theme.pr_merged_label
-                            } else {
-                                self.theme.pr_closed_label
-                            };
+                        let active_prs = self
+                            .prs_for_project(&project.id)
+                            .into_iter()
+                            .filter(|pr| pr.state == crate::model::PrState::Open)
+                            .count();
+                        if active_prs > 0 {
                             spans.push(Span::styled(
-                                format!(" PR {}", project_prs.len()),
-                                Style::default().fg(color),
+                                format!(" PR {active_prs}"),
+                                Style::default().fg(self.theme.pr_open_label),
                             ));
                         }
                         if let Some(related) = related_counts.get(&project.id)

@@ -412,36 +412,78 @@ impl App {
                         self.set_error(message);
                     }
                 },
-                WorkerEvent::PullRequestCreated { session_id, result } => match result {
-                    Ok(pr) => {
-                        let stored = App::stored_from_pr(&pr);
-                        if let Err(err) = self.session_store.upsert_pull_request(&stored) {
-                            logger::warn(&format!(
-                                "[gh-integration] failed to persist created PR #{}: {err:#}",
-                                pr.number
-                            ));
+                WorkerEvent::PrLinkResolved {
+                    request_id,
+                    session_id,
+                    result,
+                } => {
+                    let respond = self.pending_control_responses.remove(&request_id);
+                    match result {
+                        Ok(pr) => {
+                            if let Err(err) = self
+                                .session_store
+                                .upsert_pull_request(&App::stored_from_pr(&pr))
+                            {
+                                let message =
+                                    format!("Could not persist PR #{}: {err:#}", pr.number);
+                                if let Some(respond) = respond {
+                                    let _ = respond.send(ControlResponse::error(
+                                        "persistence_failed",
+                                        message.clone(),
+                                    ));
+                                }
+                                self.set_error(message);
+                            } else if let Err(err) = self.session_store.link_pull_request(
+                                &session_id,
+                                &pr.key(),
+                                crate::model::PrLinkSource::Manual,
+                            ) {
+                                let message = format!(
+                                    "Could not link PR #{} to the agent: {err:#}",
+                                    pr.number
+                                );
+                                if let Some(respond) = respond {
+                                    let _ = respond.send(ControlResponse::error(
+                                        "persistence_failed",
+                                        message.clone(),
+                                    ));
+                                }
+                                self.set_error(message);
+                            } else {
+                                self.reload_pull_request_state();
+                                self.update_pr_sync_sessions();
+                                self.rebuild_left_items();
+                                self.select_current_pr_row();
+                                let mut response =
+                                    self.pull_requests_response(Some(&session_id));
+                                response.message = Some(format!(
+                                    "Linked PR {}#{} to agent \"{}\".",
+                                    pr.owner_repo,
+                                    pr.number,
+                                    self.sessions
+                                        .iter()
+                                        .find(|session| session.id == session_id)
+                                        .map(|session| session.branch_name.as_str())
+                                        .unwrap_or(session_id.as_str()),
+                                ));
+                                if let Some(respond) = respond {
+                                    let _ = respond.send(response);
+                                }
+                                self.set_info(format!(
+                                    "Linked PR {}#{} to the agent.",
+                                    pr.owner_repo, pr.number
+                                ));
+                            }
                         }
-                        if let Err(err) = self.session_store.link_pull_request(
-                            &session_id,
-                            &pr.key(),
-                            crate::model::PrLinkSource::Created,
-                        ) {
-                            logger::warn(&format!(
-                                "[gh-integration] failed to link created PR #{}: {err:#}",
-                                pr.number
-                            ));
+                        Err(message) => {
+                            if let Some(respond) = respond {
+                                let _ = respond
+                                    .send(ControlResponse::error("pr_not_found", message.clone()));
+                            }
+                            self.set_error(message);
                         }
-                        self.reload_pull_request_state();
-                        self.rebuild_left_items();
-                        self.select_current_pr_row();
-                        let open_key = self.bindings.label_for(Action::OpenCurrentPullRequest);
-                        self.set_info(format!(
-                            "Created PR {}#{}. Press {open_key} to open it in the browser.",
-                            pr.owner_repo, pr.number
-                        ));
                     }
-                    Err(message) => self.set_error(message),
-                },
+                }
                 WorkerEvent::PullRequestResolved { result } => match result {
                     Ok(pr) => {
                         let request = CreateAgentRequest::PullRequest {
@@ -452,6 +494,7 @@ impl App {
                             title: pr.title.clone(),
                             state: pr.state.clone(),
                             head_branch: pr.head_ref_name.clone(),
+                            base_branch: pr.base_ref_name.clone(),
                             custom_name: Some(pr.head_ref_name.clone()),
                             use_existing_branch: false,
                         };
@@ -541,6 +584,10 @@ impl App {
                                 )
                                 .into_iter()
                                 .next();
+                                self.archived_sessions = entries
+                                    .iter()
+                                    .map(|entry| entry.session.clone())
+                                    .collect();
                                 prompt.entries = entries;
                                 prompt.error = None;
                                 status = Some(Ok("Choose a deleted agent to restore."));
@@ -586,6 +633,8 @@ impl App {
                             PromptState::RecoverDeletedAgent(_)
                         );
                         self.sessions.push(session);
+                        self.archived_sessions
+                            .retain(|archived| archived.id != restored_session_id);
                         self.update_branch_sync_sessions();
                         self.update_pr_sync_sessions();
                         self.reload_pull_request_state();
@@ -1585,6 +1634,14 @@ impl App {
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
             self.providers.insert(session.id.clone(), client);
             self.sessions.insert(0, session.clone());
+            if let Some(pr) = request.source_pr.as_ref()
+                && let Err(err) = self.link_imported_pull_request(&session.id, pr)
+            {
+                logger::warn(&format!(
+                    "[gh-integration] failed to link imported PR #{}: {err:#}",
+                    pr.number
+                ));
+            }
             self.mark_session_provider_started(&session.id);
             if request.resume {
                 self.resume_fallback_candidates
@@ -2403,6 +2460,10 @@ impl App {
     /// Start the long-lived poller if it is not already running. Safe to call
     /// repeatedly from startup, the runtime toggle, and config reload.
     pub(crate) fn ensure_pr_polling(&self) {
+        self.pr_poll_interval_secs.store(
+            u64::from(self.config.ui.github_poll_interval_seconds.max(15)),
+            Ordering::Relaxed,
+        );
         if self
             .pr_poller_running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -2415,13 +2476,12 @@ impl App {
         let sessions = Arc::clone(&self.pr_sync_sessions);
         let enabled = Arc::clone(&self.pr_sync_enabled);
         let running = Arc::clone(&self.pr_poller_running);
-        let interval = Duration::from_secs(u64::from(
-            self.config.ui.github_poll_interval_seconds.max(15),
-        ));
+        let interval = Arc::clone(&self.pr_poll_interval_secs);
         enabled.store(true, Ordering::Relaxed);
         thread::spawn(move || {
             loop {
-                thread::sleep(interval);
+                let secs = interval.load(Ordering::Relaxed).max(15);
+                thread::sleep(Duration::from_secs(secs));
                 if !enabled.load(Ordering::Relaxed) {
                     break;
                 }
@@ -2909,7 +2969,7 @@ pub(crate) fn run_pull_request_lookup_job(
             "--repo",
             &repo,
             "--json",
-            "number,title,state,headRefName",
+            "number,title,state,headRefName,baseRefName",
         ])
         .output();
     let result = match output {
@@ -2930,116 +2990,42 @@ pub(crate) fn run_pull_request_lookup_job(
     let _ = worker_tx.send(WorkerEvent::PullRequestResolved { result });
 }
 
-pub(crate) fn run_create_pull_request_job(
-    session: AgentSession,
-    project: Project,
-    base: String,
-    worker_tx: Sender<WorkerEvent>,
-) {
-    let result = (|| -> Result<crate::model::PrInfo, String> {
-        let worktree = Path::new(&session.worktree_path);
-        let remote = git::remote_github_repo(worktree).ok_or_else(|| {
-            format!(
-                "Worktree {} does not have a GitHub origin remote.",
-                session.worktree_path
-            )
-        })?;
-
-        // Ensure the branch exists on the remote before gh tries to open a PR.
-        let upstream = std::process::Command::new("git")
-            .args([
-                "-C",
-                &session.worktree_path,
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{u}",
-            ])
-            .output();
-        let has_upstream = upstream.as_ref().is_ok_and(|out| out.status.success());
-        if !has_upstream {
-            let push = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &session.worktree_path,
-                    "push",
-                    "--set-upstream",
-                    "origin",
-                    &session.branch_name,
-                ])
-                .output()
-                .map_err(|err| format!("Failed to push the branch before creating a PR: {err}"))?;
-            if !push.status.success() {
-                return Err(format!(
-                    "Could not push \"{}\" before creating the PR: {}",
-                    session.branch_name,
-                    String::from_utf8_lossy(&push.stderr).trim()
-                ));
-            }
-        }
-
-        let repo = gh_repo_arg(&remote.host, &remote.owner_repo);
-        let output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "create",
-                "--repo",
-                &repo,
-                "--head",
-                &session.branch_name,
-                "--base",
-                &base,
-                "--fill",
-            ])
-            .output()
-            .map_err(|err| format!("Failed to run gh pr create: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to create a pull request for project \"{}\": {}",
-                project.name,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let url = stdout
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|line| line.contains("/pull/"))
-            .ok_or_else(|| "gh pr create succeeded but did not print a PR URL.".to_string())?;
-        let lookup =
-            super::sessions::parse_pull_request_lookup(url, &remote.host, &remote.owner_repo)?;
-        let view = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &lookup.number.to_string(),
-                "--repo",
-                &repo,
-                "--json",
-                PR_JSON_FIELDS,
-            ])
-            .output()
-            .map_err(|err| format!("Failed to read the created PR: {err}"))?;
-        if !view.status.success() {
-            return Err(format!(
-                "Created PR #{} but could not read its details: {}",
-                lookup.number,
-                String::from_utf8_lossy(&view.stderr).trim()
-            ));
-        }
-        parse_pr_json_object(
-            String::from_utf8_lossy(&view.stdout).trim(),
-            &remote.host,
-            &remote.owner_repo,
+fn resolve_pr_for_project(
+    project: &Project,
+    raw_input: &str,
+) -> Result<crate::model::PrInfo, String> {
+    let remote = git::remote_github_repo(Path::new(&project.path)).ok_or_else(|| {
+        format!(
+            "Project \"{}\" does not have a GitHub origin remote.",
+            project.name
         )
-        .ok_or_else(|| "gh returned unparsable JSON for the created PR.".to_string())
-    })();
-    let _ = worker_tx.send(WorkerEvent::PullRequestCreated {
-        session_id: session.id,
-        result,
-    });
+    })?;
+    let lookup =
+        super::sessions::parse_pull_request_lookup(raw_input, &remote.host, &remote.owner_repo)?;
+    let repo = gh_repo_arg(&lookup.host, &lookup.owner_repo);
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &lookup.number.to_string(),
+            "--repo",
+            &repo,
+            "--json",
+            PR_JSON_FIELDS,
+        ])
+        .output()
+        .map_err(|err| format!("Failed to run gh pr view: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to resolve PR #{} from {}: {}",
+            lookup.number,
+            lookup.owner_repo,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_pr_json_object(text.trim(), &lookup.host, &lookup.owner_repo)
+        .ok_or_else(|| "gh returned an unparsable pull request.".to_string())
 }
 
 pub(crate) fn run_pr_stack_parent_lookup_job(
@@ -3048,44 +3034,23 @@ pub(crate) fn run_pr_stack_parent_lookup_job(
     raw_input: String,
     worker_tx: Sender<WorkerEvent>,
 ) {
-    let result = (|| -> Result<crate::model::PrInfo, String> {
-        let remote = git::remote_github_repo(Path::new(&project.path)).ok_or_else(|| {
-            format!(
-                "Project \"{}\" does not have a GitHub origin remote.",
-                project.name
-            )
-        })?;
-        let lookup = super::sessions::parse_pull_request_lookup(
-            &raw_input,
-            &remote.host,
-            &remote.owner_repo,
-        )?;
-        let repo = gh_repo_arg(&lookup.host, &lookup.owner_repo);
-        let output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &lookup.number.to_string(),
-                "--repo",
-                &repo,
-                "--json",
-                PR_JSON_FIELDS,
-            ])
-            .output()
-            .map_err(|err| format!("Failed to run gh pr view: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to resolve parent PR #{} from {}: {}",
-                lookup.number,
-                lookup.owner_repo,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        parse_pr_json_object(text.trim(), &lookup.host, &lookup.owner_repo)
-            .ok_or_else(|| "gh returned an unparsable pull request.".to_string())
-    })();
+    let result = resolve_pr_for_project(&project, &raw_input);
     let _ = worker_tx.send(WorkerEvent::PrStackParentResolved { child, result });
+}
+
+pub(crate) fn run_pr_link_job(
+    request_id: String,
+    session_id: String,
+    project: Project,
+    raw_input: String,
+    worker_tx: Sender<WorkerEvent>,
+) {
+    let result = resolve_pr_for_project(&project, &raw_input);
+    let _ = worker_tx.send(WorkerEvent::PrLinkResolved {
+        request_id,
+        session_id,
+        result,
+    });
 }
 
 type CreateAgentWorktreeResult = (String, String, String, PathBuf, bool, Option<String>, bool);
@@ -3282,6 +3247,30 @@ pub(crate) fn run_create_agent_job(
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
 ) {
+    let source_pr = match &request {
+        CreateAgentRequest::PullRequest {
+            host,
+            owner_repo,
+            number,
+            title,
+            state,
+            head_branch,
+            base_branch,
+            ..
+        } => Some(crate::model::PrInfo {
+            number: *number,
+            state: crate::model::PrState::from_db_str(state).unwrap_or(crate::model::PrState::Open),
+            title: title.clone(),
+            host: host.clone(),
+            owner_repo: owner_repo.clone(),
+            url: pull_request_url(host, owner_repo, *number),
+            is_draft: false,
+            head_ref: head_branch.clone(),
+            base_ref: base_branch.clone(),
+            head_repo: String::new(),
+        }),
+        _ => None,
+    };
     let (
         project,
         provider,
@@ -3536,6 +3525,7 @@ pub(crate) fn run_create_agent_job(
             title,
             state,
             head_branch,
+            base_branch: _,
             custom_name,
             use_existing_branch,
         } => {
@@ -3982,6 +3972,7 @@ pub(crate) fn run_create_agent_job(
         fork_provider_session,
         pty_size: (rows, cols),
         scrollback_lines: config.ui.agent_scrollback_lines,
+        source_pr,
         kind: AgentLaunchKind::Create {
             status_message,
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -4466,7 +4457,13 @@ pub(crate) fn run_pr_base_lookup_job(
     base_ref: String,
     worker_tx: Sender<WorkerEvent>,
 ) {
-    let result = match lookup_pr_by_branch(&base_ref, &host, &owner_repo, "base-lookup") {
+    let result = match lookup_pr_by_branch(
+        &base_ref,
+        &host,
+        &owner_repo,
+        "base-lookup",
+        Path::new("gh"),
+    ) {
         super::PrLookup::Found(pr) => Some(pr),
         _ => None,
     };
@@ -4491,6 +4488,11 @@ pub(crate) fn run_pr_base_lookup_job(
 /// no reason to check for newer PRs. This reduces API calls from O(sessions)
 /// to O(active_sessions) for repos with many completed agents.
 fn check_pr_for_entry(entry: &PrSyncEntry) -> super::PrLookup {
+    check_pr_for_entry_with_gh(entry, Path::new("gh"))
+}
+
+/// Testable PR decision path with an injectable `gh` binary.
+fn check_pr_for_entry_with_gh(entry: &PrSyncEntry, gh_bin: &Path) -> super::PrLookup {
     let remote = git::remote_github_repo(Path::new(&entry.worktree_path));
     let (host, owner_repo) = if let Some(remote) = remote {
         (remote.host, remote.owner_repo)
@@ -4517,7 +4519,13 @@ fn check_pr_for_entry(entry: &PrSyncEntry) -> super::PrLookup {
 
             // Terminal PR but agent is still running — it might push new
             // commits and open a follow-up PR.
-            match lookup_pr_by_branch(&entry.branch_name, &host, &owner_repo, &entry.session_id) {
+            match lookup_pr_by_branch(
+                &entry.branch_name,
+                &host,
+                &owner_repo,
+                &entry.session_id,
+                gh_bin,
+            ) {
                 super::PrLookup::Found(newer) if newer.number > known.number => {
                     return super::PrLookup::Found(newer);
                 }
@@ -4538,11 +4546,17 @@ fn check_pr_for_entry(entry: &PrSyncEntry) -> super::PrLookup {
             &known.host,
             &known.owner_repo,
             &entry.session_id,
+            gh_bin,
         ) {
             super::PrLookup::Found(pr) => {
                 // Also check if a newer PR was opened on the branch.
-                match lookup_pr_by_branch(&entry.branch_name, &host, &owner_repo, &entry.session_id)
-                {
+                match lookup_pr_by_branch(
+                    &entry.branch_name,
+                    &host,
+                    &owner_repo,
+                    &entry.session_id,
+                    gh_bin,
+                ) {
                     super::PrLookup::Found(newer) if newer.number > pr.number => {
                         return super::PrLookup::Found(newer);
                     }
@@ -4572,7 +4586,13 @@ fn check_pr_for_entry(entry: &PrSyncEntry) -> super::PrLookup {
     }
 
     // No known PR — discover by branch name.
-    lookup_pr_by_branch(&entry.branch_name, &host, &owner_repo, &entry.session_id)
+    lookup_pr_by_branch(
+        &entry.branch_name,
+        &host,
+        &owner_repo,
+        &entry.session_id,
+        gh_bin,
+    )
 }
 
 /// Check a known PR by number using `gh pr view`.
@@ -4581,9 +4601,10 @@ fn view_pr_by_number(
     host: &str,
     owner_repo: &str,
     session_id: &str,
+    gh_bin: &Path,
 ) -> super::PrLookup {
     let repo = gh_repo_arg(host, owner_repo);
-    let output = std::process::Command::new("gh")
+    let output = std::process::Command::new(gh_bin)
         .args([
             "pr",
             "view",
@@ -4634,9 +4655,10 @@ fn lookup_pr_by_branch(
     host: &str,
     owner_repo: &str,
     session_id: &str,
+    gh_bin: &Path,
 ) -> super::PrLookup {
     let repo = gh_repo_arg(host, owner_repo);
-    let output = std::process::Command::new("gh")
+    let output = std::process::Command::new(gh_bin)
         .args([
             "pr",
             "list",
@@ -4802,6 +4824,11 @@ fn parse_resolved_pull_request_json(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "gh PR response did not include a head branch.".to_string())?
         .to_string();
+    let base_ref_name = obj
+        .get("baseRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok(ResolvedPullRequest {
         project,
         host: host.to_string(),
@@ -4810,6 +4837,7 @@ fn parse_resolved_pull_request_json(
         title,
         state,
         head_ref_name,
+        base_ref_name,
     })
 }
 
@@ -5394,6 +5422,7 @@ pub(crate) fn run_split_out_create_job(
         fork_provider_session: false,
         pty_size: (rows, cols),
         scrollback_lines: config.ui.agent_scrollback_lines,
+        source_pr: None,
         kind: AgentLaunchKind::Create {
             status_message,
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -6089,6 +6118,7 @@ mod tests {
             pty_size: (24, 80),
             scrollback_lines: 1_000,
             env: Vec::new(),
+            source_pr: None,
             kind: AgentLaunchKind::Reconnect {
                 status_message: "reconnect".to_string(),
                 focus: true,
@@ -6128,6 +6158,7 @@ mod tests {
             pty_size: (24, 80),
             scrollback_lines: 1_000,
             env: Vec::new(),
+            source_pr: None,
             kind: AgentLaunchKind::Reconnect {
                 status_message: "reconnect".to_string(),
                 focus: true,
@@ -6503,6 +6534,97 @@ mod tests {
             pull_request_url("", "owner/repo", 12),
             "https://github.com/owner/repo/pull/12"
         );
+    }
+
+    fn pr_test_entry(worktree: &Path) -> PrSyncEntry {
+        PrSyncEntry {
+            session_id: "session-1".to_string(),
+            branch_name: "feature".to_string(),
+            worktree_path: worktree.to_string_lossy().to_string(),
+            known_pr: None,
+            agent_exited: false,
+        }
+    }
+
+    fn write_fake_gh(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("fake gh");
+        let mut perms = std::fs::metadata(&path)
+            .expect("fake gh metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("fake gh permissions");
+        path
+    }
+
+    fn init_pr_repo(dir: &Path) {
+        run_git(dir, &["init", "-b", "main"]);
+        run_git(
+            dir,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+    }
+
+    #[test]
+    fn pr_lookup_found_parses_stack_fields() {
+        let tmp = tempdir().expect("tempdir");
+        init_pr_repo(tmp.path());
+        let gh = write_fake_gh(
+            tmp.path(),
+            r#"cat <<'JSON'
+[{"number":42,"state":"OPEN","title":"Demo","url":"https://github.com/owner/repo/pull/42","isDraft":true,"headRefName":"feature","baseRefName":"feature-a"}]
+JSON"#,
+        );
+        let entry = pr_test_entry(tmp.path());
+
+        match check_pr_for_entry_with_gh(&entry, &gh) {
+            PrLookup::Found(pr) => {
+                assert_eq!(pr.number, 42);
+                assert!(pr.is_draft);
+                assert_eq!(pr.head_ref, "feature");
+                assert_eq!(pr.base_ref, "feature-a");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_lookup_not_found_is_distinct_from_failure() {
+        let tmp = tempdir().expect("tempdir");
+        init_pr_repo(tmp.path());
+        let gh = write_fake_gh(tmp.path(), "echo '[]'");
+        let entry = pr_test_entry(tmp.path());
+
+        match check_pr_for_entry_with_gh(&entry, &gh) {
+            PrLookup::NotFound { branch, .. } => assert_eq!(branch, "feature"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_lookup_failure_keeps_known_pr() {
+        let tmp = tempdir().expect("tempdir");
+        init_pr_repo(tmp.path());
+        let gh = write_fake_gh(tmp.path(), "echo 'HTTP 401: Bad credentials' >&2; exit 1");
+        let mut entry = pr_test_entry(tmp.path());
+        entry.known_pr = Some(crate::model::PrInfo {
+            number: 7,
+            state: PrState::Open,
+            title: "Known".to_string(),
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            url: "https://github.com/owner/repo/pull/7".to_string(),
+            is_draft: false,
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            head_repo: String::new(),
+        });
+
+        match check_pr_for_entry_with_gh(&entry, &gh) {
+            PrLookup::Found(pr) => assert_eq!(pr.number, 7),
+            other => panic!("expected known PR to survive, got {other:?}"),
+        }
     }
 
     #[test]

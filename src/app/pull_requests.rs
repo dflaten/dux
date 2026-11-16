@@ -69,6 +69,7 @@ impl App {
             self.pr_statuses.clear();
             self.pr_index = 0;
             self.pr_section_session = None;
+            self.prune_pr_tracking_caches();
             return;
         }
 
@@ -110,7 +111,37 @@ impl App {
 
         self.reconcile_pr_stacks();
         self.rebuild_current_pr_statuses();
+        self.prune_pr_tracking_caches();
         self.clamp_pr_index();
+    }
+
+    /// Drop per-session and per-base lookup caches that no longer refer to
+    /// live work. Without this the maps grow for every session and branch a
+    /// long-running dux process ever sees.
+    pub(crate) fn prune_pr_tracking_caches(&mut self) {
+        let active_sessions = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<HashSet<_>>();
+        self.pr_last_checked
+            .retain(|session_id, _| active_sessions.contains(session_id.as_str()));
+
+        let known_bases = self
+            .pull_requests
+            .values()
+            .filter(|pr| !pr.base_ref.trim().is_empty())
+            .map(|pr| {
+                (
+                    pr.host.trim().to_ascii_lowercase(),
+                    pr.owner_repo.trim().to_ascii_lowercase(),
+                    pr.base_ref.clone(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let in_flight = &self.pr_base_lookups;
+        self.pr_base_last_checked
+            .retain(|slot, _| known_bases.contains(slot) || in_flight.contains(slot));
     }
 
     /// Recompute detected stack edges from PR base/head refs. Manual edges are
@@ -261,6 +292,10 @@ impl App {
         }
     }
 
+    fn pr_view_sessions(&self) -> impl Iterator<Item = &AgentSession> {
+        self.sessions.iter().chain(self.archived_sessions.iter())
+    }
+
     fn linked_prs_for_session(&self, session_id: &str) -> Vec<&PrInfo> {
         self.pr_links
             .get(session_id)
@@ -299,12 +334,23 @@ impl App {
     }
 
     pub(crate) fn pr_section_rows_for_session(&self, session: &AgentSession) -> Vec<PrSectionRow> {
+        self.pr_section_rows_for_session_with_related(
+            session,
+            self.config.ui.pr_section_show_related,
+        )
+    }
+
+    fn pr_section_rows_for_session_with_related(
+        &self,
+        session: &AgentSession,
+        include_related: bool,
+    ) -> Vec<PrSectionRow> {
         if session.is_scratch() {
             return Vec::new();
         }
         let Some(current) = self.current_pr_key_for_session(&session.id, &session.branch_name)
         else {
-            return self.related_pr_rows(session);
+            return self.related_pr_rows(session, include_related);
         };
 
         let component = self.stack_component(current.clone());
@@ -326,7 +372,7 @@ impl App {
             .iter()
             .map(|row| row.key.clone())
             .collect::<HashSet<_>>();
-        for row in self.related_pr_rows(session) {
+        for row in self.related_pr_rows(session, include_related) {
             if seen.insert(row.key.clone()) {
                 rows.push(row);
             }
@@ -421,8 +467,8 @@ impl App {
         component
     }
 
-    fn related_pr_rows(&self, session: &AgentSession) -> Vec<PrSectionRow> {
-        if !self.config.ui.pr_section_show_related {
+    fn related_pr_rows(&self, session: &AgentSession, include_related: bool) -> Vec<PrSectionRow> {
+        if !include_related {
             return Vec::new();
         }
         let Some(group_id) = session.group_id.as_deref() else {
@@ -431,8 +477,7 @@ impl App {
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         let mut members = self
-            .sessions
-            .iter()
+            .pr_view_sessions()
             .filter(|member| {
                 member.id != session.id && member.group_id.as_deref() == Some(group_id)
             })
@@ -495,6 +540,77 @@ impl App {
         self.selected_pr_section_rows().get(self.pr_index).cloned()
     }
 
+    pub(crate) fn pull_requests_response(
+        &self,
+        source_session_id: Option<&str>,
+    ) -> crate::ipc::ControlResponse {
+        let Some(source_session_id) = source_session_id else {
+            return crate::ipc::ControlResponse::error(
+                "invalid_source",
+                "No source session was supplied. Set DUX_SESSION_ID or pass --session.",
+            );
+        };
+        let Some(session) = self
+            .pr_view_sessions()
+            .find(|session| session.id == source_session_id)
+        else {
+            return crate::ipc::ControlResponse::error(
+                "invalid_source",
+                format!("Agent session \"{source_session_id}\" no longer exists."),
+            );
+        };
+        let rows = self.pr_section_rows_for_session_with_related(session, true);
+        let mut response = crate::ipc::ControlResponse::success();
+        response.session_id = Some(session.id.clone());
+        response.message = Some(if rows.is_empty() {
+            format!(
+                "No pull requests are associated with agent \"{}\" yet.",
+                session.branch_name
+            )
+        } else {
+            format!(
+                "Agent \"{}\" has {} associated pull request(s).",
+                session.branch_name,
+                rows.len()
+            )
+        });
+        for row in rows {
+            let Some(pr) = self.pull_requests.get(&row.key) else {
+                continue;
+            };
+            let owner_session = row
+                .session_id
+                .as_deref()
+                .and_then(|session_id| {
+                    self.pr_view_sessions()
+                        .find(|session| session.id == session_id)
+                })
+                .unwrap_or(session);
+            response.pull_requests.push(crate::ipc::PullRequestInfo {
+                host: pr.host.clone(),
+                owner_repo: pr.owner_repo.clone(),
+                number: pr.number,
+                state: pr.state.as_db_str().to_string(),
+                is_draft: pr.is_draft,
+                title: pr.title.clone(),
+                url: pr.url.clone(),
+                head_ref: pr.head_ref.clone(),
+                base_ref: pr.base_ref.clone(),
+                project_id: owner_session.project_id.clone(),
+                project_name: self.project_name_for_session(owner_session),
+                session_id: owner_session.id.clone(),
+                session_label: owner_session
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| owner_session.branch_name.clone()),
+                depth: row.depth,
+                is_current: row.is_current,
+                is_related: row.is_related,
+            });
+        }
+        response
+    }
+
     pub(crate) fn open_selected_pr_in_browser(&mut self) -> anyhow::Result<()> {
         let Some(row) = self.selected_pr_section_row() else {
             self.set_warning("Select a pull request first.");
@@ -543,7 +659,17 @@ impl App {
             .iter()
             .find(|session| session.id == session_id)
         else {
-            self.set_info("The agent for this pull request is no longer active.");
+            if self
+                .archived_sessions
+                .iter()
+                .any(|session| session.id == session_id)
+            {
+                self.set_info(
+                    "This pull request belongs to an archived agent. Restore it from the command palette to jump back to it.",
+                );
+            } else {
+                self.set_info("The agent for this pull request is no longer available.");
+            }
             return Ok(());
         };
         let label = session
@@ -581,7 +707,10 @@ impl App {
         }
         let mut seen = HashSet::new();
         let mut result = Vec::new();
-        for session in self.sessions.iter().filter(|s| s.project_id == project_id) {
+        for session in self
+            .pr_view_sessions()
+            .filter(|session| session.project_id == project_id)
+        {
             for pr in self.linked_prs_for_session(&session.id) {
                 if seen.insert(pr.key()) {
                     result.push(pr.clone());
@@ -590,6 +719,22 @@ impl App {
         }
         result.sort_by_key(|pr| (pr.state_rank(), pr.number));
         result
+    }
+
+    pub(crate) fn link_imported_pull_request(
+        &mut self,
+        session_id: &str,
+        pr: &PrInfo,
+    ) -> anyhow::Result<()> {
+        self.session_store
+            .upsert_pull_request(&Self::stored_from_pr(pr))?;
+        self.session_store.link_pull_request(
+            session_id,
+            &pr.key(),
+            crate::model::PrLinkSource::Imported,
+        )?;
+        self.reload_pull_request_state();
+        Ok(())
     }
 
     pub(crate) fn set_manual_pr_stack_parent(
@@ -700,73 +845,6 @@ impl App {
                 super::workers::run_pr_base_lookup_job(host, owner_repo, base, tx);
             });
         }
-    }
-
-    pub(crate) fn default_pr_base_for_session(&self, session: &AgentSession) -> String {
-        let source_is_stacked = !session.source_branch.trim().is_empty()
-            && self.pr_links.iter().any(|(session_id, links)| {
-                self.sessions
-                    .iter()
-                    .find(|candidate| candidate.id == *session_id)
-                    .is_some_and(|candidate| candidate.project_id == session.project_id)
-                    && links.iter().any(|link| {
-                        self.pull_requests.get(&link.key).is_some_and(|pr| {
-                            pr.state == PrState::Open
-                                && pr.head_ref == session.source_branch
-                                && pr.base_ref != session.source_branch
-                        })
-                    })
-            });
-        if source_is_stacked {
-            return session.source_branch.clone();
-        }
-        self.projects
-            .iter()
-            .find(|project| project.id == session.project_id)
-            .and_then(|project| project.leading_branch.clone())
-            .unwrap_or_else(|| session.source_branch.clone())
-    }
-
-    pub(crate) fn create_pull_request_for_selected_session(&mut self) -> anyhow::Result<()> {
-        if !self.github_integration_enabled
-            || !matches!(self.gh_status, crate::model::GhStatus::Available)
-        {
-            self.set_error(
-                "Pull request creation requires GitHub integration and an authenticated gh CLI.",
-            );
-            return Ok(());
-        }
-        let Some(session) = self.selected_session().cloned() else {
-            self.set_error("Select an agent session first to create a pull request.");
-            return Ok(());
-        };
-        if session.is_scratch() {
-            self.set_error("Scratch agents are not attached to a GitHub repository.");
-            return Ok(());
-        }
-        if session.branch_name.trim().is_empty() {
-            self.set_error("The selected agent has no branch to open a pull request from.");
-            return Ok(());
-        }
-        let Some(project) = self
-            .projects
-            .iter()
-            .find(|project| project.id == session.project_id)
-            .cloned()
-        else {
-            self.set_error("The selected agent's project is no longer available.");
-            return Ok(());
-        };
-        let base = self.default_pr_base_for_session(&session);
-        self.set_busy(format!(
-            "Creating a pull request for \"{}\" against {base}...",
-            session.branch_name
-        ));
-        let worker_tx = self.worker_tx.clone();
-        thread::spawn(move || {
-            super::workers::run_create_pull_request_job(session, project, base, worker_tx);
-        });
-        Ok(())
     }
 
     /// Toggle-independent activation path used at startup, when the integration
