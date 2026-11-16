@@ -660,7 +660,8 @@ impl SessionStore {
                 source = case
                     when worktree_pull_requests.source = 'manual' then 'manual'
                     when excluded.source = 'manual' then 'manual'
-                    when worktree_pull_requests.source = 'created' and excluded.source = 'discovered' then 'created'
+                    when worktree_pull_requests.source = 'created'
+                        and excluded.source in ('discovered', 'imported') then 'created'
                     when worktree_pull_requests.source = 'imported' and excluded.source = 'discovered' then 'imported'
                     else excluded.source
                 end,
@@ -1612,6 +1613,17 @@ mod pr_tests {
         let links = store.load_pr_links().unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].source, PrLinkSource::Manual);
+
+        let created = PrKey::new("github.com", "owner/repo", 2);
+        store
+            .link_pull_request("s1", &created, PrLinkSource::Created)
+            .unwrap();
+        store
+            .link_pull_request("s1", &created, PrLinkSource::Imported)
+            .unwrap();
+        let links = store.load_pr_links().unwrap();
+        let created_link = links.iter().find(|link| link.key == created).unwrap();
+        assert_eq!(created_link.source, PrLinkSource::Created);
     }
 
     #[test]

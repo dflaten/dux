@@ -723,18 +723,27 @@ impl App {
     }
 
     pub(crate) fn open_link_pr_stack_parent_prompt(&mut self) -> Result<()> {
-        let Some(session) = self.selected_session().cloned() else {
-            self.set_error("Select an agent session first to link a stack parent.");
-            return Ok(());
-        };
         let Some(row) = self.selected_pr_section_row() else {
             self.set_error("Select a pull request in the right-pane section first.");
+            return Ok(());
+        };
+        let owner_session = row
+            .session_id
+            .as_deref()
+            .and_then(|session_id| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+            })
+            .or_else(|| self.selected_session());
+        let Some(owner_session) = owner_session else {
+            self.set_error("The project for the selected pull request is no longer available.");
             return Ok(());
         };
         let Some(project) = self
             .projects
             .iter()
-            .find(|project| project.id == session.project_id)
+            .find(|project| project.id == owner_session.project_id)
             .cloned()
         else {
             self.set_error("The selected agent's project is no longer available.");
@@ -756,9 +765,16 @@ impl App {
             self.set_warning("Select a pull request in the right-pane section first.");
             return Ok(());
         };
-        if !self.pr_stacks.contains_key(&row.key) {
+        let Some(edge) = self.pr_stacks.get(&row.key) else {
             self.set_info(format!(
                 "PR #{} is not currently part of a stack.",
+                row.key.number
+            ));
+            return Ok(());
+        };
+        if edge.source != crate::model::PrRelationSource::Manual {
+            self.set_info(format!(
+                "PR #{} is stacked automatically from its base branch. Retarget the PR base in GitHub to change the stack.",
                 row.key.number
             ));
             return Ok(());
@@ -1834,6 +1850,8 @@ impl App {
         };
         self.sessions.retain(|candidate| candidate.id != session.id);
         self.update_branch_sync_sessions();
+        self.update_pr_sync_sessions();
+        self.reload_pull_request_state();
         self.rebuild_left_items();
         if deleted_was_selected {
             if let Some(target) = previous_target
@@ -6040,12 +6058,12 @@ mod tests {
 
         // A manual override wins over the detected base relationship.
         app.set_manual_pr_stack_parent(
-            &crate::model::PrKey::new("github.com", "owner/repo", 2),
             &crate::model::PrKey::new("github.com", "owner/repo", 3),
+            &crate::model::PrKey::new("github.com", "owner/repo", 1),
         )
         .unwrap();
         app.reload_pull_request_state();
-        assert_eq!(parent_of(&app, 2), Some(3));
+        assert_eq!(parent_of(&app, 3), Some(1));
     }
 
     #[test]
@@ -6087,6 +6105,24 @@ mod tests {
             app.default_pr_base_for_session(&app.sessions[0]),
             "feature-a",
             "a child PR should stack on the PR opened for its source branch"
+        );
+    }
+
+    #[test]
+    fn default_pr_base_ignores_terminal_source_pr() {
+        let mut session = make_session("s1", "codex", "/tmp/worktree");
+        session.source_branch = "feature-a".to_string();
+        session.branch_name = "feature-b".to_string();
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "MERGED"));
+        app.reload_pull_request_state();
+
+        assert_eq!(
+            app.default_pr_base_for_session(&app.sessions[0]),
+            "main",
+            "a merged source PR should not become the base for a new PR"
         );
     }
 

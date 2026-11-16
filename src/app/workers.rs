@@ -239,6 +239,7 @@ impl App {
                             let _ = self.session_store.upsert_session(session);
                         }
                         self.update_branch_sync_sessions();
+                        self.update_pr_sync_sessions();
                         self.rebuild_left_items();
                         self.set_info(format!(
                             "Renamed agent and branch to \"{new_branch}\"."
@@ -279,6 +280,7 @@ impl App {
                     }
                     if changed {
                         self.update_branch_sync_sessions();
+                        self.update_pr_sync_sessions();
                         self.rebuild_left_items();
                     }
                 }
@@ -373,6 +375,10 @@ impl App {
                         self.reload_pull_request_state();
                         self.rebuild_left_items();
                     }
+                    // A discovered parent may itself be stacked on a branch
+                    // that has no session. Continue walking up the chain
+                    // rather than waiting for the next poll interval.
+                    self.spawn_missing_base_pr_lookups();
                     // If the base has no PR, leave the lookup timestamp in
                     // place so we do not hammer the API for stack roots.
                 }
@@ -581,6 +587,8 @@ impl App {
                         );
                         self.sessions.push(session);
                         self.update_branch_sync_sessions();
+                        self.update_pr_sync_sessions();
+                        self.reload_pull_request_state();
                         // When the recovery prompt is open the restored agent
                         // is selected and reconnected right after this, so it
                         // must not stay hidden by a filter. Restores that
@@ -1588,6 +1596,14 @@ impl App {
                 );
             }
             self.update_branch_sync_sessions();
+            self.update_pr_sync_sessions();
+            if self.github_integration_enabled
+                && matches!(self.gh_status, crate::model::GhStatus::Available)
+            {
+                // Newly created worktrees need to be added to the refs watcher
+                // so a push triggers an immediate PR check.
+                self.spawn_refs_watcher();
+            }
             if focus_on_ready {
                 // A newly created agent must be visible and selected, so drop
                 // any sidebar filter that would hide it.
@@ -6484,5 +6500,67 @@ mod tests {
 
         assert_eq!(pr.state, PrState::Merged);
         assert_eq!(pr.url, "https://github.example.com/owner/repo/pull/42");
+    }
+
+    #[test]
+    fn parse_pr_json_object_reads_stack_and_draft_fields() {
+        let pr = parse_pr_json_object(
+            r#"{
+                "number": 42,
+                "state": "OPEN",
+                "title": "Demo",
+                "isDraft": true,
+                "headRefName": "feature-b",
+                "baseRefName": "feature-a"
+            }"#,
+            "github.com",
+            "owner/repo",
+        )
+        .expect("pr");
+
+        assert!(pr.is_draft);
+        assert_eq!(pr.head_ref, "feature-b");
+        assert_eq!(pr.base_ref, "feature-a");
+    }
+
+    #[test]
+    fn missing_pr_errors_are_classified_without_treating_auth_failures_as_missing() {
+        assert!(looks_like_missing_pr(
+            "GraphQL: Could not resolve to a PullRequest with the number of 42."
+        ));
+        assert!(looks_like_missing_pr("no pull requests found for branch"));
+        assert!(!looks_like_missing_pr(
+            "HTTP 401: Bad credentials (https://api.github.com/graphql)"
+        ));
+    }
+
+    #[test]
+    fn pr_state_rank_prefers_open_draft_over_terminal_history() {
+        let open = crate::model::PrInfo {
+            number: 1,
+            state: PrState::Open,
+            title: String::new(),
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            url: String::new(),
+            is_draft: false,
+            head_ref: String::new(),
+            base_ref: String::new(),
+            head_repo: String::new(),
+        };
+        let draft = crate::model::PrInfo {
+            is_draft: true,
+            ..open.clone()
+        };
+        let merged = crate::model::PrInfo {
+            state: PrState::Merged,
+            ..open.clone()
+        };
+        let closed = crate::model::PrInfo {
+            state: PrState::Closed,
+            ..open
+        };
+        assert!(draft.state_rank() > merged.state_rank());
+        assert!(merged.state_rank() > closed.state_rank());
     }
 }

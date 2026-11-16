@@ -3089,7 +3089,7 @@ impl App {
                     self.rebuild_left_items();
                 } else {
                     self.pr_sync_enabled.store(false, Ordering::Relaxed);
-                    self.pr_statuses.clear();
+                    self.reload_pull_request_state();
                     self.rebuild_left_items();
                 }
                 let state = if self.github_integration_enabled {
@@ -3213,8 +3213,8 @@ impl App {
             self.reload_pull_request_state();
             self.activate_github_integration();
         } else {
-            self.pr_statuses.clear();
             self.pr_sync_enabled.store(false, Ordering::Relaxed);
+            self.reload_pull_request_state();
         }
         self.reload_changed_files();
         self.refresh_current_diff()?;

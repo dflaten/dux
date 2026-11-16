@@ -1578,6 +1578,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
             (HintContext::LeftTerminal, "Palette"),
             (HintContext::Center, "Palette"),
             (HintContext::Files, "Palette"),
+            (HintContext::PullRequests, "Palette"),
         ],
         palette: None,
     },
@@ -1643,6 +1644,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
             (HintContext::LeftTerminal, "Help"),
             (HintContext::Center, "Help"),
             (HintContext::Files, "Help"),
+            (HintContext::PullRequests, "Help"),
         ],
         palette: Some(PaletteEntry {
             name: "help",

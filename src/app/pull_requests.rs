@@ -68,6 +68,7 @@ impl App {
             self.pr_stacks.clear();
             self.pr_statuses.clear();
             self.pr_index = 0;
+            self.pr_section_session = None;
             return;
         }
 
@@ -178,6 +179,26 @@ impl App {
 
             match parent {
                 Some(parent) => {
+                    let mut cursor = Some(parent.clone());
+                    let mut seen = HashSet::new();
+                    let mut cycle = false;
+                    while let Some(key) = cursor {
+                        if key == child {
+                            cycle = true;
+                            break;
+                        }
+                        if !seen.insert(key.clone()) {
+                            break;
+                        }
+                        cursor = self.pr_stacks.get(&key).map(|edge| edge.parent.clone());
+                    }
+                    if cycle {
+                        logger::debug(&format!(
+                            "[gh-integration] skipping cyclic stack edge for PR #{}",
+                            child.number,
+                        ));
+                        continue;
+                    }
                     if existing.as_ref().map(|edge| edge.parent.clone()) != Some(parent.clone()) {
                         if let Err(err) = self.session_store.upsert_pr_stack(
                             &child,
@@ -409,31 +430,51 @@ impl App {
         };
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
-        for member in &self.sessions {
-            if member.id == session.id || member.group_id.as_deref() != Some(group_id) {
-                continue;
-            }
-            let Some(key) = self.current_pr_key_for_session(&member.id, &member.branch_name) else {
+        let mut members = self
+            .sessions
+            .iter()
+            .filter(|member| {
+                member.id != session.id && member.group_id.as_deref() == Some(group_id)
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| self.project_name_for_session(member));
+        for member in members {
+            let Some(current) = self.current_pr_key_for_session(&member.id, &member.branch_name)
+            else {
                 continue;
             };
-            if !seen.insert(key.clone()) {
-                continue;
+            let project_name = self.project_name_for_session(member);
+            let component = self.stack_component(current.clone());
+            let mut member_rows = Vec::new();
+            let mut visited = HashSet::new();
+            for root in self.stack_roots(&component) {
+                self.push_stack_rows(
+                    &root,
+                    0,
+                    &component,
+                    &current,
+                    &mut visited,
+                    &mut member_rows,
+                );
             }
-            rows.push(PrSectionRow {
-                key,
-                depth: 0,
-                is_current: false,
-                is_related: true,
-                project_name: Some(self.project_name_for_session(member)),
-                session_id: Some(member.id.clone()),
-            });
+            for key in &component {
+                if visited.insert(key.clone()) {
+                    member_rows.push(self.pr_row_for_key(key.clone(), 0, &current));
+                }
+            }
+            for mut row in member_rows {
+                if !seen.insert(row.key.clone()) {
+                    continue;
+                }
+                row.is_related = true;
+                row.is_current = false;
+                row.project_name = Some(project_name.clone());
+                if row.session_id.is_none() {
+                    row.session_id = Some(member.id.clone());
+                }
+                rows.push(row);
+            }
         }
-        rows.sort_by(|a, b| {
-            a.project_name
-                .cmp(&b.project_name)
-                .then_with(|| a.key.owner_repo.cmp(&b.key.owner_repo))
-                .then_with(|| a.key.number.cmp(&b.key.number))
-        });
         rows
     }
 
@@ -535,6 +576,9 @@ impl App {
     }
 
     pub(crate) fn prs_for_project(&self, project_id: &str) -> Vec<PrInfo> {
+        if !self.github_integration_enabled {
+            return Vec::new();
+        }
         let mut seen = HashSet::new();
         let mut result = Vec::new();
         for session in self.sessions.iter().filter(|s| s.project_id == project_id) {
@@ -553,6 +597,21 @@ impl App {
         child: &PrKey,
         parent: &PrKey,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            child != parent,
+            "A pull request cannot be its own stack parent."
+        );
+        let mut cursor = Some(parent.clone());
+        let mut seen = HashSet::new();
+        while let Some(key) = cursor {
+            if &key == child {
+                anyhow::bail!("That parent would create a cycle in the pull request stack.");
+            }
+            if !seen.insert(key.clone()) {
+                break;
+            }
+            cursor = self.pr_stacks.get(&key).map(|edge| edge.parent.clone());
+        }
         self.session_store
             .upsert_pr_stack(child, parent, PrRelationSource::Manual)?;
         self.pr_stacks.insert(
@@ -602,9 +661,6 @@ impl App {
             if let Some(branch) = &project.leading_branch {
                 default_bases.insert(branch.clone());
             }
-            if !project.current_branch.trim().is_empty() {
-                default_bases.insert(project.current_branch.clone());
-            }
         }
 
         let now = Instant::now();
@@ -647,11 +703,21 @@ impl App {
     }
 
     pub(crate) fn default_pr_base_for_session(&self, session: &AgentSession) -> String {
-        let source_is_stacked = self
-            .pull_requests
-            .values()
-            .any(|pr| pr.head_ref == session.source_branch && pr.base_ref != session.source_branch);
-        if source_is_stacked && !session.source_branch.trim().is_empty() {
+        let source_is_stacked = !session.source_branch.trim().is_empty()
+            && self.pr_links.iter().any(|(session_id, links)| {
+                self.sessions
+                    .iter()
+                    .find(|candidate| candidate.id == *session_id)
+                    .is_some_and(|candidate| candidate.project_id == session.project_id)
+                    && links.iter().any(|link| {
+                        self.pull_requests.get(&link.key).is_some_and(|pr| {
+                            pr.state == PrState::Open
+                                && pr.head_ref == session.source_branch
+                                && pr.base_ref != session.source_branch
+                        })
+                    })
+            });
+        if source_is_stacked {
             return session.source_branch.clone();
         }
         self.projects
@@ -708,7 +774,7 @@ impl App {
     pub(crate) fn activate_github_integration(&mut self) {
         if !self.github_integration_enabled {
             self.pr_sync_enabled.store(false, Ordering::Relaxed);
-            self.pr_statuses.clear();
+            self.reload_pull_request_state();
             return;
         }
         if !matches!(self.gh_status, crate::model::GhStatus::Available) {
