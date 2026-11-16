@@ -2840,6 +2840,16 @@ impl App {
     fn is_palette_action_available(&self, action: Action) -> bool {
         match action {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
+            Action::CreatePullRequest => {
+                self.github_pr_agent_command_available()
+                    && self
+                        .selected_session()
+                        .is_some_and(|session| !session.is_scratch())
+            }
+            Action::CopyPullRequestUrl
+            | Action::GoToPullRequestAgent
+            | Action::LinkStackParent
+            | Action::ClearStackParent => self.selected_pr_section_row().is_some(),
             Action::PasteSelectionToTerminal => self.selected_session().is_some(),
             Action::PasteSelectionToAgent => self.active_terminal_id.is_some(),
             Action::OpenMacroBar => {
