@@ -282,6 +282,30 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         &defaults.ui.pr_banner_position,
         &current.ui.pr_banner_position,
     );
+    diff_u16(
+        &mut changes,
+        "ui.github_poll_interval_seconds",
+        defaults.ui.github_poll_interval_seconds,
+        current.ui.github_poll_interval_seconds,
+    );
+    diff_bool(
+        &mut changes,
+        "ui.pr_section",
+        defaults.ui.pr_section,
+        current.ui.pr_section,
+    );
+    diff_u16(
+        &mut changes,
+        "ui.pr_section_max_rows",
+        defaults.ui.pr_section_max_rows,
+        current.ui.pr_section_max_rows,
+    );
+    diff_bool(
+        &mut changes,
+        "ui.pr_section_show_related",
+        defaults.ui.pr_section_show_related,
+        current.ui.pr_section_show_related,
+    );
     diff_bool(
         &mut changes,
         "ui.macro_focus_on_launch",

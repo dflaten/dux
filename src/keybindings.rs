@@ -38,6 +38,11 @@ pub enum Action {
     PasteSelectionToTerminal,
     PasteSelectionToAgent,
     OpenCurrentPullRequest,
+    CreatePullRequest,
+    CopyPullRequestUrl,
+    GoToPullRequestAgent,
+    LinkStackParent,
+    ClearStackParent,
     ToggleFullscreen,
     ScrollPageUp,
     ScrollPageDown,
@@ -183,6 +188,7 @@ pub enum HintContext {
     LeftTerminal,
     Center,
     Files,
+    PullRequests,
     CommitInput,
 }
 
@@ -244,6 +250,11 @@ impl Action {
             Action::PasteSelectionToTerminal => "paste_selection_to_terminal",
             Action::PasteSelectionToAgent => "paste_selection_to_agent",
             Action::OpenCurrentPullRequest => "open_current_pull_request",
+            Action::CreatePullRequest => "create_pull_request",
+            Action::CopyPullRequestUrl => "copy_pull_request_url",
+            Action::GoToPullRequestAgent => "go_to_pull_request_agent",
+            Action::LinkStackParent => "link_stack_parent",
+            Action::ClearStackParent => "clear_stack_parent",
             Action::ToggleFullscreen => "toggle_fullscreen",
             Action::ScrollPageUp => "scroll_page_up",
             Action::ScrollPageDown => "scroll_page_down",
@@ -385,6 +396,21 @@ impl Action {
             Action::OpenCurrentPullRequest => {
                 "Open the selected agent's current pull request in the default browser."
             }
+            Action::CreatePullRequest => {
+                "Create a GitHub pull request for the selected agent's branch."
+            }
+            Action::CopyPullRequestUrl => {
+                "Copy the selected pull request URL from the right-pane section."
+            }
+            Action::GoToPullRequestAgent => {
+                "Jump to the agent that owns the selected pull request."
+            }
+            Action::LinkStackParent => {
+                "Manually mark the selected pull request as stacked on another PR."
+            }
+            Action::ClearStackParent => {
+                "Remove the manual stack-parent override for the selected pull request."
+            }
             Action::ToggleFullscreen => "Toggle fullscreen overlay for the agent terminal.",
             Action::ScrollPageUp => "Scroll up one page in the agent output.",
             Action::ScrollPageDown => "Scroll down one page in the agent output.",
@@ -520,6 +546,11 @@ impl Action {
             | Action::ScrollToBottom
             | Action::ScrollToTop => Some("Scrolling"),
             Action::OpenDiff
+            | Action::CreatePullRequest
+            | Action::CopyPullRequestUrl
+            | Action::GoToPullRequestAgent
+            | Action::LinkStackParent
+            | Action::ClearStackParent
             | Action::StageUnstage
             | Action::CommitChanges
             | Action::GenerateCommitMessage
@@ -643,6 +674,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
             (HintContext::LeftSession, "Move"),
             (HintContext::LeftTerminal, "Move"),
             (HintContext::Files, "Move"),
+            (HintContext::PullRequests, "Move"),
         ],
         palette: None,
     },
@@ -1173,6 +1205,76 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         }),
     },
     BindingDef {
+        action: Action::CreatePullRequest,
+        default_keys: &[],
+        scopes: &[],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Create a pull request for the selected agent",
+        }),
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "create-pull-request",
+            description: "Create a GitHub pull request for the selected agent's branch",
+        }),
+    },
+    BindingDef {
+        action: Action::CopyPullRequestUrl,
+        default_keys: &[key!(y)],
+        scopes: &[BindingScope::Files],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Copy the selected pull request URL",
+        }),
+        hint_contexts: &[(HintContext::PullRequests, "Copy URL")],
+        palette: Some(PaletteEntry {
+            name: "copy-pr-url",
+            description: "Copy the selected right-pane pull request URL",
+        }),
+    },
+    BindingDef {
+        action: Action::GoToPullRequestAgent,
+        default_keys: &[key!(g)],
+        scopes: &[BindingScope::Files],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Jump to the agent that owns the selected pull request",
+        }),
+        hint_contexts: &[(HintContext::PullRequests, "Go to agent")],
+        palette: Some(PaletteEntry {
+            name: "go-to-pr-agent",
+            description: "Switch to the agent that owns the selected pull request",
+        }),
+    },
+    BindingDef {
+        action: Action::LinkStackParent,
+        default_keys: &[],
+        scopes: &[],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Manually link the selected pull request to a stack parent",
+        }),
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "link-stack-parent",
+            description: "Manually mark the selected pull request as stacked on another PR",
+        }),
+    },
+    BindingDef {
+        action: Action::ClearStackParent,
+        default_keys: &[],
+        scopes: &[],
+        help: Some(HelpEntry {
+            section: "Files pane",
+            description: "Clear the manual stack-parent override",
+        }),
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "clear-stack-parent",
+            description: "Remove the manual stack-parent override for the selected PR",
+        }),
+    },
+    BindingDef {
         action: Action::ToggleFullscreen,
         default_keys: &[],
         scopes: &[],
@@ -1269,9 +1371,12 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Files],
         help: Some(HelpEntry {
             section: "Files pane",
-            description: "Open selected file diff",
+            description: "Open selected file diff or pull request",
         }),
-        hint_contexts: &[(HintContext::Files, "Diff")],
+        hint_contexts: &[
+            (HintContext::Files, "Diff"),
+            (HintContext::PullRequests, "Open PR"),
+        ],
         palette: None,
     },
     BindingDef {

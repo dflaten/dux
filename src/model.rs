@@ -25,7 +25,27 @@ pub enum PrState {
     Closed,
 }
 
-/// Cached information about a GitHub pull request associated with a session.
+/// Stable identity for a pull request, independent of any agent session.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PrKey {
+    /// Lowercased GitHub host.
+    pub host: String,
+    /// Lowercased `owner/repo` of the repository the PR was opened against.
+    pub owner_repo: String,
+    pub number: u64,
+}
+
+impl PrKey {
+    pub fn new(host: impl Into<String>, owner_repo: impl Into<String>, number: u64) -> Self {
+        Self {
+            host: host.into().trim().to_ascii_lowercase(),
+            owner_repo: owner_repo.into().trim().to_ascii_lowercase(),
+            number,
+        }
+    }
+}
+
+/// Cached information about a GitHub pull request.
 #[derive(Clone, Debug)]
 pub struct PrInfo {
     pub number: u64,
@@ -34,6 +54,110 @@ pub struct PrInfo {
     pub host: String,
     pub owner_repo: String,
     pub url: String,
+    pub is_draft: bool,
+    pub head_ref: String,
+    pub base_ref: String,
+    /// Repository containing the head branch. Empty means it matches
+    /// `owner_repo` (same-repository branch, not a fork).
+    pub head_repo: String,
+}
+
+impl PrInfo {
+    pub fn key(&self) -> PrKey {
+        PrKey::new(self.host.clone(), self.owner_repo.clone(), self.number)
+    }
+
+    /// Ordering used to choose the PR to display for a worktree. Active PRs
+    /// beat merged/closed history; drafts are still open but rank after a
+    /// regular open PR.
+    pub fn state_rank(&self) -> u8 {
+        match self.state {
+            PrState::Open if !self.is_draft => 4,
+            PrState::Open => 3,
+            PrState::Merged => 2,
+            PrState::Closed => 1,
+        }
+    }
+}
+
+impl PrState {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Merged => "MERGED",
+            Self::Closed => "CLOSED",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "OPEN" => Some(Self::Open),
+            "MERGED" => Some(Self::Merged),
+            "CLOSED" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// How a pull request became associated with a worktree session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrLinkSource {
+    Discovered,
+    Created,
+    Imported,
+    Manual,
+}
+
+impl PrLinkSource {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Discovered => "discovered",
+            Self::Created => "created",
+            Self::Imported => "imported",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        match value {
+            "created" => Self::Created,
+            "imported" => Self::Imported,
+            "manual" => Self::Manual,
+            _ => Self::Discovered,
+        }
+    }
+}
+
+/// How a parent relationship between two stacked PRs was established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrRelationSource {
+    Detected,
+    Manual,
+}
+
+impl PrRelationSource {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Detected => "detected",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Self {
+        if value == "manual" {
+            Self::Manual
+        } else {
+            Self::Detected
+        }
+    }
+}
+
+/// A PR-to-PR stack edge: `child` is based on `parent`'s head branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrStackEdge {
+    pub child: PrKey,
+    pub parent: PrKey,
+    pub source: PrRelationSource,
 }
 
 /// Reserved project id for the built-in scratch workspace. Scratch agents are

@@ -684,6 +684,7 @@ impl App {
         self.prompt = PromptState::PullRequestInput {
             project,
             input: TextInput::new(),
+            purpose: PullRequestPromptPurpose::NewAgent,
         };
         self.set_info("Paste a GitHub PR URL or enter a PR number for the selected project.");
         Ok(())
@@ -700,6 +701,75 @@ impl App {
         thread::spawn(move || {
             super::workers::run_pull_request_lookup_job(project, raw_input, worker_tx);
         });
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_pr_stack_parent_lookup(
+        &mut self,
+        project: Project,
+        child: crate::model::PrKey,
+        raw_input: String,
+    ) -> Result<()> {
+        self.prompt = PromptState::None;
+        self.set_busy(format!(
+            "Resolving parent PR #{} for the selected stack...",
+            child.number
+        ));
+        let worker_tx = self.worker_tx.clone();
+        thread::spawn(move || {
+            super::workers::run_pr_stack_parent_lookup_job(project, child, raw_input, worker_tx);
+        });
+        Ok(())
+    }
+
+    pub(crate) fn open_link_pr_stack_parent_prompt(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session().cloned() else {
+            self.set_error("Select an agent session first to link a stack parent.");
+            return Ok(());
+        };
+        let Some(row) = self.selected_pr_section_row() else {
+            self.set_error("Select a pull request in the right-pane section first.");
+            return Ok(());
+        };
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.id == session.project_id)
+            .cloned()
+        else {
+            self.set_error("The selected agent's project is no longer available.");
+            return Ok(());
+        };
+        self.input_target = InputTarget::None;
+        self.fullscreen_overlay = FullscreenOverlay::None;
+        self.prompt = PromptState::PullRequestInput {
+            project,
+            input: TextInput::new(),
+            purpose: PullRequestPromptPurpose::LinkStackParent { child: row.key },
+        };
+        self.set_info("Enter the parent PR URL or number to mark this PR as stacked.");
+        Ok(())
+    }
+
+    pub(crate) fn clear_selected_pr_stack_parent(&mut self) -> Result<()> {
+        let Some(row) = self.selected_pr_section_row() else {
+            self.set_warning("Select a pull request in the right-pane section first.");
+            return Ok(());
+        };
+        if !self.pr_stacks.contains_key(&row.key) {
+            self.set_info(format!(
+                "PR #{} is not currently part of a stack.",
+                row.key.number
+            ));
+            return Ok(());
+        }
+        self.clear_manual_pr_stack_parent(&row.key)?;
+        self.reload_pull_request_state();
+        self.rebuild_left_items();
+        self.set_info(format!(
+            "Cleared the stack parent override for PR #{}.",
+            row.key.number
+        ));
         Ok(())
     }
 
@@ -3918,10 +3988,18 @@ mod tests {
             gh_status: crate::model::GhStatus::Unknown,
             github_integration_enabled: false,
             pr_banner_at_bottom: true,
+            pull_requests: std::collections::HashMap::new(),
+            pr_links: std::collections::HashMap::new(),
+            pr_stacks: std::collections::HashMap::new(),
             pr_statuses: std::collections::HashMap::new(),
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
+            pr_poller_running: Arc::new(AtomicBool::new(false)),
             pr_last_checked: std::collections::HashMap::new(),
+            pr_base_lookups: std::collections::HashSet::new(),
+            pr_base_last_checked: std::collections::HashMap::new(),
+            pr_index: 0,
+            pr_section_session: None,
             refs_watcher: None,
             refs_watch_paths: std::collections::HashMap::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
@@ -5839,5 +5917,226 @@ mod tests {
         )
         .expect_err("mismatched repo");
         assert!(err.contains("selected project uses github.com/octocat/Hello-World"));
+    }
+
+    fn stored_pr(
+        number: u64,
+        head_ref: &str,
+        base_ref: &str,
+        state: &str,
+    ) -> crate::storage::StoredPullRequest {
+        crate::storage::StoredPullRequest {
+            host: "github.com".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            number,
+            state: state.to_string(),
+            is_draft: false,
+            title: format!("PR {number}"),
+            url: format!("https://github.com/owner/repo/pull/{number}"),
+            head_ref: head_ref.to_string(),
+            base_ref: base_ref.to_string(),
+            head_repo: String::new(),
+        }
+    }
+
+    fn seed_linked_pr(app: &mut App, session_id: &str, pr: crate::storage::StoredPullRequest) {
+        app.session_store.upsert_pull_request(&pr).unwrap();
+        app.session_store
+            .link_pull_request(
+                session_id,
+                &crate::model::PrKey::new(&pr.host, &pr.owner_repo, pr.number),
+                crate::model::PrLinkSource::Discovered,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn current_pr_prefers_the_branch_match_over_higher_numbered_history() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let branch = session.branch_name.clone();
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(10, "other-branch", "main", "OPEN"),
+        );
+        seed_linked_pr(&mut app, "s1", stored_pr(5, &branch, "main", "MERGED"));
+        app.reload_pull_request_state();
+
+        let current = app
+            .current_pr_key_for_session("s1", &branch)
+            .expect("branch PR");
+        assert_eq!(current.number, 5);
+    }
+
+    #[test]
+    fn stack_rows_render_root_to_tip_with_current_marked() {
+        let mut session = make_session("s1", "codex", "/tmp/worktree");
+        session.branch_name = "feature-b".to_string();
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "MERGED"));
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(2, "feature-b", "feature-a", "OPEN"),
+        );
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(3, "feature-c", "feature-b", "OPEN"),
+        );
+        app.reload_pull_request_state();
+
+        let rows = app.pr_section_rows_for_session(&app.sessions[0]);
+        assert_eq!(
+            rows.iter().map(|row| row.key.number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.key.number == 2)
+                .unwrap()
+                .is_current
+        );
+    }
+
+    #[test]
+    fn reconcile_detects_stack_edges_and_keeps_manual_override() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "OPEN"));
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(2, "feature-b", "feature-a", "OPEN"),
+        );
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(3, "feature-c", "feature-b", "OPEN"),
+        );
+        app.reload_pull_request_state();
+        let parent_of = |app: &App, number: u64| {
+            app.pr_stacks
+                .get(&crate::model::PrKey::new(
+                    "github.com",
+                    "owner/repo",
+                    number,
+                ))
+                .map(|edge| edge.parent.number)
+        };
+        assert_eq!(parent_of(&app, 2), Some(1));
+        assert_eq!(parent_of(&app, 3), Some(2));
+
+        // A manual override wins over the detected base relationship.
+        app.set_manual_pr_stack_parent(
+            &crate::model::PrKey::new("github.com", "owner/repo", 2),
+            &crate::model::PrKey::new("github.com", "owner/repo", 3),
+        )
+        .unwrap();
+        app.reload_pull_request_state();
+        assert_eq!(parent_of(&app, 2), Some(3));
+    }
+
+    #[test]
+    fn related_group_prs_are_included_in_section_rows() {
+        let mut first = make_session("s1", "codex", "/tmp/worktree-1");
+        let mut second = make_session("s2", "codex", "/tmp/worktree-2");
+        first.group_id = Some("group-1".to_string());
+        second.group_id = Some("group-1".to_string());
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s2", stored_pr(2, "branch-s2", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let rows = app.pr_section_rows_for_session(&app.sessions[0]);
+        assert_eq!(rows.len(), 2);
+        let related = rows.iter().find(|row| row.is_related).expect("related row");
+        assert_eq!(related.key.number, 2);
+        let expected_project = app.project_name_for_session(&app.sessions[1]);
+        assert_eq!(
+            related.project_name.as_deref(),
+            Some(expected_project.as_str())
+        );
+    }
+
+    #[test]
+    fn default_pr_base_uses_stacked_source_branch_when_it_has_a_pr() {
+        let mut session = make_session("s1", "codex", "/tmp/worktree");
+        session.source_branch = "feature-a".to_string();
+        session.branch_name = "feature-b".to_string();
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "feature-a", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        assert_eq!(
+            app.default_pr_base_for_session(&app.sessions[0]),
+            "feature-a",
+            "a child PR should stack on the PR opened for its source branch"
+        );
+    }
+
+    #[test]
+    fn default_pr_base_falls_back_to_project_leading_branch() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.sessions[0].source_branch = "feature-a".to_string();
+        app.projects[0].leading_branch = Some("main".to_string());
+
+        assert_eq!(app.default_pr_base_for_session(&app.sessions[0]), "main");
+    }
+
+    #[test]
+    fn pr_section_visibility_respects_config_and_selection() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        assert!(app.pr_section_visible());
+        app.config.ui.pr_section = false;
+        assert!(!app.pr_section_visible());
+    }
+
+    #[test]
+    fn right_section_navigation_skips_prs_when_empty() {
+        assert_eq!(
+            RightSection::first(false),
+            RightSection::Unstaged,
+            "without PRs the top section is Changes"
+        );
+        assert_eq!(
+            RightSection::first(true),
+            RightSection::PullRequests,
+            "with PRs Tab enters at Pull Requests"
+        );
+        assert_eq!(
+            RightSection::PullRequests.next(true, false),
+            Some(RightSection::Unstaged)
+        );
+        assert_eq!(
+            RightSection::Unstaged.previous(true),
+            Some(RightSection::PullRequests)
+        );
+        assert_eq!(RightSection::Unstaged.previous(false), None);
     }
 }

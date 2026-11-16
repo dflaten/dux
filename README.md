@@ -38,7 +38,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | ⇄ | Multi-repo work | Agents can split work into linked worktrees in other projects; the origin agent moves into this section with them |
 | ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders with the diff pane hidden, and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
-| 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and PR tracking |
+| 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and worktree PR tracking with stacked-PR detection |
 | 🎨 | Configuration | Fully commented config, rebindable keys, and a theme engine |
 | 🧪 | Validation | `cargo fmt`, Clippy, unit tests, and PTY integration tests |
 
