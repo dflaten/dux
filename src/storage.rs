@@ -36,16 +36,35 @@ const UPSERT_SESSION_SQL: &str = r#"
         updated_at=excluded.updated_at
     "#;
 
-/// A stored PR association loaded from the database.
+/// Canonical pull request data, independent of any worktree session.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredPr {
-    pub session_id: String,
-    pub pr_number: u64,
+pub struct StoredPullRequest {
     pub host: String,
     pub owner_repo: String,
+    pub number: u64,
     pub state: String,
+    pub is_draft: bool,
     pub title: String,
     pub url: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub head_repo: String,
+}
+
+/// A link between a worktree session and a canonical pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPrLink {
+    pub session_id: String,
+    pub key: crate::model::PrKey,
+    pub source: crate::model::PrLinkSource,
+}
+
+/// A stored stack edge between two pull requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPrStack {
+    pub child: crate::model::PrKey,
+    pub parent: crate::model::PrKey,
+    pub source: crate::model::PrRelationSource,
 }
 
 pub struct SessionStore {
@@ -224,6 +243,73 @@ impl SessionStore {
             "text not null default ''",
         )?;
         ensure_column(&self.conn, "session_prs", "url", "text not null default ''")?;
+        self.conn.execute_batch(
+            r#"
+            create table if not exists pull_requests (
+                host text not null,
+                owner_repo text not null,
+                number integer not null,
+                state text not null default 'OPEN',
+                is_draft integer not null default 0,
+                title text not null default '',
+                url text not null default '',
+                head_ref text not null default '',
+                base_ref text not null default '',
+                head_repo text not null default '',
+                updated_at text not null,
+                checked_at text not null,
+                primary key (host, owner_repo, number)
+            );
+            create index if not exists idx_pull_requests_head
+                on pull_requests(host, owner_repo, head_ref);
+            create table if not exists worktree_pull_requests (
+                session_id text not null,
+                host text not null,
+                owner_repo text not null,
+                number integer not null,
+                source text not null default 'discovered',
+                linked_at text not null,
+                primary key (session_id, host, owner_repo, number)
+            );
+            create index if not exists idx_worktree_pull_requests_pr
+                on worktree_pull_requests(host, owner_repo, number);
+            create table if not exists pull_request_stacks (
+                child_host text not null,
+                child_owner_repo text not null,
+                child_number integer not null,
+                parent_host text not null,
+                parent_owner_repo text not null,
+                parent_number integer not null,
+                source text not null default 'detected',
+                created_at text not null,
+                updated_at text not null,
+                primary key (child_host, child_owner_repo, child_number)
+            );
+            create index if not exists idx_pull_request_stacks_parent
+                on pull_request_stacks(parent_host, parent_owner_repo, parent_number);
+            "#,
+        )?;
+        // Copy legacy session_prs rows into the canonical tables. This is
+        // idempotent so it is safe to run on every startup.
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            r#"
+            insert or ignore into pull_requests
+                (host, owner_repo, number, state, is_draft, title, url, head_ref, base_ref, head_repo, updated_at, checked_at)
+            select lower(host), lower(owner_repo), pr_number, state, 0, title, url, '', '', '', ?1, ?1
+            from session_prs
+            "#,
+            params![now],
+        )?;
+        self.conn.execute(
+            r#"
+            insert or ignore into worktree_pull_requests
+                (session_id, host, owner_repo, number, source, linked_at)
+            select session_id, lower(host), lower(owner_repo), pr_number, 'discovered', ?1
+            from session_prs
+            "#,
+            params![now],
+        )?;
         Ok(())
     }
 
@@ -493,87 +579,63 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Insert a PR association or update its state and title if it already exists.
-    pub fn upsert_pr(&self, pr: &StoredPr) -> Result<()> {
+    // -- Canonical pull request storage -------------------------------------
+
+    pub fn upsert_pull_request(&self, pr: &StoredPullRequest) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
             r#"
-            insert into session_prs (session_id, pr_number, host, owner_repo, state, title, url)
-            values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            on conflict(session_id, pr_number) do update set
-                host=excluded.host,
-                owner_repo=excluded.owner_repo,
+            insert into pull_requests
+                (host, owner_repo, number, state, is_draft, title, url, head_ref, base_ref, head_repo, updated_at, checked_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            on conflict(host, owner_repo, number) do update set
                 state=excluded.state,
+                is_draft=excluded.is_draft,
                 title=excluded.title,
-                url=excluded.url
+                url=excluded.url,
+                head_ref=excluded.head_ref,
+                base_ref=excluded.base_ref,
+                head_repo=excluded.head_repo,
+                updated_at=excluded.updated_at,
+                checked_at=excluded.checked_at
             "#,
             params![
-                pr.session_id,
-                pr.pr_number as i64,
-                pr.host,
-                pr.owner_repo,
+                pr.host.trim().to_ascii_lowercase(),
+                pr.owner_repo.trim().to_ascii_lowercase(),
+                pr.number as i64,
                 pr.state,
+                pr.is_draft,
                 pr.title,
-                pr.url
+                pr.url,
+                pr.head_ref,
+                pr.base_ref,
+                pr.head_repo,
+                now,
             ],
         )?;
         Ok(())
     }
 
-    /// Load all known PRs for a session, ordered by pr_number descending (latest first).
-    pub fn load_prs(&self, session_id: &str) -> Result<Vec<StoredPr>> {
+    pub fn load_pull_requests(&self) -> Result<Vec<StoredPullRequest>> {
         let mut stmt = self.conn.prepare(
             r#"
-            select pr_number, host, owner_repo, state, title, url
-            from session_prs
-            where session_id = ?1
-            order by pr_number desc
-            "#,
-        )?;
-        let sid = session_id.to_string();
-        let rows = stmt.query_map(params![session_id], |row| {
-            let pr_number = row.get::<_, i64>(0)? as u64;
-            let host: String = row.get(1)?;
-            let owner_repo: String = row.get(2)?;
-            Ok(StoredPr {
-                session_id: sid.clone(),
-                pr_number,
-                host: host.clone(),
-                owner_repo: owner_repo.clone(),
-                state: row.get(3)?,
-                title: row.get(4)?,
-                url: normalize_pr_url(row.get(5)?, &host, &owner_repo, pr_number),
-            })
-        })?;
-        let mut prs = Vec::new();
-        for row in rows {
-            prs.push(row?);
-        }
-        Ok(prs)
-    }
-
-    /// Load the latest (highest-numbered) PR for each session that has at least one.
-    pub fn load_all_latest_prs(&self) -> Result<Vec<StoredPr>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            select session_id, pr_number, host, owner_repo, state, title, url
-            from session_prs
-            where (session_id, pr_number) in (
-                select session_id, max(pr_number) from session_prs group by session_id
-            )
+            select host, owner_repo, number, state, is_draft, title, url, head_ref, base_ref, head_repo
+            from pull_requests
+            order by updated_at desc
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
-            let pr_number = row.get::<_, i64>(1)? as u64;
-            let host: String = row.get(2)?;
-            let owner_repo: String = row.get(3)?;
-            Ok(StoredPr {
-                session_id: row.get(0)?,
-                pr_number,
-                host: host.clone(),
-                owner_repo: owner_repo.clone(),
-                state: row.get(4)?,
+            Ok(StoredPullRequest {
+                host: row.get(0)?,
+                owner_repo: row.get(1)?,
+                number: row.get::<_, i64>(2)? as u64,
+                state: row.get(3)?,
+                is_draft: row.get(4)?,
                 title: row.get(5)?,
-                url: normalize_pr_url(row.get(6)?, &host, &owner_repo, pr_number),
+                url: row.get(6)?,
+                head_ref: row.get(7)?,
+                base_ref: row.get(8)?,
+                head_repo: row.get(9)?,
             })
         })?;
         let mut result = Vec::new();
@@ -581,6 +643,226 @@ impl SessionStore {
             result.push(row?);
         }
         Ok(result)
+    }
+
+    pub fn link_pull_request(
+        &self,
+        session_id: &str,
+        key: &crate::model::PrKey,
+        source: crate::model::PrLinkSource,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            r#"
+            insert into worktree_pull_requests (session_id, host, owner_repo, number, source, linked_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6)
+            on conflict(session_id, host, owner_repo, number) do update set
+                source = case
+                    when worktree_pull_requests.source = 'manual' then 'manual'
+                    when excluded.source = 'manual' then 'manual'
+                    when worktree_pull_requests.source = 'created'
+                        and excluded.source in ('discovered', 'imported') then 'created'
+                    when worktree_pull_requests.source = 'imported' and excluded.source = 'discovered' then 'imported'
+                    else excluded.source
+                end,
+                linked_at = excluded.linked_at
+            "#,
+            params![
+                session_id,
+                key.host,
+                key.owner_repo,
+                key.number as i64,
+                source.as_db_str(),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the discovered association for a branch that no longer has a PR.
+    /// Created, imported, and manually linked PRs are preserved.
+    pub fn unlink_discovered_pr_for_branch(
+        &self,
+        session_id: &str,
+        host: &str,
+        owner_repo: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let host = host.trim().to_ascii_lowercase();
+        let owner_repo = owner_repo.trim().to_ascii_lowercase();
+        self.conn.execute(
+            r#"
+            delete from worktree_pull_requests
+            where session_id = ?1
+              and source = 'discovered'
+              and host = ?2
+              and owner_repo = ?3
+              and number in (
+                  select number from pull_requests
+                  where host = ?2 and owner_repo = ?3 and head_ref = ?4
+              )
+            "#,
+            params![session_id, host, owner_repo, branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_pr_links(&self) -> Result<Vec<StoredPrLink>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            select session_id, host, owner_repo, number, source
+            from worktree_pull_requests
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredPrLink {
+                session_id: row.get(0)?,
+                key: crate::model::PrKey::new(
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                ),
+                source: crate::model::PrLinkSource::from_db_str(&row.get::<_, String>(4)?),
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn load_pr_stacks(&self) -> Result<Vec<StoredPrStack>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            select child_host, child_owner_repo, child_number,
+                   parent_host, parent_owner_repo, parent_number, source
+            from pull_request_stacks
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredPrStack {
+                child: crate::model::PrKey::new(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ),
+                parent: crate::model::PrKey::new(
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)? as u64,
+                ),
+                source: crate::model::PrRelationSource::from_db_str(&row.get::<_, String>(6)?),
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn upsert_pr_stack(
+        &self,
+        child: &crate::model::PrKey,
+        parent: &crate::model::PrKey,
+        source: crate::model::PrRelationSource,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            r#"
+            insert into pull_request_stacks
+                (child_host, child_owner_repo, child_number,
+                 parent_host, parent_owner_repo, parent_number, source, created_at, updated_at)
+            values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+            on conflict(child_host, child_owner_repo, child_number) do update set
+                parent_host = case
+                    when pull_request_stacks.source = 'manual' and excluded.source = 'detected'
+                        then pull_request_stacks.parent_host
+                    else excluded.parent_host
+                end,
+                parent_owner_repo = case
+                    when pull_request_stacks.source = 'manual' and excluded.source = 'detected'
+                        then pull_request_stacks.parent_owner_repo
+                    else excluded.parent_owner_repo
+                end,
+                parent_number = case
+                    when pull_request_stacks.source = 'manual' and excluded.source = 'detected'
+                        then pull_request_stacks.parent_number
+                    else excluded.parent_number
+                end,
+                source = case
+                    when pull_request_stacks.source = 'manual' and excluded.source = 'detected' then 'manual'
+                    else excluded.source
+                end,
+                updated_at=excluded.updated_at
+            "#,
+            params![
+                child.host,
+                child.owner_repo,
+                child.number as i64,
+                parent.host,
+                parent.owner_repo,
+                parent.number as i64,
+                source.as_db_str(),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pr_stack(&self, child: &crate::model::PrKey) -> Result<()> {
+        self.conn.execute(
+            r#"
+            delete from pull_request_stacks
+            where child_host = ?1 and child_owner_repo = ?2 and child_number = ?3
+            "#,
+            params![child.host, child.owner_repo, child.number as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_detected_pr_stack(&self, child: &crate::model::PrKey) -> Result<()> {
+        self.conn.execute(
+            r#"
+            delete from pull_request_stacks
+            where child_host = ?1 and child_owner_repo = ?2 and child_number = ?3
+              and source = 'detected'
+            "#,
+            params![child.host, child.owner_repo, child.number as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove stack edges whose endpoints are gone, then remove canonical PRs
+    /// that are neither linked to a worktree nor part of a stack.
+    pub fn prune_orphaned_pull_requests(&self) -> Result<()> {
+        self.conn.execute_batch(
+            r#"
+            delete from pull_request_stacks
+            where (child_host, child_owner_repo, child_number) not in (
+                    select host, owner_repo, number from pull_requests
+                  )
+               or (parent_host, parent_owner_repo, parent_number) not in (
+                    select host, owner_repo, number from pull_requests
+                  );
+            delete from pull_requests
+            where not exists (
+                    select 1 from worktree_pull_requests links
+                    where links.host = pull_requests.host
+                      and links.owner_repo = pull_requests.owner_repo
+                      and links.number = pull_requests.number
+                  )
+              and not exists (
+                    select 1 from pull_request_stacks stacks
+                    where (stacks.child_host, stacks.child_owner_repo, stacks.child_number)
+                          = (pull_requests.host, pull_requests.owner_repo, pull_requests.number)
+                       or (stacks.parent_host, stacks.parent_owner_repo, stacks.parent_number)
+                          = (pull_requests.host, pull_requests.owner_repo, pull_requests.number)
+                  );
+            "#,
+        )?;
+        Ok(())
     }
 
     pub fn upsert_session(&self, session: &AgentSession) -> Result<()> {
@@ -678,7 +960,12 @@ impl SessionStore {
             "delete from deleted_agent_sessions where id = ?1",
             params![id],
         )?;
+        transaction.execute(
+            "delete from worktree_pull_requests where session_id = ?1",
+            params![id],
+        )?;
         transaction.commit()?;
+        self.prune_orphaned_pull_requests()?;
         Ok(())
     }
 
@@ -703,10 +990,20 @@ impl SessionStore {
         drop(statement);
         let transaction = self.conn.transaction()?;
         transaction.execute(
+            r#"
+            delete from worktree_pull_requests
+            where session_id in (
+                select id from deleted_agent_sessions where deleted_at <= ?1
+            )
+            "#,
+            params![cutoff.to_rfc3339()],
+        )?;
+        transaction.execute(
             "delete from deleted_agent_sessions where deleted_at <= ?1",
             params![cutoff.to_rfc3339()],
         )?;
         transaction.commit()?;
+        self.prune_orphaned_pull_requests()?;
         Ok(deleted)
     }
 
@@ -889,14 +1186,6 @@ pub fn fallback_pr_url(host: &str, owner_repo: &str, pr_number: u64) -> String {
         host
     };
     format!("https://{host}/{owner_repo}/pull/{pr_number}")
-}
-
-fn normalize_pr_url(url: String, host: &str, owner_repo: &str, pr_number: u64) -> String {
-    if url.trim().is_empty() {
-        fallback_pr_url(host, owner_repo, pr_number)
-    } else {
-        url
-    }
 }
 
 /// Opens an in-memory session store for tests.
@@ -1277,164 +1566,229 @@ mod tests {
 #[cfg(test)]
 mod pr_tests {
     use super::*;
+    use crate::model::{PrKey, PrLinkSource, PrRelationSource};
     use chrono::Duration;
 
-    fn spr(sid: &str, num: u64, host: &str, repo: &str, state: &str, title: &str) -> StoredPr {
-        StoredPr {
-            session_id: sid.to_string(),
-            pr_number: num,
+    fn spr(
+        num: u64,
+        host: &str,
+        repo: &str,
+        state: &str,
+        head: &str,
+        base: &str,
+    ) -> StoredPullRequest {
+        StoredPullRequest {
             host: host.to_string(),
             owner_repo: repo.to_string(),
+            number: num,
             state: state.to_string(),
-            title: title.to_string(),
+            is_draft: false,
+            title: format!("PR {num}"),
             url: fallback_pr_url(host, repo, num),
+            head_ref: head.to_string(),
+            base_ref: base.to_string(),
+            head_repo: String::new(),
         }
     }
 
     #[test]
-    fn upsert_and_load_prs() {
+    fn upsert_and_load_pull_requests() {
         let store = test_store();
-        let now = Utc::now();
-        let s = test_session("s1", now, now);
-        store.upsert_session(&s).unwrap();
-
         store
-            .upsert_pr(&spr(
-                "s1",
-                10,
-                "github.com",
-                "owner/repo",
-                "OPEN",
-                "First PR",
-            ))
+            .upsert_pull_request(&spr(10, "github.com", "owner/repo", "OPEN", "b10", "main"))
             .unwrap();
         store
-            .upsert_pr(&spr(
-                "s1",
+            .upsert_pull_request(&spr(
                 20,
                 "github.com",
                 "owner/repo",
-                "OPEN",
-                "Second PR",
-            ))
-            .unwrap();
-        store
-            .upsert_pr(&spr(
-                "s1",
-                15,
-                "github.com",
-                "owner/repo",
                 "MERGED",
-                "Middle PR",
+                "b20",
+                "main",
             ))
             .unwrap();
 
-        let prs = store.load_prs("s1").unwrap();
-        assert_eq!(prs.len(), 3);
-        assert_eq!(
-            prs[0],
-            spr("s1", 20, "github.com", "owner/repo", "OPEN", "Second PR")
-        );
-        assert_eq!(
-            prs[1],
-            spr("s1", 15, "github.com", "owner/repo", "MERGED", "Middle PR")
-        );
-        assert_eq!(
-            prs[2],
-            spr("s1", 10, "github.com", "owner/repo", "OPEN", "First PR")
-        );
+        let mut prs = store.load_pull_requests().unwrap();
+        prs.sort_by_key(|pr| pr.number);
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 10);
+        assert_eq!(prs[0].head_ref, "b10");
+        assert_eq!(prs[1].state, "MERGED");
     }
 
     #[test]
-    fn upsert_pr_updates_state_and_title() {
+    fn upsert_pull_request_updates_fields() {
         let store = test_store();
-        let now = Utc::now();
-        let s = test_session("s1", now, now);
-        store.upsert_session(&s).unwrap();
-
         store
-            .upsert_pr(&spr("s1", 42, "github.com", "owner/repo", "OPEN", "My PR"))
+            .upsert_pull_request(&spr(42, "github.com", "owner/repo", "OPEN", "b", "main"))
             .unwrap();
-        store
-            .upsert_pr(&StoredPr {
-                url: "https://github.com/owner/repo/pull/42".to_string(),
-                ..spr(
-                    "s1",
-                    42,
-                    "github.example.com",
-                    "owner/repo",
-                    "MERGED",
-                    "My PR (updated)",
-                )
-            })
-            .unwrap();
+        let mut updated = spr(42, "GitHub.com", "owner/repo", "MERGED", "b", "release");
+        updated.title = "Updated title".to_string();
+        store.upsert_pull_request(&updated).unwrap();
 
-        let prs = store.load_prs("s1").unwrap();
+        let prs = store.load_pull_requests().unwrap();
         assert_eq!(prs.len(), 1);
-        assert_eq!(prs[0].host, "github.example.com");
         assert_eq!(prs[0].state, "MERGED");
-        assert_eq!(prs[0].title, "My PR (updated)");
-        assert_eq!(prs[0].url, "https://github.com/owner/repo/pull/42");
+        assert_eq!(prs[0].base_ref, "release");
+        assert_eq!(prs[0].title, "Updated title");
     }
 
     #[test]
-    fn load_all_latest_prs() {
+    fn link_source_does_not_downgrade() {
+        let store = test_store();
+        let key = PrKey::new("github.com", "owner/repo", 1);
+        store
+            .link_pull_request("s1", &key, PrLinkSource::Manual)
+            .unwrap();
+        store
+            .link_pull_request("s1", &key, PrLinkSource::Discovered)
+            .unwrap();
+        let links = store.load_pr_links().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].source, PrLinkSource::Manual);
+
+        let created = PrKey::new("github.com", "owner/repo", 2);
+        store
+            .link_pull_request("s1", &created, PrLinkSource::Created)
+            .unwrap();
+        store
+            .link_pull_request("s1", &created, PrLinkSource::Imported)
+            .unwrap();
+        let links = store.load_pr_links().unwrap();
+        let created_link = links.iter().find(|link| link.key == created).unwrap();
+        assert_eq!(created_link.source, PrLinkSource::Created);
+    }
+
+    #[test]
+    fn manual_stack_edge_survives_detected_upsert() {
+        let store = test_store();
+        let child = PrKey::new("github.com", "owner/repo", 2);
+        let parent = PrKey::new("github.com", "owner/repo", 1);
+        let other = PrKey::new("github.com", "owner/repo", 3);
+        store
+            .upsert_pr_stack(&child, &parent, PrRelationSource::Manual)
+            .unwrap();
+        store
+            .upsert_pr_stack(&child, &other, PrRelationSource::Detected)
+            .unwrap();
+        let stacks = store.load_pr_stacks().unwrap();
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].parent, parent);
+        assert_eq!(stacks[0].source, PrRelationSource::Manual);
+    }
+
+    #[test]
+    fn legacy_session_prs_are_migrated() {
         let store = test_store();
         let now = Utc::now();
-        let s1 = test_session("s1", now, now);
-        let s2 = test_session("s2", now - Duration::hours(1), now - Duration::hours(1));
-        store.upsert_session(&s1).unwrap();
-        store.upsert_session(&s2).unwrap();
+        store.upsert_session(&test_session("s1", now, now)).unwrap();
+        store
+            .conn
+            .execute(
+                r#"
+                insert into session_prs (session_id, pr_number, host, owner_repo, state, title, url)
+                values ('s1', 7, 'GitHub.com', 'Owner/Repo', 'OPEN', 'Legacy', '')
+                "#,
+                [],
+            )
+            .unwrap();
+        store.migrate().unwrap();
 
+        let prs = store.load_pull_requests().unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].host, "github.com");
+        assert_eq!(prs[0].owner_repo, "owner/repo");
+        let links = store.load_pr_links().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].session_id, "s1");
+    }
+
+    #[test]
+    fn archive_preserves_links_and_permanent_delete_removes_them() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.upsert_session(&session).unwrap();
+        let key = PrKey::new("github.com", "owner/repo", 1);
         store
-            .upsert_pr(&spr(
-                "s1",
-                10,
-                "github.com",
-                "owner/repo",
-                "CLOSED",
-                "Old PR",
-            ))
-            .unwrap();
-        store
-            .upsert_pr(&spr(
-                "s1",
-                20,
-                "github.com",
-                "owner/repo",
-                "MERGED",
-                "Latest PR",
-            ))
-            .unwrap();
-        store
-            .upsert_pr(&spr(
-                "s2",
-                5,
-                "github.com",
-                "other/repo",
-                "OPEN",
-                "Other PR",
-            ))
+            .link_pull_request("s1", &key, PrLinkSource::Discovered)
             .unwrap();
 
-        let latest = store.load_all_latest_prs().unwrap();
-        assert_eq!(latest.len(), 2);
-        assert!(latest.contains(&spr(
-            "s1",
-            20,
-            "github.com",
-            "owner/repo",
-            "MERGED",
-            "Latest PR"
-        )));
-        assert!(latest.contains(&spr(
-            "s2",
-            5,
-            "github.com",
-            "other/repo",
-            "OPEN",
-            "Other PR"
-        )));
+        let mut store = store;
+        store.archive_and_delete_session(&session).unwrap();
+        assert_eq!(store.load_pr_links().unwrap().len(), 1);
+        store.permanently_delete_session("s1").unwrap();
+        assert!(store.load_pr_links().unwrap().is_empty());
+    }
+
+    #[test]
+    fn permanent_delete_prunes_orphaned_prs_but_keeps_stack_parents() {
+        let store = test_store();
+        let now = Utc::now();
+        let session = test_session("s1", now, now);
+        store.upsert_session(&session).unwrap();
+        let child = PrKey::new("github.com", "owner/repo", 2);
+        let parent = PrKey::new("github.com", "owner/repo", 1);
+        store
+            .upsert_pull_request(&spr(1, "github.com", "owner/repo", "OPEN", "b1", "main"))
+            .unwrap();
+        store
+            .upsert_pull_request(&spr(2, "github.com", "owner/repo", "OPEN", "b2", "b1"))
+            .unwrap();
+        store
+            .link_pull_request("s1", &child, PrLinkSource::Discovered)
+            .unwrap();
+        store
+            .upsert_pr_stack(&child, &parent, PrRelationSource::Detected)
+            .unwrap();
+
+        let mut store = store;
+        store.permanently_delete_session("s1").unwrap();
+        let prs = store.load_pull_requests().unwrap();
+        assert_eq!(
+            prs.len(),
+            2,
+            "a child with no links but a stack edge must not be pruned"
+        );
+
+        let lone = PrKey::new("github.com", "owner/repo", 9);
+        store
+            .upsert_pull_request(&spr(9, "github.com", "owner/repo", "OPEN", "b9", "main"))
+            .unwrap();
+        // Link the lone PR to a live session, then delete that session to
+        // exercise the orphan-pruning path.
+        let session2 = test_session("s2", now, now);
+        store.upsert_session(&session2).unwrap();
+        store
+            .link_pull_request("s2", &lone, PrLinkSource::Discovered)
+            .unwrap();
+        store.permanently_delete_session("s2").unwrap();
+        assert!(
+            !store
+                .load_pull_requests()
+                .unwrap()
+                .iter()
+                .any(|pr| pr.number == 9),
+            "an unlinked PR outside any stack should be pruned"
+        );
+    }
+
+    #[test]
+    fn purging_archived_sessions_removes_their_links() {
+        let store = test_store();
+        let now = Utc::now() - Duration::days(40);
+        let session = test_session("s1", now, now);
+        store.upsert_session(&session).unwrap();
+        let key = PrKey::new("github.com", "owner/repo", 1);
+        store
+            .link_pull_request("s1", &key, PrLinkSource::Discovered)
+            .unwrap();
+        let mut store = store;
+        store.archive_and_delete_session(&session).unwrap();
+        store
+            .purge_deleted_sessions_older_than(Utc::now() + Duration::days(1))
+            .unwrap();
+        assert!(store.load_pr_links().unwrap().is_empty());
     }
 }
 

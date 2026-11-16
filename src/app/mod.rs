@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,6 +83,9 @@ pub struct App {
     pub(crate) session_store: SessionStore,
     pub(crate) projects: Vec<Project>,
     pub(crate) sessions: Vec<AgentSession>,
+    /// Archived agent sessions retained for recovery. PR views include their
+    /// associations so project and related-work history stays visible.
+    pub(crate) archived_sessions: Vec<AgentSession>,
     pub(crate) groups: Vec<AgentGroup>,
     pub(crate) staged_files: Vec<ChangedFile>,
     pub(crate) unstaged_files: Vec<ChangedFile>,
@@ -218,18 +221,42 @@ pub struct App {
     pub(crate) gh_status: crate::model::GhStatus,
     pub(crate) github_integration_enabled: bool,
     pub(crate) pr_banner_at_bottom: bool,
+    /// Canonical PR data, keyed by repository identity + number.
+    pub(crate) pull_requests: HashMap<crate::model::PrKey, crate::model::PrInfo>,
+    /// PRs associated with each worktree session.
+    pub(crate) pr_links: HashMap<String, Vec<crate::storage::StoredPrLink>>,
+    /// Stack edges, keyed by child PR.
+    pub(crate) pr_stacks: HashMap<crate::model::PrKey, crate::model::PrStackEdge>,
+    /// Current PR per session, derived from `pr_links` for callers that only
+    /// need the selected/current PR.
     pub(crate) pr_statuses: HashMap<String, crate::model::PrInfo>,
     pub(crate) pr_sync_sessions: Arc<Mutex<Vec<PrSyncEntry>>>,
     pub(crate) pr_sync_enabled: Arc<AtomicBool>,
+    /// Guards against spawning more than one long-lived poller.
+    pub(crate) pr_poller_running: Arc<AtomicBool>,
+    /// Current poll interval in seconds, shared with the running poller so a
+    /// config reload takes effect without restarting the thread.
+    pub(crate) pr_poll_interval_secs: Arc<AtomicU64>,
     /// Timestamps of the last PR check per session, to avoid hammering on rapid
     /// state transitions.
     pub(crate) pr_last_checked: HashMap<String, Instant>,
+    /// Base-branch PR lookups currently in flight, keyed by
+    /// `(host, owner_repo, base_ref)`.
+    pub(crate) pr_base_lookups: HashSet<(String, String, String)>,
+    /// Last time an untracked base branch was checked, to avoid repeated
+    /// lookups for branches that do not have a PR.
+    pub(crate) pr_base_last_checked: HashMap<(String, String, String), Instant>,
+    /// Row cursor inside the right-pane Pull Requests section.
+    pub(crate) pr_index: usize,
+    /// Session the PR row cursor was last initialized for.
+    pub(crate) pr_section_session: Option<String>,
     /// File-system watcher for `.git/refs/heads/` directories. `None` if the
     /// watcher could not be created (graceful fallback to poll-only).
     pub(crate) refs_watcher: Option<Arc<Mutex<notify::RecommendedWatcher>>>,
-    /// Maps watched worktree paths back to session IDs so the refs watcher
-    /// can route change events.
-    pub(crate) refs_watch_paths: HashMap<PathBuf, String>,
+    /// Maps watched refs directories back to session IDs so the refs watcher
+    /// can route change events. A shared repository refs directory maps to
+    /// every worktree session in that project.
+    pub(crate) refs_watch_paths: HashMap<PathBuf, Vec<String>>,
     /// Session IDs spawned with resume args and the wall-clock time the resume
     /// attempt began. Used for one-shot fallbacks when resume exits quickly or
     /// hangs without rendering visible output.
@@ -289,11 +316,24 @@ pub(crate) struct PrSyncEntry {
     pub(crate) worktree_path: String,
     /// If we already know a PR for this session, the worker can use `gh pr view`
     /// (works even after branch deletion) and skip terminal states (merged/closed).
-    pub(crate) known_pr: Option<crate::storage::StoredPr>,
+    pub(crate) known_pr: Option<crate::model::PrInfo>,
     /// Whether the agent process has exited. Used to skip PR discovery calls
     /// for sessions that are both exited and in a terminal PR state — nobody
     /// is pushing to that branch anymore.
     pub(crate) agent_exited: bool,
+}
+
+/// Result of a background PR lookup. Kept distinct from `Option` so a
+/// transient `gh` failure never looks like "this branch has no PR".
+#[derive(Clone, Debug)]
+pub(crate) enum PrLookup {
+    Found(crate::model::PrInfo),
+    NotFound {
+        host: String,
+        owner_repo: String,
+        branch: String,
+    },
+    Unavailable(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +363,7 @@ impl FocusPane {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightSection {
+    PullRequests,
     Unstaged,
     Staged,
     CommitInput,
@@ -330,28 +371,37 @@ pub(crate) enum RightSection {
 
 impl RightSection {
     /// Returns the next section, or `None` to exit the pane.
-    /// The visible right pane now contains only the Changes list; staged and
-    /// commit state remains for legacy actions but is not focusable.
-    pub(crate) fn next(self, _has_staged: bool) -> Option<Self> {
+    /// Pull Requests is the top section; Changes is the bottom section. Staged
+    /// and commit state remain for legacy actions but are not focusable.
+    pub(crate) fn next(self, has_prs: bool, _has_staged: bool) -> Option<Self> {
         match self {
+            Self::PullRequests if has_prs => Some(Self::Unstaged),
+            Self::PullRequests => None,
             Self::Unstaged => None,
             Self::Staged | Self::CommitInput => None,
         }
     }
 
     /// Returns the previous section, or `None` to exit the pane.
-    pub(crate) fn previous(self) -> Option<Self> {
+    pub(crate) fn previous(self, has_prs: bool) -> Option<Self> {
         match self {
-            Self::Unstaged => None,
+            Self::Unstaged if has_prs => Some(Self::PullRequests),
+            Self::Unstaged | Self::PullRequests => None,
             Self::Staged | Self::CommitInput => Some(Self::Unstaged),
         }
     }
 
-    /// First section when entering the pane (always Changes/Unstaged on top).
-    pub(crate) fn first() -> Self {
-        Self::Unstaged
+    /// First section when entering the pane from the top.
+    pub(crate) fn first(has_prs: bool) -> Self {
+        if has_prs {
+            Self::PullRequests
+        } else {
+            Self::Unstaged
+        }
     }
 
+    /// Last section when entering the pane from the bottom. Changes is always
+    /// the bottom section.
     pub(crate) fn last(_has_staged: bool) -> Self {
         Self::Unstaged
     }
@@ -746,6 +796,13 @@ pub(crate) struct ResolvedPullRequest {
     pub(crate) title: String,
     pub(crate) state: String,
     pub(crate) head_ref_name: String,
+    pub(crate) base_ref_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PullRequestPromptPurpose {
+    NewAgent,
+    LinkStackParent { child: crate::model::PrKey },
 }
 
 #[derive(Clone, Debug)]
@@ -860,6 +917,7 @@ pub(crate) enum PromptState {
     PullRequestInput {
         project: Project,
         input: TextInput,
+        purpose: PullRequestPromptPurpose,
     },
     NameNewAgent {
         request: CreateAgentRequest,
@@ -1345,6 +1403,8 @@ pub(crate) struct MouseLayoutState {
     pub(crate) left_list_offset: usize,
     pub(crate) terminal_list: Rect,
     pub(crate) agent_term: Option<Rect>,
+    pub(crate) pr_list: Option<Rect>,
+    pub(crate) pr_list_offset: usize,
     pub(crate) unstaged_list: Option<Rect>,
     pub(crate) staged_list: Option<Rect>,
     pub(crate) commit_area: Option<Rect>,
@@ -1361,6 +1421,8 @@ impl MouseLayoutState {
         self.left_list_offset = 0;
         self.terminal_list = Rect::default();
         self.agent_term = None;
+        self.pr_list = None;
+        self.pr_list_offset = 0;
         self.unstaged_list = None;
         self.staged_list = None;
         self.commit_area = None;
@@ -1539,6 +1601,7 @@ pub(crate) enum MouseClickTarget {
     CenterPane,
     UnstagedPane,
     StagedPane,
+    PullRequestsPane,
     CommandPalette,
     StartupCommandInput,
 }
@@ -1872,6 +1935,8 @@ pub(crate) struct AgentLaunchRequest {
     pub(crate) fork_provider_session: bool,
     pub(crate) pty_size: (u16, u16),
     pub(crate) scrollback_lines: usize,
+    /// Source PR when this agent was created from a pull request.
+    pub(crate) source_pr: Option<crate::model::PrInfo>,
     pub(crate) kind: AgentLaunchKind,
 }
 
@@ -1907,6 +1972,7 @@ pub(crate) enum CreateAgentRequest {
         title: String,
         state: String,
         head_branch: String,
+        base_branch: String,
         custom_name: Option<String>,
         use_existing_branch: bool,
     },
@@ -2080,7 +2146,21 @@ pub(crate) enum WorkerEvent {
     },
     ResourceStatsReady(Vec<ResourceStats>),
     GhStatusChecked(crate::model::GhStatus),
-    PrStatusReady(Vec<(String, Option<crate::model::PrInfo>)>),
+    PrStatusReady(Vec<(String, PrLookup)>),
+    /// A parent PR was discovered lazily from a stack child's base branch.
+    PrBaseLookupFinished {
+        lookup: (String, String, String),
+        result: Option<crate::model::PrInfo>,
+    },
+    PrStackParentResolved {
+        child: crate::model::PrKey,
+        result: Result<crate::model::PrInfo, String>,
+    },
+    PrLinkResolved {
+        request_id: String,
+        session_id: String,
+        result: Result<crate::model::PrInfo, String>,
+    },
     PullRequestResolved {
         result: Result<ResolvedPullRequest, String>,
     },
@@ -2198,6 +2278,7 @@ mod components;
 mod control;
 mod input;
 mod left_search;
+mod pull_requests;
 mod render;
 mod sessions;
 mod terminal_links;
@@ -2246,6 +2327,11 @@ impl App {
         )?;
         projects.push(scratch_project(&paths, &config)?);
         let sessions = session_store.load_sessions()?;
+        let archived_sessions = session_store
+            .load_deleted_sessions()?
+            .into_iter()
+            .map(|entry| entry.session)
+            .collect::<Vec<_>>();
         session_store.purge_empty_groups()?;
         let groups = session_store.load_groups()?;
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -2263,6 +2349,7 @@ impl App {
         }
         let gh_integration_val = config.ui.github_integration;
         let pr_banner_at_bottom = config.ui.pr_banner_position == "bottom";
+        let pr_poll_interval_secs = config.ui.github_poll_interval_seconds.max(15);
         let mut app = Self {
             show_diff_line_numbers: config.ui.show_diff_line_numbers,
             left_width_pct: config.ui.left_width_pct,
@@ -2276,6 +2363,7 @@ impl App {
             session_store,
             projects,
             sessions,
+            archived_sessions,
             groups,
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -2378,10 +2466,19 @@ impl App {
             gh_status: crate::model::GhStatus::Unknown,
             github_integration_enabled: gh_integration_val,
             pr_banner_at_bottom,
+            pull_requests: HashMap::new(),
+            pr_links: HashMap::new(),
+            pr_stacks: HashMap::new(),
             pr_statuses: HashMap::new(),
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
+            pr_poller_running: Arc::new(AtomicBool::new(false)),
+            pr_poll_interval_secs: Arc::new(AtomicU64::new(u64::from(pr_poll_interval_secs))),
             pr_last_checked: HashMap::new(),
+            pr_base_lookups: HashSet::new(),
+            pr_base_last_checked: HashMap::new(),
+            pr_index: 0,
+            pr_section_session: None,
             refs_watcher: None,
             refs_watch_paths: HashMap::new(),
             resume_fallback_candidates: HashMap::new(),
@@ -2398,7 +2495,8 @@ impl App {
             _single_instance_lock: single_instance_lock,
         };
         app.restore_sessions();
-        app.seed_pr_statuses_from_db();
+        app.reload_pull_request_state();
+        app.select_current_pr_row();
         app.rebuild_left_items();
         app.reload_changed_files();
         app.update_branch_sync_sessions();
@@ -2609,41 +2707,6 @@ impl App {
         }
     }
 
-    /// Populate the in-memory PR status map from the database so the UI shows
-    /// PR state immediately on startup, before the first background poll.
-    fn seed_pr_statuses_from_db(&mut self) {
-        if !self.github_integration_enabled {
-            return;
-        }
-        let stored = self.session_store.load_all_latest_prs().unwrap_or_default();
-        for pr in stored {
-            use crate::model::{PrInfo, PrState};
-            let state = match pr.state.as_str() {
-                "OPEN" => PrState::Open,
-                "MERGED" => PrState::Merged,
-                "CLOSED" => PrState::Closed,
-                _ => continue,
-            };
-            self.pr_statuses.insert(
-                pr.session_id,
-                PrInfo {
-                    number: pr.pr_number,
-                    state,
-                    title: pr.title,
-                    host: pr.host,
-                    owner_repo: pr.owner_repo,
-                    url: pr.url,
-                },
-            );
-        }
-        if !self.pr_statuses.is_empty() {
-            logger::info(&format!(
-                "[gh-integration] seeded {} PR statuses from database",
-                self.pr_statuses.len(),
-            ));
-        }
-    }
-
     pub(crate) fn close_top_overlay(&mut self) -> bool {
         if matches!(self.fullscreen_overlay, FullscreenOverlay::Terminal) {
             let return_to_list = self.terminal_return_to_list;
@@ -2797,6 +2860,10 @@ impl App {
     fn is_palette_action_available(&self, action: Action) -> bool {
         match action {
             Action::OpenCurrentPullRequest => self.current_pr_info().is_some(),
+            Action::CopyPullRequestUrl
+            | Action::GoToPullRequestAgent
+            | Action::LinkStackParent
+            | Action::ClearStackParent => self.selected_pr_section_row().is_some(),
             Action::PasteSelectionToTerminal => self.selected_session().is_some(),
             Action::PasteSelectionToAgent => self.active_terminal_id.is_some(),
             Action::OpenMacroBar => {
@@ -2956,6 +3023,10 @@ impl App {
             "open-worktree" => self.open_selected_worktree_in_default_editor(),
             "open-worktree-with" => self.open_worktree_editor_picker(),
             "open-current-pr" => self.open_current_pr_in_browser(),
+            "copy-pr-url" => self.copy_selected_pr_url(),
+            "go-to-pr-agent" => self.go_to_selected_pr_agent(),
+            "link-stack-parent" => self.open_link_pr_stack_parent_prompt(),
+            "clear-stack-parent" => self.clear_selected_pr_stack_parent(),
             "toggle-project" => {
                 self.toggle_collapse_selected_project();
                 Ok(())
@@ -3035,15 +3106,13 @@ impl App {
                 self.config.ui.github_integration = self.github_integration_enabled;
                 let save_result =
                     save_config(&self.paths.config_path, &self.config, &self.bindings);
-                if self.github_integration_enabled
-                    && matches!(self.gh_status, crate::model::GhStatus::Available)
-                {
-                    self.update_pr_sync_sessions();
-                    self.spawn_initial_pr_refresh();
-                    self.pr_sync_enabled.store(true, Ordering::Relaxed);
-                } else if !self.github_integration_enabled {
-                    self.pr_statuses.clear();
+                if self.github_integration_enabled {
+                    self.reload_pull_request_state();
+                    self.activate_github_integration();
+                    self.rebuild_left_items();
+                } else {
                     self.pr_sync_enabled.store(false, Ordering::Relaxed);
+                    self.reload_pull_request_state();
                     self.rebuild_left_items();
                 }
                 let state = if self.github_integration_enabled {
@@ -3154,6 +3223,7 @@ impl App {
         self.config = config;
 
         refresh_project_defaults(&mut self.projects, &self.config);
+        self.clamp_files_cursor();
         self.selected_left = self
             .selected_left
             .min(self.projects.len().saturating_sub(1));
@@ -3162,15 +3232,12 @@ impl App {
             self.selected_left = self.left_items_cache.len().saturating_sub(1);
         }
         self.update_branch_sync_sessions();
-        if self.github_integration_enabled
-            && matches!(self.gh_status, crate::model::GhStatus::Available)
-        {
-            self.update_pr_sync_sessions();
-            self.spawn_initial_pr_refresh();
-            self.pr_sync_enabled.store(true, Ordering::Relaxed);
+        if self.github_integration_enabled {
+            self.reload_pull_request_state();
+            self.activate_github_integration();
         } else {
-            self.pr_statuses.clear();
             self.pr_sync_enabled.store(false, Ordering::Relaxed);
+            self.reload_pull_request_state();
         }
         self.reload_changed_files();
         self.refresh_current_diff()?;
@@ -3514,6 +3581,15 @@ impl App {
                 configured_base_ref,
             )
         });
+        let selected_id = selected
+            .as_ref()
+            .map(|(session_id, _, _, _)| session_id.clone());
+        if selected_id != self.pr_section_session {
+            self.pr_section_session = selected_id;
+            self.select_current_pr_row();
+        } else {
+            self.clamp_pr_index();
+        }
         // Keep the background poller in sync with the currently selected session.
         if let Ok(mut guard) = self.watched_worktree.lock() {
             *guard = selected
@@ -3582,7 +3658,7 @@ impl App {
         match self.right_section {
             RightSection::Staged => self.staged_files.get(self.files_index),
             RightSection::Unstaged => self.unstaged_files.get(self.files_index),
-            RightSection::CommitInput => None,
+            RightSection::PullRequests | RightSection::CommitInput => None,
         }
     }
 
@@ -3590,11 +3666,18 @@ impl App {
         match self.right_section {
             RightSection::Staged => self.staged_files.len(),
             RightSection::Unstaged => self.unstaged_files.len(),
-            RightSection::CommitInput => 0,
+            RightSection::PullRequests | RightSection::CommitInput => 0,
         }
     }
 
     pub(crate) fn clamp_files_cursor(&mut self) {
+        if self.right_section == RightSection::PullRequests {
+            if !self.pr_section_visible() {
+                self.right_section = RightSection::Unstaged;
+            }
+            self.clamp_pr_index();
+            return;
+        }
         if self.right_section == RightSection::CommitInput {
             return;
         }

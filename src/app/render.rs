@@ -2,6 +2,7 @@ use super::components::{
     Button, ButtonKind, ButtonPressedTarget, Checkbox, CheckboxState, button_state_for,
     shared_button_width,
 };
+use super::pull_requests::PrSectionRow;
 use super::*;
 use std::num::NonZeroU16;
 use std::path::Path;
@@ -915,6 +916,17 @@ impl App {
                             spans.push(Span::styled(
                                 format!(" ({count})"),
                                 Style::default().fg(self.theme.provider_label_fg),
+                            ));
+                        }
+                        let active_prs = self
+                            .prs_for_project(&project.id)
+                            .into_iter()
+                            .filter(|pr| pr.state == crate::model::PrState::Open)
+                            .count();
+                        if active_prs > 0 {
+                            spans.push(Span::styled(
+                                format!(" PR {active_prs}"),
+                                Style::default().fg(self.theme.pr_open_label),
                             ));
                         }
                         if let Some(related) = related_counts.get(&project.id)
@@ -1981,7 +1993,7 @@ impl App {
         }
     }
 
-    fn render_files(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_files(&mut self, frame: &mut Frame, mut area: Rect) {
         if self.right_pane_hidden() {
             return;
         }
@@ -2024,6 +2036,28 @@ impl App {
         }
 
         let focused = self.focus == FocusPane::Files;
+
+        let pr_rows = self.selected_pr_section_rows();
+        if !pr_rows.is_empty() {
+            let max_rows = usize::from(self.config.ui.pr_section_max_rows.max(1));
+            let content_rows = pr_rows.len().min(max_rows);
+            let desired_height = (content_rows + 2) as u16;
+            let available = area.height.saturating_sub(3);
+            let pr_height = desired_height.min(available);
+            if pr_height >= 3 {
+                let [pr_area, files_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(pr_height), Constraint::Min(3)])
+                    .areas(area);
+                self.render_pull_request_section(frame, pr_area, &pr_rows, focused);
+                area = files_area;
+            } else {
+                self.mouse_layout.pr_list = None;
+            }
+        } else {
+            self.mouse_layout.pr_list = None;
+        }
+
         let session_id = self.selected_session().map(|session| session.id.as_str());
         let queued_count = self
             .queued_diff_comments
@@ -2064,6 +2098,103 @@ impl App {
             self.mouse_layout.commit_area = None;
             self.mouse_layout.commit_text_area = None;
         }
+    }
+
+    fn render_pull_request_section(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &[PrSectionRow],
+        pane_focused: bool,
+    ) {
+        let is_active = pane_focused && self.right_section == RightSection::PullRequests;
+        let title = format!("Pull Requests ({})", rows.len());
+        let block = self.themed_block(&title, is_active);
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        if inner.width == 0 || inner.height == 0 {
+            self.mouse_layout.pr_list = None;
+            return;
+        }
+
+        let selected = is_active.then_some(self.pr_index.min(rows.len().saturating_sub(1)));
+        let mut state = ListState::default().with_selected(selected);
+        let row_width = inner.width as usize;
+        let items = rows
+            .iter()
+            .map(|row| self.pull_request_list_item(row, row_width))
+            .collect::<Vec<_>>();
+        StatefulWidget::render(
+            List::new(items).highlight_style(self.theme.selection_style()),
+            inner,
+            frame.buffer_mut(),
+            &mut state,
+        );
+        self.mouse_layout.pr_list = Some(inner);
+        self.mouse_layout.pr_list_offset = state.offset();
+    }
+
+    fn pull_request_list_item(&self, row: &PrSectionRow, width: usize) -> ListItem<'static> {
+        let Some(pr) = self.pull_requests.get(&row.key) else {
+            return ListItem::new(Line::from(Span::styled(
+                format!("? #{}", row.key.number),
+                Style::default().fg(self.theme.hint_dim_desc_fg),
+            )));
+        };
+
+        let (glyph, state_color) = match pr.state {
+            crate::model::PrState::Open if pr.is_draft => ("◌", self.theme.pr_open_label),
+            crate::model::PrState::Open => ("●", self.theme.pr_open_label),
+            crate::model::PrState::Merged => ("✔", self.theme.pr_merged_label),
+            crate::model::PrState::Closed => ("✖", self.theme.pr_closed_label),
+        };
+        let indent = "  ".repeat(row.depth);
+        let connector = if row.depth > 0 { "└ " } else { "" };
+        let related_prefix = if row.is_related { "⇄ " } else { "" };
+        let number = if row.is_related {
+            format!("{}#{}", pr.owner_repo, pr.number)
+        } else {
+            format!("#{}", pr.number)
+        };
+        let prefix = format!("{indent}{connector}{glyph} {related_prefix}");
+        let prefix_width = display_width(&prefix);
+        let number_width = display_width(&number);
+        let gap = 1usize;
+        let title_budget = width.saturating_sub(prefix_width + number_width + gap);
+        let title = if title_budget == 0 {
+            String::new()
+        } else {
+            truncate_to_width(pr.title.trim(), title_budget)
+        };
+
+        let mut spans = vec![Span::styled(
+            format!("{indent}{connector}"),
+            Style::default().fg(self.theme.related_link_fg),
+        )];
+        spans.push(Span::styled(
+            format!("{glyph} {related_prefix}"),
+            Style::default().fg(state_color),
+        ));
+        let number_style = if row.is_current {
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.theme.text_fg)
+        };
+        spans.push(Span::styled(number, number_style));
+        if !title.is_empty() {
+            spans.push(Span::styled(" ", Style::default()));
+            let title_style = if row.is_current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if row.is_related {
+                Style::default().fg(self.theme.hint_dim_desc_fg)
+            } else {
+                Style::default().fg(self.theme.text_fg)
+            };
+            spans.push(Span::styled(title, title_style));
+        }
+        ListItem::new(Line::from(spans))
     }
 
     fn render_scratch_workspace_pane(&mut self, frame: &mut Frame, area: Rect) {
@@ -2482,6 +2613,9 @@ impl App {
             FocusPane::Left if is_on_project => HintContext::LeftProject,
             FocusPane::Left => HintContext::LeftSession,
             FocusPane::Center => HintContext::Center,
+            FocusPane::Files if self.right_section == RightSection::PullRequests => {
+                HintContext::PullRequests
+            }
             FocusPane::Files => HintContext::Files,
         };
         let hints = self.footer_hints_for(ctx);
@@ -6918,12 +7052,28 @@ impl App {
                     }),
                 };
             }
-            PromptState::PullRequestInput { project, input } => {
+            PromptState::PullRequestInput {
+                project,
+                input,
+                purpose,
+            } => {
                 self.render_dim_overlay(frame);
                 let area = centered_rect_exact(64, 8, frame.area());
                 self.clear_overlay_area(frame, area);
+                let (title, prompt_label, action_label) = match purpose {
+                    PullRequestPromptPurpose::NewAgent => (
+                        "Create Agent From PR",
+                        " Paste a GitHub PR URL or enter a PR number:",
+                        " resolve  ",
+                    ),
+                    PullRequestPromptPurpose::LinkStackParent { .. } => (
+                        "Link PR Stack Parent",
+                        " Enter the parent PR URL or number:",
+                        " link  ",
+                    ),
+                };
 
-                let outer = self.themed_overlay_block("Create Agent From PR");
+                let outer = self.themed_overlay_block(title);
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
@@ -6942,7 +7092,7 @@ impl App {
                         Style::default().fg(self.theme.input_label_fg),
                     )),
                     Line::from(Span::styled(
-                        " Paste a GitHub PR URL or enter a PR number:",
+                        prompt_label,
                         Style::default().fg(self.theme.input_label_fg),
                     )),
                 ])
@@ -6985,7 +7135,7 @@ impl App {
                 let mut hints = vec![Span::raw(" ")];
                 hints.extend(self.theme.key_badge_default(&confirm_key));
                 hints.push(Span::styled(
-                    " resolve  ",
+                    action_label,
                     Style::default().fg(self.theme.hint_desc_fg),
                 ));
                 hints.extend(self.theme.key_badge_default(&close_key));

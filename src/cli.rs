@@ -282,6 +282,30 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         &defaults.ui.pr_banner_position,
         &current.ui.pr_banner_position,
     );
+    diff_u16(
+        &mut changes,
+        "ui.github_poll_interval_seconds",
+        defaults.ui.github_poll_interval_seconds,
+        current.ui.github_poll_interval_seconds,
+    );
+    diff_bool(
+        &mut changes,
+        "ui.pr_section",
+        defaults.ui.pr_section,
+        current.ui.pr_section,
+    );
+    diff_u16(
+        &mut changes,
+        "ui.pr_section_max_rows",
+        defaults.ui.pr_section_max_rows,
+        current.ui.pr_section_max_rows,
+    );
+    diff_bool(
+        &mut changes,
+        "ui.pr_section_show_related",
+        defaults.ui.pr_section_show_related,
+        current.ui.pr_section_show_related,
+    );
     diff_bool(
         &mut changes,
         "ui.macro_focus_on_launch",
@@ -791,6 +815,142 @@ fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
     send_and_print_request(paths, request, json)
 }
 
+// ---------------------------------------------------------------------------
+// dux pr
+// ---------------------------------------------------------------------------
+
+pub fn run_pr(args: &[String], paths: &DuxPaths) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("");
+    let wants_json = args.iter().any(|arg| arg == "--json");
+    let result = match sub {
+        "list" => run_pr_list(&args[1..], paths),
+        "link" => run_pr_link(&args[1..], paths),
+        "" | "--help" | "-h" => {
+            print_pr_help();
+            Ok(())
+        }
+        other => bail!("unknown pr subcommand: {other}\nRun `dux pr --help` for usage."),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if wants_json => {
+            print_control_response(
+                &crate::ipc::ControlResponse::error("invalid_request", format!("{err:#}")),
+                true,
+            );
+            std::process::exit(1);
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn print_pr_help() {
+    println!(
+        "\
+dux pr — inspect and link pull requests for an agent
+
+Subcommands:
+  dux pr list             List pull requests for an agent
+  dux pr link <pr>        Associate a PR with an agent worktree
+
+list options:
+  --session <session-id>  Session to inspect (defaults to DUX_SESSION_ID)
+  --json                  Print the machine-readable JSON response
+
+link options:
+  --session <session-id>  Session to link (defaults to DUX_SESSION_ID)
+  --json                  Print the machine-readable JSON response
+
+<pr> accepts a PR number, #number, or GitHub PR URL.
+
+Environment:
+  DUX_SESSION_ID          Current agent session id
+  DUX_SOCKET              Override the control socket path"
+    );
+}
+
+fn default_pr_session() -> Option<String> {
+    std::env::var("DUX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn run_pr_list(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_pr_help();
+        return Ok(());
+    }
+    let mut session_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => session_id = Some(take_value("--session")?),
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    let session_id = session_id.or_else(default_pr_session).ok_or_else(|| {
+        anyhow!("pr list needs a session id, either from DUX_SESSION_ID or --session <session-id>.")
+    })?;
+    send_and_print_request(
+        paths,
+        crate::ipc::ControlRequest::pull_requests(Some(session_id)),
+        json,
+    )
+}
+
+fn run_pr_link(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_pr_help();
+        return Ok(());
+    }
+    let mut session_id = None;
+    let mut json = false;
+    let mut input = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => session_id = Some(take_value("--session")?),
+            "--json" => json = true,
+            other if other.starts_with('-') && !other.starts_with('#') => {
+                bail!("unknown flag: {other}")
+            }
+            other => {
+                if input.replace(other.to_string()).is_some() {
+                    bail!("pr link accepts one PR URL or number.");
+                }
+            }
+        }
+        index += 1;
+    }
+    let input = input.ok_or_else(|| anyhow!("pr link requires a PR URL or number."))?;
+    let session_id = session_id.or_else(default_pr_session).ok_or_else(|| {
+        anyhow!("pr link needs a session id, either from DUX_SESSION_ID or --session <session-id>.")
+    })?;
+    send_and_print_request(
+        paths,
+        crate::ipc::ControlRequest::link_pull_request(Some(session_id), input),
+        json,
+    )
+}
+
 fn send_and_print_request(
     paths: &DuxPaths,
     request: crate::ipc::ControlRequest,
@@ -798,7 +958,9 @@ fn send_and_print_request(
 ) -> Result<()> {
     let timeout = match &request.command {
         crate::ipc::ControlCommand::SplitOut(params) => params.timeout(),
-        crate::ipc::ControlCommand::Related { .. } => crate::ipc::DEFAULT_CONTROL_TIMEOUT,
+        crate::ipc::ControlCommand::Related { .. }
+        | crate::ipc::ControlCommand::PullRequests { .. }
+        | crate::ipc::ControlCommand::LinkPullRequest { .. } => crate::ipc::DEFAULT_CONTROL_TIMEOUT,
     };
     let response = match crate::ipc::send_request(&paths.control_socket_path, &request, timeout) {
         Ok(response) => response,
@@ -852,6 +1014,26 @@ fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
     }
     if let Some(group_id) = response.group_id.as_deref() {
         println!("group:    {group_id}");
+    }
+    if !response.pull_requests.is_empty() {
+        println!();
+        for pr in &response.pull_requests {
+            let indent = "  ".repeat(pr.depth);
+            let current = if pr.is_current { " (current)" } else { "" };
+            let related = if pr.is_related { " (related)" } else { "" };
+            println!(
+                "{indent}- [{}] {}#{} · {} · {} · {}{}{}",
+                pr.state,
+                pr.owner_repo,
+                pr.number,
+                pr.title,
+                pr.project_name,
+                pr.session_label,
+                current,
+                related,
+            );
+            println!("{indent}  {}", pr.url);
+        }
     }
     if !response.related.is_empty() {
         println!();

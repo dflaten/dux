@@ -124,6 +124,7 @@ enum MouseTarget {
     TerminalPane,
     Center,
     FilesPane,
+    PullRequestRow(Option<usize>),
     UnstagedFile(Option<usize>),
     StagedFile(Option<usize>),
     CommitChrome,
@@ -649,6 +650,7 @@ impl App {
                 }
                 Action::FocusNext => {
                     let has_staged = !self.staged_files.is_empty();
+                    let has_prs = self.pr_section_visible();
                     if self.focus == FocusPane::Left
                         && self.left_section == LeftSection::Projects
                         && self.has_terminal_items()
@@ -661,7 +663,7 @@ impl App {
                         self.left_section = LeftSection::Projects;
                         self.focus = self.focus.next();
                     } else if self.focus == FocusPane::Files {
-                        match self.right_section.next(has_staged) {
+                        match self.right_section.next(has_prs, has_staged) {
                             Some(next) => {
                                 self.right_section = next;
                                 self.clamp_files_cursor();
@@ -677,7 +679,7 @@ impl App {
                             self.focus = self.focus.next();
                         }
                         if self.focus == FocusPane::Files {
-                            self.right_section = RightSection::first();
+                            self.right_section = RightSection::first(has_prs);
                             self.clamp_files_cursor();
                         } else if self.focus == FocusPane::Left {
                             self.left_section = LeftSection::Projects;
@@ -688,6 +690,7 @@ impl App {
                 }
                 Action::FocusPrev => {
                     let has_staged = !self.staged_files.is_empty();
+                    let has_prs = self.pr_section_visible();
                     if self.focus == FocusPane::Left && self.left_section == LeftSection::Terminals
                     {
                         self.left_section = LeftSection::Projects;
@@ -703,7 +706,7 @@ impl App {
                             self.clamp_files_cursor();
                         }
                     } else if self.focus == FocusPane::Files {
-                        match self.right_section.previous() {
+                        match self.right_section.previous(has_prs) {
                             Some(prev) => {
                                 self.right_section = prev;
                                 self.clamp_files_cursor();
@@ -1557,6 +1560,12 @@ impl App {
                 return Ok(());
             }
             match action {
+                Action::MoveDown if self.right_section == RightSection::PullRequests => {
+                    let len = self.selected_pr_section_rows().len();
+                    if self.pr_index + 1 < len {
+                        self.pr_index += 1;
+                    }
+                }
                 Action::MoveDown if self.right_section != RightSection::CommitInput => {
                     let len = self.current_files_len();
                     if self.files_index + 1 < len {
@@ -1564,33 +1573,76 @@ impl App {
                     }
                 }
                 Action::MoveUp
-                    if self.right_section != RightSection::CommitInput && self.files_index > 0 =>
+                    if self.right_section == RightSection::PullRequests && self.pr_index > 0 =>
+                {
+                    self.pr_index -= 1;
+                }
+                Action::MoveUp
+                    if self.right_section != RightSection::CommitInput
+                        && self.right_section != RightSection::PullRequests
+                        && self.files_index > 0 =>
                 {
                     self.files_index -= 1;
                 }
-                Action::StageUnstage if self.right_section != RightSection::CommitInput => {
+                Action::StageUnstage
+                    if matches!(
+                        self.right_section,
+                        RightSection::Unstaged | RightSection::Staged
+                    ) =>
+                {
                     self.toggle_stage_selected_file()?;
                 }
-                Action::CommitChanges if !self.staged_files.is_empty() => {
+                Action::CommitChanges
+                    if !self.staged_files.is_empty()
+                        && self.right_section != RightSection::PullRequests =>
+                {
                     self.execute_commit()?;
                 }
-                Action::OpenDiff => {
-                    if self.right_section == RightSection::CommitInput {
+                Action::OpenDiff => match self.right_section {
+                    RightSection::PullRequests => {
+                        self.open_selected_pr_in_browser()?;
+                    }
+                    RightSection::CommitInput => {
                         if !self.staged_files.is_empty() {
                             self.input_target = InputTarget::CommitMessage;
                         }
-                    } else {
+                    }
+                    RightSection::Staged | RightSection::Unstaged => {
                         self.open_diff_for_selected_file()?;
                     }
-                }
-                Action::DiscardChanges if self.right_section != RightSection::CommitInput => {
+                },
+                Action::DiscardChanges
+                    if matches!(
+                        self.right_section,
+                        RightSection::Unstaged | RightSection::Staged
+                    ) =>
+                {
                     self.confirm_discard_selected_file()?;
                 }
-                Action::GenerateCommitMessage => {
+                Action::GenerateCommitMessage
+                    if self.right_section != RightSection::PullRequests =>
+                {
                     self.trigger_ai_commit_message()?;
                 }
-                Action::EngageCommitInput if !self.staged_files.is_empty() => {
+                Action::EngageCommitInput
+                    if !self.staged_files.is_empty()
+                        && self.right_section != RightSection::PullRequests =>
+                {
                     self.input_target = InputTarget::CommitMessage;
+                }
+                Action::CopyPullRequestUrl if self.right_section == RightSection::PullRequests => {
+                    self.copy_selected_pr_url()?;
+                }
+                Action::GoToPullRequestAgent
+                    if self.right_section == RightSection::PullRequests =>
+                {
+                    self.go_to_selected_pr_agent()?;
+                }
+                Action::LinkStackParent if self.right_section == RightSection::PullRequests => {
+                    self.open_link_pr_stack_parent_prompt()?;
+                }
+                Action::ClearStackParent if self.right_section == RightSection::PullRequests => {
+                    self.clear_selected_pr_stack_parent()?;
                 }
                 Action::PushToRemote => {
                     self.push_to_remote()?;
@@ -1993,7 +2045,7 @@ impl App {
         let file = match self.right_section {
             RightSection::Staged => self.staged_files.get(self.files_index),
             RightSection::Unstaged => self.unstaged_files.get(self.files_index),
-            RightSection::CommitInput => return Ok(()),
+            RightSection::PullRequests | RightSection::CommitInput => return Ok(()),
         };
         let Some(file) = file else { return Ok(()) };
         if file.is_branch_only() {
@@ -2010,7 +2062,7 @@ impl App {
             RightSection::Staged => {
                 git::unstage_file(&worktree, &path)?;
             }
-            RightSection::CommitInput => {}
+            RightSection::PullRequests | RightSection::CommitInput => {}
         }
         self.reload_changed_files();
         // If the visible Changes list is now empty, keep focus on that list.
@@ -2032,7 +2084,7 @@ impl App {
                 self.set_error("Unstage the file first to discard changes.");
                 return Ok(());
             }
-            RightSection::CommitInput => return Ok(()),
+            RightSection::PullRequests | RightSection::CommitInput => return Ok(()),
         };
         let Some(file) = file else { return Ok(()) };
         if file.is_branch_only() {
@@ -4250,13 +4302,26 @@ impl App {
                     self.prompt = PromptState::None;
                 }
                 Some(Action::Confirm) => {
-                    let (project, raw_input) = match &self.prompt {
-                        PromptState::PullRequestInput { project, input } => {
-                            (project.clone(), input.text.trim().to_string())
-                        }
+                    let (project, raw_input, purpose) = match &self.prompt {
+                        PromptState::PullRequestInput {
+                            project,
+                            input,
+                            purpose,
+                        } => (
+                            project.clone(),
+                            input.text.trim().to_string(),
+                            purpose.clone(),
+                        ),
                         _ => unreachable!(),
                     };
-                    self.dispatch_pull_request_lookup(project, raw_input)?;
+                    match purpose {
+                        PullRequestPromptPurpose::NewAgent => {
+                            self.dispatch_pull_request_lookup(project, raw_input)?;
+                        }
+                        PullRequestPromptPurpose::LinkStackParent { child } => {
+                            self.dispatch_pr_stack_parent_lookup(project, child, raw_input)?;
+                        }
+                    }
                 }
                 _ => {
                     if let PromptState::PullRequestInput { input, .. } = &mut self.prompt {
@@ -5174,6 +5239,15 @@ impl App {
 
         if contains_point(self.mouse_layout.left, column, row) {
             return Some(MouseTarget::LeftPane);
+        }
+
+        if let Some(area) = self.mouse_layout.pr_list
+            && contains_point(area, column, row)
+        {
+            let visible_row = usize::from(row.saturating_sub(area.y));
+            let index = self.mouse_layout.pr_list_offset + visible_row;
+            let pr_index = (index < self.selected_pr_section_rows().len()).then_some(index);
+            return Some(MouseTarget::PullRequestRow(pr_index));
         }
 
         if let Some(area) = self.mouse_layout.unstaged_list
@@ -7226,6 +7300,22 @@ impl App {
                         self.input_target = InputTarget::None;
                         self.fullscreen_overlay = FullscreenOverlay::None;
                     }
+                    Some(MouseTarget::PullRequestRow(index)) => {
+                        self.focus = FocusPane::Files;
+                        self.right_section = RightSection::PullRequests;
+                        self.input_target = InputTarget::None;
+                        self.fullscreen_overlay = FullscreenOverlay::None;
+                        if let Some(index) = index {
+                            self.pr_index = index;
+                            let double_click = self.register_mouse_click(
+                                MouseClickTarget::PullRequestsPane,
+                                Some(index),
+                            );
+                            if double_click && let Err(err) = self.open_selected_pr_in_browser() {
+                                self.set_error(format!("{err:#}"));
+                            }
+                        }
+                    }
                     Some(MouseTarget::UnstagedFile(index)) => {
                         self.set_file_selection(RightSection::Unstaged, index);
                         if index.is_some() {
@@ -7279,6 +7369,14 @@ impl App {
                     self.handle_left_mouse_wheel(true, mouse.column, mouse.row)
                 }
                 Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
+                Some(MouseTarget::PullRequestRow(_)) => {
+                    let len = self.selected_pr_section_rows().len();
+                    self.focus = FocusPane::Files;
+                    self.right_section = RightSection::PullRequests;
+                    if self.pr_index + 1 < len {
+                        self.pr_index += 1;
+                    }
+                }
                 Some(MouseTarget::UnstagedFile(_)) => {
                     self.scroll_file_selection(RightSection::Unstaged, true)
                 }
@@ -7297,6 +7395,11 @@ impl App {
                     self.handle_left_mouse_wheel(false, mouse.column, mouse.row)
                 }
                 Some(MouseTarget::Center) => self.handle_center_mouse_wheel(mouse),
+                Some(MouseTarget::PullRequestRow(_)) => {
+                    self.focus = FocusPane::Files;
+                    self.right_section = RightSection::PullRequests;
+                    self.pr_index = self.pr_index.saturating_sub(1);
+                }
                 Some(MouseTarget::UnstagedFile(_)) => {
                     self.scroll_file_selection(RightSection::Unstaged, false)
                 }
@@ -8159,6 +8262,7 @@ mod tests {
             session_store,
             projects: vec![project],
             sessions: vec![session],
+            archived_sessions: Vec::new(),
             groups: Vec::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -8266,10 +8370,19 @@ mod tests {
             gh_status: crate::model::GhStatus::Unknown,
             github_integration_enabled: false,
             pr_banner_at_bottom: true,
+            pull_requests: std::collections::HashMap::new(),
+            pr_links: std::collections::HashMap::new(),
+            pr_stacks: std::collections::HashMap::new(),
             pr_statuses: std::collections::HashMap::new(),
             pr_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             pr_sync_enabled: Arc::new(AtomicBool::new(false)),
+            pr_poller_running: Arc::new(AtomicBool::new(false)),
+            pr_poll_interval_secs: Arc::new(std::sync::atomic::AtomicU64::new(45)),
             pr_last_checked: std::collections::HashMap::new(),
+            pr_base_lookups: std::collections::HashSet::new(),
+            pr_base_last_checked: std::collections::HashMap::new(),
+            pr_index: 0,
+            pr_section_session: None,
             refs_watcher: None,
             refs_watch_paths: std::collections::HashMap::new(),
             resume_fallback_candidates: std::collections::HashMap::new(),
@@ -8310,11 +8423,28 @@ mod tests {
             left_list_offset: 0,
             terminal_list: Rect::default(),
             agent_term: Some(Rect::new(21, 1, 55, 16)),
+            pr_list: None,
+            pr_list_offset: 0,
             unstaged_list: Some(Rect::new(78, 1, 21, 8)),
             staged_list: Some(Rect::new(78, 9, 21, 5)),
             commit_area: Some(Rect::new(77, 14, 23, 6)),
             commit_text_area: Some(Rect::new(78, 15, 21, 4)),
         };
+    }
+
+    #[test]
+    fn mouse_hits_in_the_pr_section_route_to_pr_rows() {
+        let mut app = test_app(default_bindings());
+        app.mouse_layout.pr_list = Some(Rect::new(80, 1, 20, 5));
+
+        assert!(matches!(
+            app.mouse_target(81, 1),
+            Some(MouseTarget::PullRequestRow(_))
+        ));
+        assert!(!matches!(
+            app.mouse_target(79, 1),
+            Some(MouseTarget::PullRequestRow(_))
+        ));
     }
 
     #[test]
@@ -9549,6 +9679,7 @@ not_a_real_action = ["x"]
                 title: "Fix issue".to_string(),
                 state: "OPEN".to_string(),
                 head_branch: "feature/pr-42".to_string(),
+                base_branch: "main".to_string(),
                 custom_name: Some("feature/pr-42".to_string()),
                 use_existing_branch: false,
             },
@@ -11798,6 +11929,10 @@ not_a_real_action = ["x"]
                 host: "github.com".to_string(),
                 owner_repo: "owner/repo".to_string(),
                 url: "https://github.com/owner/repo/pull/42".to_string(),
+                is_draft: false,
+                head_ref: String::new(),
+                base_ref: String::new(),
+                head_repo: String::new(),
             },
         );
 
@@ -11823,6 +11958,10 @@ not_a_real_action = ["x"]
                 host: "github.com".to_string(),
                 owner_repo: "owner/repo".to_string(),
                 url: "https://github.com/owner/repo/pull/42".to_string(),
+                is_draft: false,
+                head_ref: String::new(),
+                base_ref: String::new(),
+                head_repo: String::new(),
             },
         );
 
@@ -11887,6 +12026,7 @@ not_a_real_action = ["x"]
                     title: "Fix issue".to_string(),
                     state: "OPEN".to_string(),
                     head_ref_name: "feature/pr-42".to_string(),
+                    base_ref_name: "main".to_string(),
                 }),
             })
             .expect("send PR resolution");

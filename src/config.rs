@@ -299,6 +299,14 @@ pub struct UiConfig {
     pub auto_reopen_agents: bool,
     pub deleted_agent_retention_days: u16,
     pub pr_banner_position: String,
+    /// Seconds between background PR status refreshes. Clamped to at least 15.
+    pub github_poll_interval_seconds: u16,
+    /// Show the focusable Pull Requests section above Changes in the right pane.
+    pub pr_section: bool,
+    /// Maximum PR rows shown before the section scrolls (borders excluded).
+    pub pr_section_max_rows: u16,
+    /// Include PRs from related agents in other projects in the PR section.
+    pub pr_section_show_related: bool,
     pub macro_focus_on_launch: bool,
     pub theme: String,
 }
@@ -334,6 +342,10 @@ impl Default for Config {
                 auto_reopen_agents: false,
                 deleted_agent_retention_days: 30,
                 pr_banner_position: "bottom".to_string(),
+                github_poll_interval_seconds: 45,
+                pr_section: true,
+                pr_section_max_rows: 6,
+                pr_section_show_related: true,
                 macro_focus_on_launch: false,
                 theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
             },
@@ -513,6 +525,10 @@ impl Default for UiConfig {
             auto_reopen_agents: false,
             deleted_agent_retention_days: 30,
             pr_banner_position: "bottom".to_string(),
+            github_poll_interval_seconds: 45,
+            pr_section: true,
+            pr_section_max_rows: 6,
+            pr_section_show_related: true,
             macro_focus_on_launch: false,
             theme: crate::theme::DEFAULT_THEME_NAME.to_string(),
         }
@@ -1161,6 +1177,34 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Str(c.ui.pr_banner_position.clone()),
         },
         ConfigEntry::Field {
+            key: "github_poll_interval_seconds",
+            comment: Some(CommentSource::Static(
+                "# Seconds between background PR refreshes for running agents.\n# Minimum 15. Lower values use more GitHub API calls.",
+            )),
+            value_fn: |c| FieldValue::U16(c.ui.github_poll_interval_seconds),
+        },
+        ConfigEntry::Field {
+            key: "pr_section",
+            comment: Some(CommentSource::Static(
+                "# Show a focusable Pull Requests section above Changes in the right pane.\n# The section only appears when the selected agent has associated PRs.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.pr_section),
+        },
+        ConfigEntry::Field {
+            key: "pr_section_max_rows",
+            comment: Some(CommentSource::Static(
+                "# Maximum PR rows shown in the right-pane section before it scrolls.\n# Borders add two more rows. Values below 1 are treated as 1.",
+            )),
+            value_fn: |c| FieldValue::U16(c.ui.pr_section_max_rows),
+        },
+        ConfigEntry::Field {
+            key: "pr_section_show_related",
+            comment: Some(CommentSource::Static(
+                "# Include PRs from other agents in the same Multi-repo work group\n# in the right-pane Pull Requests section.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.ui.pr_section_show_related),
+        },
+        ConfigEntry::Field {
             key: "macro_focus_on_launch",
             comment: Some(CommentSource::Static(
                 "# When true, jump to the agent or terminal pane after a macro runs in it.\n\
@@ -1432,6 +1476,25 @@ pub fn save_config(
         "ui",
         "pr_banner_position",
         &config.ui.pr_banner_position,
+    );
+    patch_table_u16(
+        &mut doc,
+        "ui",
+        "github_poll_interval_seconds",
+        config.ui.github_poll_interval_seconds,
+    );
+    patch_table_bool(&mut doc, "ui", "pr_section", config.ui.pr_section);
+    patch_table_u16(
+        &mut doc,
+        "ui",
+        "pr_section_max_rows",
+        config.ui.pr_section_max_rows,
+    );
+    patch_table_bool(
+        &mut doc,
+        "ui",
+        "pr_section_show_related",
+        config.ui.pr_section_show_related,
     );
     patch_table_bool(
         &mut doc,
