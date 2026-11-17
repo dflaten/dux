@@ -6260,7 +6260,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_contribute_prs_to_project_and_related_views() {
+    fn archived_sessions_contribute_prs_to_related_views() {
         let mut first = make_session("s1", "codex", "/tmp/worktree-1");
         first.group_id = Some("group-1".to_string());
         let mut archived = make_session("s2", "codex", "/tmp/worktree-2");
@@ -6273,34 +6273,195 @@ mod tests {
         seed_linked_pr(&mut app, "s2", stored_pr(2, "branch-s2", "main", "OPEN"));
         app.reload_pull_request_state();
 
-        let project_prs = app.prs_for_project("project-1");
-        assert!(project_prs.iter().any(|pr| pr.number == 2));
         let rows = app.pr_section_rows_for_session(&app.sessions[0]);
         assert!(rows.iter().any(|row| row.key.number == 2 && row.is_related));
     }
 
     #[test]
-    fn project_pr_badge_counts_only_active_prs() {
+    fn pr_section_lists_historical_prs_linked_to_the_agent() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s1", stored_pr(2, "old-branch", "main", "MERGED"));
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(3, "older-branch", "main", "CLOSED"),
+        );
+        app.reload_pull_request_state();
+
+        let rows = app.pr_section_rows_for_session(&app.sessions[0]);
+        assert_eq!(
+            rows.len(),
+            3,
+            "the right pane should list the current PR and its historical PRs"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the current PR should stay first, followed by the newest historical states"
+        );
+        assert!(
+            rows.iter().any(|row| row.key.number == 1 && row.is_current),
+            "the current-branch PR should still be marked current"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.key.number == 2 && !row.is_current),
+            "merged PRs linked to the agent should remain visible"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.key.number == 3 && !row.is_current),
+            "closed PRs linked to the agent should remain visible"
+        );
+    }
+
+    #[test]
+    fn agent_rows_mark_prs_without_provider_labels_or_project_pr_counts() {
+        let first = make_session("s1", "codex", "/tmp/worktree-1");
+        let second = make_session("s2", "codex", "/tmp/worktree-2");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s2", stored_pr(2, "branch-s2", "main", "MERGED"));
+        app.reload_pull_request_state();
+
+        let rows = render_rows(&mut app, 160, 30);
+        // Only inspect the left pane rows: the header and right pane may
+        // legitimately mention branch names or PR titles.
+        let left_row = |needle: &str, row_marker: &str| {
+            rows.iter()
+                .find(|row| row.contains(needle) && row.contains(row_marker))
+                .map(|row| row.chars().take(32).collect::<String>())
+                .unwrap_or_else(|| panic!("missing {needle:?} row:\n{}", rows.join("\n")))
+        };
+
+        let project_row = left_row("demo", "▾ ");
+        assert!(
+            !project_row.contains("PR"),
+            "project rows should not show pull request counts: {project_row:?}"
+        );
+
+        let open_pr_row = left_row("branch-s1", "├ ");
+        assert!(
+            open_pr_row.contains("(PR)"),
+            "open PR agents should be marked with (PR): {open_pr_row:?}"
+        );
+        assert!(
+            !open_pr_row.contains("(codex)"),
+            "agent rows should not show the provider name: {open_pr_row:?}"
+        );
+
+        let merged_pr_row = left_row("branch-s2", "└ ");
+        assert!(
+            merged_pr_row.contains("(PR)"),
+            "agents with merged PRs should still be marked with (PR): {merged_pr_row:?}"
+        );
+        assert!(
+            !merged_pr_row.contains("(codex)"),
+            "agent rows should not show the provider name: {merged_pr_row:?}"
+        );
+    }
+
+    #[test]
+    fn agent_rows_hide_pr_marker_when_no_pr_is_associated() {
         let session = make_session("s1", "codex", "/tmp/worktree");
         let project = make_project("project-1", "codex");
         let mut app = test_app_with_sessions(vec![session], vec![project]);
         app.github_integration_enabled = true;
         app.rebuild_left_items();
         app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
-        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
-        seed_linked_pr(&mut app, "s1", stored_pr(2, "old-branch", "main", "MERGED"));
-        app.reload_pull_request_state();
 
-        let rows = render_rows(&mut app, 120, 30);
+        let rows = render_rows(&mut app, 160, 30);
+        let session_row = rows
+            .iter()
+            .find(|row| row.contains("branch-s1") && row.contains("└ "))
+            .map(|row| row.chars().take(32).collect::<String>())
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
         assert!(
-            rows.iter().any(|row| row.contains("PR 1")),
-            "project row should show the active PR count:\n{}",
-            rows.join("\n")
+            !session_row.contains("(PR)"),
+            "agents without a PR should not show the marker: {session_row:?}"
         );
         assert!(
-            !rows.iter().any(|row| row.contains("PR 2")),
-            "merged history should not inflate the project badge:\n{}",
-            rows.join("\n")
+            !session_row.contains("(codex)"),
+            "agent rows should not show the provider name: {session_row:?}"
+        );
+    }
+
+    #[test]
+    fn pr_marker_survives_long_session_titles_in_a_narrow_sidebar() {
+        let mut session = make_session("s1", "codex", "/tmp/worktree");
+        session.title = Some(
+            "a very long session title that would otherwise push every badge off the row"
+                .to_string(),
+        );
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let width = 120u16;
+        let rows = render_rows(&mut app, width, 30);
+        let left_width = usize::from(width) * usize::from(app.left_width_pct) / 100;
+        let session_row = rows
+            .iter()
+            .find(|row| row.contains("└ "))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+        let left: String = session_row.chars().take(left_width).collect();
+        assert!(
+            left.contains("(PR)"),
+            "the PR marker should survive a long title in a narrow sidebar: {left:?}"
+        );
+        assert!(
+            left.contains('…'),
+            "the title should be truncated to leave room for status markers: {left:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_sidebar_marks_pr_agents_with_a_compact_marker() {
+        let first = make_session("s1", "codex", "/tmp/worktree-1");
+        let second = make_session("s2", "codex", "/tmp/worktree-2");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        app.github_integration_enabled = true;
+        app.left_collapsed = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let rows = render_rows(&mut app, 80, 24);
+        // The collapsed sidebar is 5 columns wide including borders, leaving
+        // room for the tree connector, status dot, and one compact marker.
+        let left_prefix = |row: &str| row.chars().take(5).collect::<String>();
+        let pr_row = rows
+            .iter()
+            .map(|row| left_prefix(row))
+            .find(|row| row.contains('├'))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+        let no_pr_row = rows
+            .iter()
+            .map(|row| left_prefix(row))
+            .find(|row| row.contains('└'))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+
+        assert!(
+            pr_row.contains('P'),
+            "agents with PRs should show a compact marker in the collapsed sidebar: {pr_row:?}"
+        );
+        assert!(
+            !no_pr_row.contains('P'),
+            "agents without PRs should not show the compact marker: {no_pr_row:?}"
         );
     }
 
