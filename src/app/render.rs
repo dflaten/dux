@@ -840,22 +840,29 @@ impl App {
             .collect();
 
         let left_items = self.left_items();
-        // While filtering, the per-project count must reflect the agents that
-        // are actually listed, not the unfiltered total.
-        let session_counts: HashMap<String, usize> = if self.left_search_is_filtering() {
-            let mut counts = HashMap::new();
-            for item in left_items {
-                if let LeftItem::Session(index) = item
-                    && let Some(session) = self.sessions.get(*index)
-                    && !self.session_is_related_member(session)
-                    && !self.session_is_related_origin(session)
-                {
-                    *counts.entry(session.project_id.clone()).or_insert(0) += 1;
-                }
-            }
-            counts
+        // While filtering, only projects with agents that are actually listed
+        // should look expanded.
+        let visible_session_projects: HashSet<String> = if self.left_search_is_filtering() {
+            left_items
+                .iter()
+                .filter_map(|item| match item {
+                    LeftItem::Session(index) => self.sessions.get(*index),
+                    _ => None,
+                })
+                .filter(|session| {
+                    !self.session_is_related_member(session)
+                        && !self.session_is_related_origin(session)
+                })
+                .map(|session| session.project_id.clone())
+                .collect()
         } else {
-            project_visible_session_counts(&self.sessions, &self.groups)
+            self.projects
+                .iter()
+                .filter(|project| {
+                    project_has_visible_sessions(&self.sessions, &project.id, &related_group_ids)
+                })
+                .map(|project| project.id.clone())
+                .collect()
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;
         // Only split-out members count toward a project's related badge. Origins
@@ -870,15 +877,6 @@ impl App {
                 *counts.entry(session.project_id.clone()).or_insert(0) += 1;
                 counts
             });
-        let project_count = self
-            .projects
-            .iter()
-            .filter(|project| !project.is_scratch())
-            .count();
-        let visible_project_count = left_items
-            .iter()
-            .filter(|item| matches!(item, LeftItem::Project(_)))
-            .count();
         // The search row needs two rows of its own. In a pane that is too
         // short for it, the query moves into the block title instead.
         let show_search = self.left_search_active || self.has_left_search();
@@ -887,11 +885,7 @@ impl App {
             .inner(projects_area)
             .height
             >= 4;
-        let mut title = if self.left_search_is_filtering() {
-            format!("Projects ({visible_project_count}/{project_count})")
-        } else {
-            format!("Projects ({project_count})")
-        };
+        let mut title = "Projects".to_string();
         if show_search && !search_fits {
             let query = self.left_search.text.trim();
             if !query.is_empty() {
@@ -919,10 +913,11 @@ impl App {
                         ];
                         ListItem::new(Line::from(spans))
                     } else {
-                        let count = session_counts.get(&project.id).copied().unwrap_or(0);
                         let icon = if is_below_empty_projects_separator {
                             "⧉ "
-                        } else if count == 0 || self.collapsed_projects.contains(&project.id) {
+                        } else if !visible_session_projects.contains(&project.id)
+                            || self.collapsed_projects.contains(&project.id)
+                        {
                             "▸ "
                         } else {
                             "▾ "
@@ -943,12 +938,6 @@ impl App {
                                 }
                             }),
                         ];
-                        if count > 0 {
-                            spans.push(Span::styled(
-                                format!(" ({count})"),
-                                Style::default().fg(self.theme.provider_label_fg),
-                            ));
-                        }
                         if let Some(related) = related_counts.get(&project.id)
                             && *related > 0
                         {
@@ -1169,13 +1158,12 @@ impl App {
                     SCRATCH_PROJECT_NAME,
                 )),
                 LeftItem::ScratchHeader => {
-                    let count = session_counts.get(SCRATCH_PROJECT_ID).copied().unwrap_or(0);
                     let icon = if self.collapsed_projects.contains(SCRATCH_PROJECT_ID) {
                         "▸ "
                     } else {
                         "▾ "
                     };
-                    let mut spans = vec![
+                    let spans = vec![
                         Span::styled(icon, Style::default().fg(self.theme.project_icon)),
                         Span::styled(
                             SCRATCH_PROJECT_NAME.to_string(),
@@ -1188,12 +1176,6 @@ impl App {
                             Style::default().fg(self.theme.hint_dim_desc_fg),
                         ),
                     ];
-                    if count > 0 {
-                        spans.push(Span::styled(
-                            format!(" ({count})"),
-                            Style::default().fg(self.theme.provider_label_fg),
-                        ));
-                    }
                     ListItem::new(Line::from(spans))
                 }
                 LeftItem::EmptyProjectsSeparator => {

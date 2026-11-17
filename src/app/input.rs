@@ -19281,6 +19281,10 @@ cyan = "#00ffff"
             rendered.contains("Scratch (ad-hoc)"),
             "the scratch header should use the ad-hoc label, got: {rendered}"
         );
+        assert!(
+            !rendered.contains("Scratch (ad-hoc) (1)"),
+            "the scratch header should not show an agent count, got: {rendered}"
+        );
     }
 
     #[test]
@@ -19632,7 +19636,7 @@ cyan = "#00ffff"
     }
 
     #[test]
-    fn the_sidebar_search_row_is_rendered() {
+    fn the_sidebar_search_row_is_rendered_without_project_counts() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -19658,8 +19662,12 @@ cyan = "#00ffff"
             "the search row should show the query, got: {rendered}"
         );
         assert!(
-            rendered.contains("Projects (1/2)"),
-            "the title should show the filtered project count, got: {rendered}"
+            !rendered.contains("Projects ("),
+            "the title should not show a project count, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("demo (1)") && !rendered.contains("alpha (1)"),
+            "project rows should not show agent counts, got: {rendered}"
         );
     }
 }

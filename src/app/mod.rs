@@ -1829,26 +1829,6 @@ pub(crate) fn related_origin_session_index(
     })
 }
 
-/// Per-project session counts for rows rendered under the project tree.
-/// Multi-repo work sessions (origins and split-out children) live in their own
-/// section, so they must not make a project look expanded or inflate its agent
-/// count.
-pub(crate) fn project_visible_session_counts(
-    sessions: &[AgentSession],
-    groups: &[AgentGroup],
-) -> HashMap<String, usize> {
-    let related_groups = related_group_indices(groups, sessions);
-    let related_group_ids = related_section_group_ids(groups, &related_groups);
-    let mut counts = HashMap::new();
-    for session in sessions {
-        if session_in_related_section(session, &related_group_ids) {
-            continue;
-        }
-        *counts.entry(session.project_id.clone()).or_insert(0) += 1;
-    }
-    counts
-}
-
 pub(crate) fn related_group_label_for(sessions: &[AgentSession], group: &AgentGroup) -> String {
     if let Some(origin_id) = group.origin_session_id.as_deref()
         && let Some(origin) = sessions.iter().find(|session| session.id == origin_id)
@@ -4945,24 +4925,6 @@ mod tests {
 
         assert!(items.contains(&LeftItem::RelatedGroupLabel(0)));
         assert!(items.contains(&LeftItem::Session(0)));
-    }
-
-    #[test]
-    fn project_visible_session_counts_exclude_multi_repo_work() {
-        let mut sessions = vec![
-            test_session("origin", "alpha", 0),
-            test_session("plain", "alpha", -1),
-            test_session("child", "beta", -2),
-        ];
-        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
-        group.id = "group-1".to_string();
-        sessions[0].group_id = Some(group.id.clone());
-        sessions[2].group_id = Some(group.id.clone());
-        sessions[2].parent_session_id = Some("origin".to_string());
-
-        let counts = project_visible_session_counts(&sessions, std::slice::from_ref(&group));
-        assert_eq!(counts.get("alpha"), Some(&1));
-        assert_eq!(counts.get("beta"), None);
     }
 
     #[test]
