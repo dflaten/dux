@@ -840,8 +840,9 @@ impl App {
             .collect();
 
         let left_items = self.left_items();
-        // While filtering, only projects with agents that are actually listed
-        // should look expanded.
+        // Track which projects still have agent rows beneath them: those are the
+        // only ones that should show an expanded arrow. While filtering, only
+        // the agents that survived the filter count.
         let visible_session_projects: HashSet<String> = if self.left_search_is_filtering() {
             left_items
                 .iter()
@@ -856,12 +857,10 @@ impl App {
                 .map(|session| session.project_id.clone())
                 .collect()
         } else {
-            self.projects
+            self.sessions
                 .iter()
-                .filter(|project| {
-                    project_has_visible_sessions(&self.sessions, &project.id, &related_group_ids)
-                })
-                .map(|project| project.id.clone())
+                .filter(|session| !session_in_related_section(session, &related_group_ids))
+                .map(|session| session.project_id.clone())
                 .collect()
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;

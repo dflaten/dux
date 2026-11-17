@@ -19662,11 +19662,15 @@ cyan = "#00ffff"
             "the search row should show the query, got: {rendered}"
         );
         assert!(
+            rendered.contains("alpha"),
+            "the matching project row should still render, got: {rendered}"
+        );
+        assert!(
             !rendered.contains("Projects ("),
             "the title should not show a project count, got: {rendered}"
         );
         assert!(
-            !rendered.contains("demo (1)") && !rendered.contains("alpha (1)"),
+            !rendered.contains("alpha (1)"),
             "project rows should not show agent counts, got: {rendered}"
         );
     }
