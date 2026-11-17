@@ -372,6 +372,23 @@ impl App {
             .iter()
             .map(|row| row.key.clone())
             .collect::<HashSet<_>>();
+        // The stack component only covers the PR on the current branch and the
+        // PRs stacked around it. Older merged or closed PRs linked to the same
+        // agent still belong to it, so list them here instead of silently
+        // hiding their history.
+        let mut linked = self.linked_prs_for_session(&session.id);
+        linked.sort_by_key(|pr| {
+            (
+                std::cmp::Reverse(pr.state_rank()),
+                std::cmp::Reverse(pr.number),
+            )
+        });
+        for pr in linked {
+            let key = pr.key();
+            if seen.insert(key.clone()) {
+                rows.push(self.pr_row_for_key(key, 0, &current));
+            }
+        }
         for row in self.related_pr_rows(session, include_related) {
             if seen.insert(row.key.clone()) {
                 rows.push(row);

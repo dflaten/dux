@@ -6278,6 +6278,48 @@ mod tests {
     }
 
     #[test]
+    fn pr_section_lists_historical_prs_linked_to_the_agent() {
+        let session = make_session("s1", "codex", "/tmp/worktree");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        seed_linked_pr(&mut app, "s1", stored_pr(2, "old-branch", "main", "MERGED"));
+        seed_linked_pr(
+            &mut app,
+            "s1",
+            stored_pr(3, "older-branch", "main", "CLOSED"),
+        );
+        app.reload_pull_request_state();
+
+        let rows = app.pr_section_rows_for_session(&app.sessions[0]);
+        assert_eq!(
+            rows.len(),
+            3,
+            "the right pane should list the current PR and its historical PRs"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.key.number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the current PR should stay first, followed by the newest historical states"
+        );
+        assert!(
+            rows.iter().any(|row| row.key.number == 1 && row.is_current),
+            "the current-branch PR should still be marked current"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.key.number == 2 && !row.is_current),
+            "merged PRs linked to the agent should remain visible"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.key.number == 3 && !row.is_current),
+            "closed PRs linked to the agent should remain visible"
+        );
+    }
+
+    #[test]
     fn agent_rows_mark_prs_without_provider_labels_or_project_pr_counts() {
         let first = make_session("s1", "codex", "/tmp/worktree-1");
         let second = make_session("s2", "codex", "/tmp/worktree-2");
