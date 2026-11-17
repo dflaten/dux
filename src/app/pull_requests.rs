@@ -701,26 +701,6 @@ impl App {
         }
     }
 
-    pub(crate) fn prs_for_project(&self, project_id: &str) -> Vec<PrInfo> {
-        if !self.github_integration_enabled {
-            return Vec::new();
-        }
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        for session in self
-            .pr_view_sessions()
-            .filter(|session| session.project_id == project_id)
-        {
-            for pr in self.linked_prs_for_session(&session.id) {
-                if seen.insert(pr.key()) {
-                    result.push(pr.clone());
-                }
-            }
-        }
-        result.sort_by_key(|pr| (pr.state_rank(), pr.number));
-        result
-    }
-
     pub(crate) fn link_imported_pull_request(
         &mut self,
         session_id: &str,

@@ -124,7 +124,7 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
         "Need to change which CLI new agents use? `change-default-provider` updates the global fallback. `change-project-default-provider` overrides just one project.".into()
     },
     |_b| {
-        "Swapped providers while an agent was still running? The sidebar shows `(old → new)` until you exit and relaunch. dux queues the swap, you run the show.".into()
+        "Swapped providers while an agent was still running? The agent pane title keeps the old name until you exit and relaunch. dux queues the swap, you run the show.".into()
     },
     // --- new tips ---
     |_b| {
@@ -918,17 +918,6 @@ impl App {
                                 Style::default().fg(self.theme.provider_label_fg),
                             ));
                         }
-                        let active_prs = self
-                            .prs_for_project(&project.id)
-                            .into_iter()
-                            .filter(|pr| pr.state == crate::model::PrState::Open)
-                            .count();
-                        if active_prs > 0 {
-                            spans.push(Span::styled(
-                                format!(" PR {active_prs}"),
-                                Style::default().fg(self.theme.pr_open_label),
-                            ));
-                        }
                         if let Some(related) = related_counts.get(&project.id)
                             && *related > 0
                         {
@@ -970,11 +959,11 @@ impl App {
                         };
                     // While a background delete is in flight for this session,
                     // dim the row text and italicize it so the user sees the
-                    // transient state. This covers the dot, label, and
-                    // provider suffix; the companion-terminal badge chain is
-                    // excluded because it renders through a separate helper
-                    // and the in-flight window is too brief to justify
-                    // threading a deletion flag through it.
+                    // transient state. This covers the dot, label, and PR
+                    // marker; the companion-terminal badge chain is excluded
+                    // because it renders through a separate helper and the
+                    // in-flight window is too brief to justify threading a
+                    // deletion flag through it.
                     let deleting = self.pending_deletions.contains(&session.id);
                     let label_color = if deleting {
                         self.theme.session_deleting
@@ -992,19 +981,6 @@ impl App {
                             .add_modifier(Modifier::ITALIC)
                     } else {
                         Style::default().fg(label_color)
-                    };
-                    let running_provider = self.running_provider_for(session);
-                    let provider_label = if running_provider != session.provider {
-                        // Swap is pending: agent is still running the old
-                        // provider but will spawn with session.provider on
-                        // next launch. Show both so the sidebar doesn't lie.
-                        format!(
-                            " ({} → {})",
-                            running_provider.as_str(),
-                            session.provider.as_str(),
-                        )
-                    } else {
-                        format!(" ({})", session.provider.as_str())
                     };
                     let is_related = self.session_is_related_member(session);
                     let is_related_origin = self.session_is_related_origin(session);
@@ -1046,14 +1022,16 @@ impl App {
                         label_style
                     };
                     spans.push(Span::styled(label, title_style));
-                    spans.push(Span::styled(
-                        provider_label,
-                        if deleting {
-                            label_style
-                        } else {
-                            Style::default().fg(self.theme.provider_label_fg)
-                        },
-                    ));
+                    if self.pr_statuses.contains_key(&session.id) {
+                        spans.push(Span::styled(
+                            " (PR)",
+                            if deleting {
+                                label_style
+                            } else {
+                                Style::default().fg(label_color)
+                            },
+                        ));
+                    }
                     if let Some(related_count) = project_tree_related_badge_count(
                         session,
                         &self.sessions,

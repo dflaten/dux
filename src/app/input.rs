@@ -18979,10 +18979,15 @@ cyan = "#00ffff"
             "pane title should NOT claim Opencode is running yet, got: {rendered}"
         );
 
-        // Sidebar entry should show the running → queued transition.
+        // Sidebar entries no longer repeat the provider name; the pane title and
+        // header carry that information instead.
         assert!(
-            rendered.contains("(codex → opencode)"),
-            "sidebar should show running provider → next provider, got: {rendered}"
+            !rendered.contains("(codex → opencode)"),
+            "sidebar should not show a provider transition label, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("(codex)"),
+            "sidebar should not show the running provider name, got: {rendered}"
         );
 
         // Tearing down the PTY clears the pin — the next launch will be opencode.
@@ -18993,7 +18998,7 @@ cyan = "#00ffff"
             "opencode"
         );
 
-        // After the PTY is gone, the sidebar collapses back to a single label.
+        // After the PTY is gone, the sidebar stays free of provider labels.
         let backend = TestBackend::new(200, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -19007,8 +19012,8 @@ cyan = "#00ffff"
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            rendered.contains("(opencode)"),
-            "sidebar should collapse to plain (opencode) after the PTY exits, got: {rendered}"
+            !rendered.contains("(opencode)"),
+            "sidebar should not show agent provider labels, got: {rendered}"
         );
         assert!(
             !rendered.contains("→"),
