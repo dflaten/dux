@@ -6558,12 +6558,13 @@ mod tests {
         path
     }
 
-    fn init_pr_repo(dir: &Path) {
+    fn init_pr_repo_with_remote(dir: &Path, remote: &str) {
         run_git(dir, &["init", "-b", "main"]);
-        run_git(
-            dir,
-            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
-        );
+        run_git(dir, &["remote", "add", "origin", remote]);
+    }
+
+    fn init_pr_repo(dir: &Path) {
+        init_pr_repo_with_remote(dir, "git@github.com:owner/repo.git");
     }
 
     #[test]
@@ -6584,6 +6585,30 @@ JSON"#,
                 assert!(pr.is_draft);
                 assert_eq!(pr.head_ref, "feature");
                 assert_eq!(pr.base_ref, "feature-a");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_lookup_resolves_an_ssh_scheme_origin() {
+        // A scheme-qualified SSH origin used to parse as no GitHub remote at
+        // all, so the poller returned Unavailable and no PR banner appeared.
+        let tmp = tempdir().expect("tempdir");
+        init_pr_repo_with_remote(tmp.path(), "ssh://git@github.com:2222/owner/repo.git");
+        let gh = write_fake_gh(
+            tmp.path(),
+            r#"cat <<'JSON'
+[{"number":42,"state":"OPEN","title":"Demo","url":"https://github.com/owner/repo/pull/42","isDraft":false,"headRefName":"feature","baseRefName":"main"}]
+JSON"#,
+        );
+        let entry = pr_test_entry(tmp.path());
+
+        match check_pr_for_entry_with_gh(&entry, &gh) {
+            PrLookup::Found(pr) => {
+                assert_eq!(pr.number, 42);
+                assert_eq!(pr.host, "github.com");
+                assert_eq!(pr.owner_repo, "owner/repo");
             }
             other => panic!("expected Found, got {other:?}"),
         }

@@ -1437,7 +1437,8 @@ pub fn remote_github_repo(worktree_path: &Path) -> Option<GitHubRemote> {
 
 /// Extracts `"owner/repo"` from a GitHub remote URL.
 ///
-/// Supports SSH (`git@github.com:owner/repo.git`), HTTPS
+/// Supports scp-like SSH (`git@github.com:owner/repo.git`), scheme-qualified
+/// SSH (`ssh://`, `git+ssh://`, `ssh+git://`), HTTPS
 /// (`https://github.com/owner/repo.git`), and bare
 /// (`github.com/owner/repo`) forms.
 #[cfg(test)]
@@ -1446,19 +1447,26 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
 }
 
 fn parse_github_remote(url: &str) -> Option<GitHubRemote> {
-    // SSH: git@github.com:owner/repo.git or git@github.example.com:owner/repo.git
+    // scp-like SSH: git@github.com:owner/repo.git or
+    // git@github.example.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@") {
-        let (host, rest) = rest.split_once(':')?;
-        if !is_github_host(host) {
-            return None;
-        }
-        let rest = rest.strip_suffix(".git").unwrap_or(rest);
-        if rest.contains('/') {
-            return Some(GitHubRemote {
-                host: host.to_string(),
-                owner_repo: rest.to_string(),
-            });
-        }
+        let (host, path) = rest.split_once(':')?;
+        let host = github_host(&host.to_ascii_lowercase(), true)?;
+        return split_owner_repo(path).map(|owner_repo| GitHubRemote { host, owner_repo });
+    }
+
+    // Scheme-qualified SSH: ssh://[user@]github.com[:port]/owner/repo.git.
+    // This is what git reports whenever a `url.*.insteadOf` rewrite maps onto an
+    // ssh base, and it is the only ssh spelling that can carry a port.
+    let ssh_rest = url
+        .strip_prefix("ssh://")
+        .or_else(|| url.strip_prefix("git+ssh://"))
+        .or_else(|| url.strip_prefix("ssh+git://"));
+    if let Some(rest) = ssh_rest {
+        let (authority, path) = rest.split_once('/')?;
+        let written_host = strip_remote_port(strip_remote_userinfo(authority)).to_ascii_lowercase();
+        let host = github_host(&written_host, true)?;
+        return split_owner_repo(path).map(|owner_repo| GitHubRemote { host, owner_repo });
     }
 
     // HTTPS / plain: https://github.com/owner/repo.git or github.com/owner/repo
@@ -1467,22 +1475,68 @@ fn parse_github_remote(url: &str) -> Option<GitHubRemote> {
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
     let parts: Vec<&str> = without_scheme.splitn(2, '/').collect();
-    if parts.len() == 2 && is_github_host(parts[0]) {
-        let host = parts[0];
-        let rest = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some(GitHubRemote {
-                host: host.to_string(),
-                owner_repo: format!("{}/{}", parts[0], parts[1]),
-            });
+    if parts.len() == 2 {
+        let written_host = strip_remote_userinfo(parts[0]).to_ascii_lowercase();
+        if let Some(host) = github_host(&written_host, false)
+            && let Some(owner_repo) = split_owner_repo(parts[1])
+        {
+            return Some(GitHubRemote { host, owner_repo });
         }
     }
     None
 }
 
-fn is_github_host(host: &str) -> bool {
-    host == "github.com" || host.starts_with("github.")
+/// Drops any `user[:password]@` prefix from a remote's authority. Credentials
+/// embedded in a remote URL must never reach the parsed host, which is logged
+/// and handed to `gh` as a command argument.
+fn strip_remote_userinfo(authority: &str) -> &str {
+    match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    }
+}
+
+/// Drops a trailing `:port` from an ssh authority. That port belongs to the ssh
+/// service and is not the host's API port, so it must not be carried into the
+/// host handed to `gh`.
+fn strip_remote_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
+        Some((bare, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => bare,
+        _ => host,
+    }
+}
+
+/// Takes the leading `owner/repo` of a remote's path, tolerating trailing
+/// slashes, a `.git` suffix, and extra trailing segments.
+fn split_owner_repo(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        return Some(format!("{}/{}", parts[0], parts[1]));
+    }
+    None
+}
+
+/// GitHub's documented second SSH endpoint, offered for networks that block
+/// port 22 and normally written with an explicit `:443`.
+const GITHUB_SSH_ALT_HOST: &str = "ssh.github.com";
+
+/// The GitHub host to hand to `gh`, or `None` when the remote is not GitHub's.
+///
+/// `ssh_transport` allows GitHub's alternate SSH endpoint and normalizes it to
+/// `github.com`, because `gh` knows `github.com` as an API host but has no idea
+/// what `ssh.github.com` is. The match is exact so `sshgithub.com`,
+/// `x.ssh.github.com`, and suffix attacks stay rejected. HTTPS remotes never
+/// get this widening because GitHub does not publish an HTTPS endpoint there.
+fn github_host(host: &str, ssh_transport: bool) -> Option<String> {
+    if ssh_transport && host == GITHUB_SSH_ALT_HOST {
+        return Some("github.com".to_string());
+    }
+    if host == "github.com" || host.starts_with("github.") {
+        return Some(host.to_string());
+    }
+    None
 }
 
 fn sync_directory_contents(source: &Path, destination: &Path, prune: bool) -> Result<()> {
@@ -2650,6 +2704,217 @@ mod tests {
             parse_github_remote("git@github.example.com:octocat/Hello-World.git"),
             Some(GitHubRemote {
                 host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_with_user_and_git_suffix() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_without_git_suffix() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/octocat/Hello-World"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_without_user() {
+        assert_eq!(
+            parse_github_remote("ssh://github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_drops_the_ssh_port() {
+        // The port belongs to the ssh service, not to the host's API, and the
+        // parsed host is handed to `gh`, so it must come back bare.
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com:2222/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_enterprise_host_is_preserved() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.example.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_rejects_non_github_host() {
+        // The parsed host is queried with `gh`, so a non-GitHub host must not
+        // be accepted through the ssh:// spelling either.
+        assert_eq!(
+            parse_github_remote("ssh://git@gitlab.com/owner/repo.git"),
+            None,
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@gitlab.com:2222/owner/repo.git"),
+            None,
+        );
+    }
+
+    #[test]
+    fn parse_github_documented_ssh_alt_host_normalizes_to_github_com() {
+        // GitHub documents ssh.github.com on port 443 for networks that block
+        // port 22. Both ssh spellings must resolve, and the host handed to
+        // `gh` must be github.com because gh does not know the SSH alias.
+        let expected = Some(GitHubRemote {
+            host: "github.com".to_string(),
+            owner_repo: "octocat/Hello-World".to_string(),
+        });
+        for url in [
+            "ssh://git@ssh.github.com:443/octocat/Hello-World.git",
+            "ssh://git@ssh.github.com/octocat/Hello-World.git",
+            "git@ssh.github.com:octocat/Hello-World.git",
+            "git+ssh://git@ssh.github.com/octocat/Hello-World.git",
+            "ssh+git://git@ssh.github.com/octocat/Hello-World.git",
+        ] {
+            assert_eq!(parse_github_remote(url), expected, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn parse_github_ssh_alt_host_is_only_accepted_over_ssh() {
+        // GitHub publishes no HTTPS endpoint at ssh.github.com, and the alias
+        // must be matched exactly rather than by prefix or suffix.
+        for url in [
+            "https://ssh.github.com/octocat/Hello-World.git",
+            "https://git@ssh.github.com/octocat/Hello-World.git",
+            "ssh://git@sshgithub.com/octocat/Hello-World.git",
+            "ssh://git@x.ssh.github.com/octocat/Hello-World.git",
+            "ssh://git@ssh.github.com.attacker.example/octocat/Hello-World.git",
+        ] {
+            assert_eq!(parse_github_remote(url), None, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_accepts_git_plus_ssh_spellings() {
+        let expected = Some(GitHubRemote {
+            host: "github.com".to_string(),
+            owner_repo: "octocat/Hello-World".to_string(),
+        });
+        assert_eq!(
+            parse_github_remote("git+ssh://git@github.com/octocat/Hello-World.git"),
+            expected,
+        );
+        assert_eq!(
+            parse_github_remote("ssh+git://git@github.com/octocat/Hello-World.git"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn parse_github_host_is_matched_case_insensitively_and_lowercased() {
+        assert_eq!(
+            parse_github_remote("git@GitHub.com:octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+        assert_eq!(
+            parse_github_remote("HTTPS://GitHub.Example.com/octocat/Hello-World.git"),
+            None,
+            "git treats schemes case-sensitively, so this is not an HTTPS remote",
+        );
+        assert_eq!(
+            parse_github_remote("https://GitHub.Example.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.example.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_tolerates_trailing_slash() {
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/octocat/Hello-World.git/"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_https_url_does_not_leak_embedded_credentials() {
+        assert_eq!(
+            parse_github_remote("https://user:token@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_ssh_scheme_url_does_not_leak_embedded_credentials() {
+        assert_eq!(
+            parse_github_remote("ssh://user:token@github.com/octocat/Hello-World.git"),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
+                owner_repo: "octocat/Hello-World".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_github_url_rejects_file_and_local_paths() {
+        assert_eq!(parse_github_remote("file:///some/path/repo.git"), None);
+        assert_eq!(parse_github_remote("/some/path/repo.git"), None);
+        assert_eq!(parse_github_remote("../sibling/repo"), None);
+    }
+
+    #[test]
+    fn remote_github_repo_resolves_explicit_ssh_scheme_origin() {
+        // `git remote get-url` reports this spelling when an
+        // `url.*.insteadOf` rewrite maps onto an ssh base. Failing to parse it
+        // makes both PR polling and manual PR linking report that the repo has
+        // no GitHub origin, so no PR link ever appears.
+        let repo = init_test_repo();
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com:2222/octocat/Hello-World.git",
+            ],
+        );
+
+        assert_eq!(
+            remote_github_repo(repo.path()),
+            Some(GitHubRemote {
+                host: "github.com".to_string(),
                 owner_repo: "octocat/Hello-World".to_string(),
             }),
         );
