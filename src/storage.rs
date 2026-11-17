@@ -1682,19 +1682,19 @@ mod pr_tests {
     #[test]
     fn legacy_session_prs_are_migrated_and_the_table_is_dropped() {
         let conn = Connection::open_in_memory().unwrap();
-        // Simulate an older database whose `session_prs` table predates the
-        // `state`, `title`, and `url` columns.
+        // Simulate the oldest `session_prs` schema, which predates the `host`,
+        // `title`, and `url` columns.
         conn.execute_batch(
             r#"
             create table session_prs (
                 session_id text not null,
                 pr_number integer not null,
-                host text not null default 'github.com',
                 owner_repo text not null,
+                state text not null default 'OPEN',
                 primary key (session_id, pr_number)
             );
-            insert into session_prs (session_id, pr_number, host, owner_repo)
-            values ('s1', 7, 'GitHub.com', 'Owner/Repo');
+            insert into session_prs (session_id, pr_number, owner_repo, state)
+            values ('s1', 7, 'Owner/Repo', 'MERGED');
             "#,
         )
         .unwrap();
@@ -1707,11 +1707,12 @@ mod pr_tests {
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].host, "github.com");
         assert_eq!(prs[0].owner_repo, "owner/repo");
-        assert_eq!(prs[0].state, "OPEN");
+        assert_eq!(prs[0].state, "MERGED");
         assert_eq!(prs[0].title, "");
         let links = store.load_pr_links().unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].session_id, "s1");
+        assert_eq!(links[0].source, PrLinkSource::Discovered);
 
         // Migrating again must stay idempotent once the legacy table is gone.
         store.migrate().unwrap();
