@@ -213,38 +213,6 @@ impl SessionStore {
         )?;
         self.conn.execute_batch(
             r#"
-            create table if not exists session_prs (
-                session_id text not null,
-                pr_number integer not null,
-                host text not null default 'github.com',
-                owner_repo text not null,
-                state text not null default 'OPEN',
-                primary key (session_id, pr_number),
-                foreign key (session_id) references agent_sessions(id) on delete cascade
-            );
-            "#,
-        )?;
-        ensure_column(
-            &self.conn,
-            "session_prs",
-            "host",
-            "text not null default 'github.com'",
-        )?;
-        ensure_column(
-            &self.conn,
-            "session_prs",
-            "state",
-            "text not null default 'OPEN'",
-        )?;
-        ensure_column(
-            &self.conn,
-            "session_prs",
-            "title",
-            "text not null default ''",
-        )?;
-        ensure_column(&self.conn, "session_prs", "url", "text not null default ''")?;
-        self.conn.execute_batch(
-            r#"
             create table if not exists pull_requests (
                 host text not null,
                 owner_repo text not null,
@@ -289,8 +257,41 @@ impl SessionStore {
                 on pull_request_stacks(parent_host, parent_owner_repo, parent_number);
             "#,
         )?;
-        // Copy legacy session_prs rows into the canonical tables. This is
-        // idempotent so it is safe to run on every startup.
+        // Pull requests moved from the per-session `session_prs` table to the
+        // canonical `pull_requests` and `worktree_pull_requests` tables above.
+        self.migrate_legacy_session_prs()?;
+        Ok(())
+    }
+
+    /// Copy rows from the pre-`pull_requests` `session_prs` table into the
+    /// canonical tables, then drop the legacy table. Older databases may lack
+    /// columns that were added to `session_prs` over time, so ensure they
+    /// exist before copying.
+    fn migrate_legacy_session_prs(&self) -> Result<()> {
+        if !table_exists(&self.conn, "session_prs")? {
+            return Ok(());
+        }
+
+        ensure_column(
+            &self.conn,
+            "session_prs",
+            "host",
+            "text not null default 'github.com'",
+        )?;
+        ensure_column(
+            &self.conn,
+            "session_prs",
+            "state",
+            "text not null default 'OPEN'",
+        )?;
+        ensure_column(
+            &self.conn,
+            "session_prs",
+            "title",
+            "text not null default ''",
+        )?;
+        ensure_column(&self.conn, "session_prs", "url", "text not null default ''")?;
+
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             r#"
@@ -310,6 +311,7 @@ impl SessionStore {
             "#,
             params![now],
         )?;
+        self.conn.execute("drop table session_prs", [])?;
         Ok(())
     }
 
@@ -1678,29 +1680,43 @@ mod pr_tests {
     }
 
     #[test]
-    fn legacy_session_prs_are_migrated() {
-        let store = test_store();
-        let now = Utc::now();
-        store.upsert_session(&test_session("s1", now, now)).unwrap();
-        store
-            .conn
-            .execute(
-                r#"
-                insert into session_prs (session_id, pr_number, host, owner_repo, state, title, url)
-                values ('s1', 7, 'GitHub.com', 'Owner/Repo', 'OPEN', 'Legacy', '')
-                "#,
-                [],
-            )
-            .unwrap();
+    fn legacy_session_prs_are_migrated_and_the_table_is_dropped() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate the oldest `session_prs` schema, which predates the `host`,
+        // `title`, and `url` columns.
+        conn.execute_batch(
+            r#"
+            create table session_prs (
+                session_id text not null,
+                pr_number integer not null,
+                owner_repo text not null,
+                state text not null default 'OPEN',
+                primary key (session_id, pr_number)
+            );
+            insert into session_prs (session_id, pr_number, owner_repo, state)
+            values ('s1', 7, 'Owner/Repo', 'MERGED');
+            "#,
+        )
+        .unwrap();
+
+        let store = SessionStore { conn };
         store.migrate().unwrap();
 
+        assert!(!table_exists(&store.conn, "session_prs").unwrap());
         let prs = store.load_pull_requests().unwrap();
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].host, "github.com");
         assert_eq!(prs[0].owner_repo, "owner/repo");
+        assert_eq!(prs[0].state, "MERGED");
+        assert_eq!(prs[0].title, "");
         let links = store.load_pr_links().unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].session_id, "s1");
+        assert_eq!(links[0].source, PrLinkSource::Discovered);
+
+        // Migrating again must stay idempotent once the legacy table is gone.
+        store.migrate().unwrap();
+        assert!(!table_exists(&store.conn, "session_prs").unwrap());
     }
 
     #[test]
@@ -1790,6 +1806,15 @@ mod pr_tests {
             .unwrap();
         assert!(store.load_pr_links().unwrap().is_empty());
     }
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let exists = conn.query_row(
+        "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(exists != 0)
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
