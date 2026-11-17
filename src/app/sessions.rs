@@ -6395,6 +6395,77 @@ mod tests {
     }
 
     #[test]
+    fn pr_marker_survives_long_session_titles_in_a_narrow_sidebar() {
+        let mut session = make_session("s1", "codex", "/tmp/worktree");
+        session.title = Some(
+            "a very long session title that would otherwise push every badge off the row"
+                .to_string(),
+        );
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![session], vec![project]);
+        app.github_integration_enabled = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let width = 120u16;
+        let rows = render_rows(&mut app, width, 30);
+        let left_width = usize::from(width) * usize::from(app.left_width_pct) / 100;
+        let session_row = rows
+            .iter()
+            .find(|row| row.contains("└ "))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+        let left: String = session_row.chars().take(left_width).collect();
+        assert!(
+            left.contains("(PR)"),
+            "the PR marker should survive a long title in a narrow sidebar: {left:?}"
+        );
+        assert!(
+            left.contains('…'),
+            "the title should be truncated to leave room for status markers: {left:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_sidebar_marks_pr_agents_with_a_compact_marker() {
+        let first = make_session("s1", "codex", "/tmp/worktree-1");
+        let second = make_session("s2", "codex", "/tmp/worktree-2");
+        let project = make_project("project-1", "codex");
+        let mut app = test_app_with_sessions(vec![first, second], vec![project]);
+        app.github_integration_enabled = true;
+        app.left_collapsed = true;
+        app.rebuild_left_items();
+        app.select_left_target(&crate::app::LeftSelectionTarget::Session("s1".to_string()));
+        seed_linked_pr(&mut app, "s1", stored_pr(1, "branch-s1", "main", "OPEN"));
+        app.reload_pull_request_state();
+
+        let rows = render_rows(&mut app, 80, 24);
+        // The collapsed sidebar is 5 columns wide including borders, leaving
+        // room for the tree connector, status dot, and one compact marker.
+        let left_prefix = |row: &str| row.chars().take(5).collect::<String>();
+        let pr_row = rows
+            .iter()
+            .map(|row| left_prefix(row))
+            .find(|row| row.contains('├'))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+        let no_pr_row = rows
+            .iter()
+            .map(|row| left_prefix(row))
+            .find(|row| row.contains('└'))
+            .unwrap_or_else(|| panic!("missing agent row:\n{}", rows.join("\n")));
+
+        assert!(
+            pr_row.contains('P'),
+            "agents with PRs should show a compact marker in the collapsed sidebar: {pr_row:?}"
+        );
+        assert!(
+            !no_pr_row.contains('P'),
+            "agents without PRs should not show the compact marker: {no_pr_row:?}"
+        );
+    }
+
+    #[test]
     fn pr_section_is_hidden_without_associated_prs() {
         let session = make_session("s1", "codex", "/tmp/worktree");
         let project = make_project("project-1", "codex");

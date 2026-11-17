@@ -8,6 +8,10 @@ use std::num::NonZeroU16;
 use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Width of the collapsed left sidebar. The inner area needs room for the
+/// tree connector, the session status dot, and a compact PR/swap marker.
+const COLLAPSED_LEFT_WIDTH: u16 = 5;
+
 /// ASCII art logo displayed in the agent pane when no content is active.
 const ASCII_LOGO: &[&str] = &[
     "       ░██                       ",
@@ -124,7 +128,7 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
         "Need to change which CLI new agents use? `change-default-provider` updates the global fallback. `change-project-default-provider` overrides just one project.".into()
     },
     |_b| {
-        "Swapped providers while an agent was still running? The agent pane title keeps the old name until you exit and relaunch. dux queues the swap, you run the show.".into()
+        "Swapped providers while an agent was still running? A `↻` badge marks the queued swap until you exit and relaunch. dux queues the swap, you run the show.".into()
     },
     // --- new tips ---
     |_b| {
@@ -346,6 +350,14 @@ fn project_tree_related_badge_count(
     (count > 0).then_some(count)
 }
 
+fn pr_state_color(theme: &Theme, state: &crate::model::PrState) -> Color {
+    match state {
+        crate::model::PrState::Open => theme.pr_open_label,
+        crate::model::PrState::Merged => theme.pr_merged_label,
+        crate::model::PrState::Closed => theme.pr_closed_label,
+    }
+}
+
 fn left_section_separator_line(width: u16, theme: &Theme, label: &str) -> Line<'static> {
     let padded_label = format!(" {label} ");
 
@@ -529,7 +541,11 @@ impl App {
         let [left, center, right] = if self.left_collapsed {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(4), Constraint::Min(20), right_constraint])
+                .constraints([
+                    Constraint::Length(COLLAPSED_LEFT_WIDTH),
+                    Constraint::Min(20),
+                    right_constraint,
+                ])
                 .areas(body)
         } else {
             let right_pct = if self.right_pane_hidden() || self.right_collapsed {
@@ -725,11 +741,22 @@ impl App {
                     }
                     LeftItem::Session(index) => {
                         let session = &self.sessions[*index];
+                        let marker = if self.running_provider_for(session) != session.provider {
+                            Some(("↻", self.theme.status_busy_fg))
+                        } else {
+                            self.pr_statuses
+                                .get(&session.id)
+                                .map(|pr| ("P", pr_state_color(&self.theme, &pr.state)))
+                        };
                         if self.session_is_related_origin(session) {
-                            return ListItem::new(Line::from(Span::styled(
+                            let mut spans = vec![Span::styled(
                                 "⇄",
                                 Style::default().fg(self.theme.related_link_fg),
-                            )));
+                            )];
+                            if let Some((marker, color)) = marker {
+                                spans.push(Span::styled(marker, Style::default().fg(color)));
+                            }
+                            return ListItem::new(Line::from(spans));
                         }
                         let (dot, dot_color) = self.theme.session_dot(&session.status);
                         let is_last = session_row_is_last(
@@ -740,10 +767,14 @@ impl App {
                             &related_group_ids,
                         );
                         let connector = if is_last { "└" } else { "├" };
-                        ListItem::new(Line::from(vec![
+                        let mut spans = vec![
                             Span::styled(connector, Style::default().fg(self.theme.project_icon)),
                             Span::styled(dot.to_string(), Style::default().fg(dot_color)),
-                        ]))
+                        ];
+                        if let Some((marker, color)) = marker {
+                            spans.push(Span::styled(marker, Style::default().fg(color)));
+                        }
+                        ListItem::new(Line::from(spans))
                     }
                     LeftItem::EmptyProjectsSpacer => ListItem::new(Line::from("")),
                     LeftItem::RelatedSeparator
@@ -959,19 +990,17 @@ impl App {
                         };
                     // While a background delete is in flight for this session,
                     // dim the row text and italicize it so the user sees the
-                    // transient state. This covers the dot, label, and PR
-                    // marker; the companion-terminal badge chain is excluded
-                    // because it renders through a separate helper and the
-                    // in-flight window is too brief to justify threading a
-                    // deletion flag through it.
+                    // transient state. This covers the dot, label, PR marker,
+                    // and queued-provider marker; the companion-terminal badge
+                    // chain is excluded because it renders through a separate
+                    // helper and the in-flight window is too brief to justify
+                    // threading a deletion flag through it.
                     let deleting = self.pending_deletions.contains(&session.id);
                     let label_color = if deleting {
                         self.theme.session_deleting
                     } else {
-                        match self.pr_statuses.get(&session.id).map(|pr| &pr.state) {
-                            Some(crate::model::PrState::Merged) => self.theme.pr_merged_label,
-                            Some(crate::model::PrState::Closed) => self.theme.pr_closed_label,
-                            Some(crate::model::PrState::Open) => self.theme.pr_open_label,
+                        match self.pr_statuses.get(&session.id) {
+                            Some(pr) => pr_state_color(&self.theme, &pr.state),
                             None => dot_color,
                         }
                     };
@@ -982,6 +1011,24 @@ impl App {
                     } else {
                         Style::default().fg(label_color)
                     };
+                    let has_pr = self.pr_statuses.contains_key(&session.id);
+                    let swap_pending = self.running_provider_for(session) != session.provider;
+                    let related_count = project_tree_related_badge_count(
+                        session,
+                        &self.sessions,
+                        &related_group_ids,
+                    );
+                    let mut trailing_width = 0;
+                    if has_pr {
+                        trailing_width += display_width(" (PR)");
+                    }
+                    if swap_pending {
+                        trailing_width += display_width(" (↻)");
+                    }
+                    if let Some(count) = related_count {
+                        trailing_width += display_width(&format!(" ⇄ {count}"));
+                    }
+                    let dot_width = display_width(&format!("{dot} "));
                     let is_related = self.session_is_related_member(session);
                     let is_related_origin = self.session_is_related_origin(session);
                     let mut spans = if is_related_origin {
@@ -1013,7 +1060,22 @@ impl App {
                             .find(|project| project.id == session.project_id)
                             .map(|project| project.name.clone())
                             .unwrap_or_else(|| session.project_id.clone());
-                        spans.push(related_repo_name_span(&project_name, &self.theme));
+                        // Leave room for the dot, status markers, and related
+                        // count so a long repo name cannot hide them.
+                        let used_width: usize = spans
+                            .iter()
+                            .map(|span| display_width(span.content.as_ref()))
+                            .sum();
+                        let name_budget = usize::from(projects_inner_width)
+                            .saturating_sub(used_width + dot_width + trailing_width);
+                        let name_suffix_width = display_width(" · ");
+                        if name_budget > name_suffix_width {
+                            let name =
+                                truncate_to_width(&project_name, name_budget - name_suffix_width);
+                            if !name.is_empty() {
+                                spans.push(related_repo_name_span(&name, &self.theme));
+                            }
+                        }
                     }
                     spans.push(Span::styled(format!("{dot} "), label_style));
                     let title_style = if is_related_origin {
@@ -1021,8 +1083,15 @@ impl App {
                     } else {
                         label_style
                     };
+                    let used_width: usize = spans
+                        .iter()
+                        .map(|span| display_width(span.content.as_ref()))
+                        .sum();
+                    let label_budget = usize::from(projects_inner_width)
+                        .saturating_sub(used_width + trailing_width);
+                    let label = truncate_to_width(&label, label_budget);
                     spans.push(Span::styled(label, title_style));
-                    if self.pr_statuses.contains_key(&session.id) {
+                    if has_pr {
                         spans.push(Span::styled(
                             " (PR)",
                             if deleting {
@@ -1032,11 +1101,19 @@ impl App {
                             },
                         ));
                     }
-                    if let Some(related_count) = project_tree_related_badge_count(
-                        session,
-                        &self.sessions,
-                        &related_group_ids,
-                    ) {
+                    if swap_pending {
+                        // Provider-neutral marker for a queued swap; the pane
+                        // title shows which provider is still running.
+                        spans.push(Span::styled(
+                            " (↻)",
+                            if deleting {
+                                label_style
+                            } else {
+                                Style::default().fg(self.theme.status_busy_fg)
+                            },
+                        ));
+                    }
+                    if let Some(related_count) = related_count {
                         spans.push(Span::styled(
                             format!(" ⇄ {related_count}"),
                             Style::default().fg(self.theme.related_link_fg),
