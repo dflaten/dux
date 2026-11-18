@@ -3971,6 +3971,7 @@ mod tests {
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             rebases_in_flight: std::collections::HashSet::new(),
+            force_pushes_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),

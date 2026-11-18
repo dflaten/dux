@@ -91,6 +91,134 @@ pub(crate) fn build_rebase_failed_prompt(branch_name: &str, base_ref: &str, erro
     )
 }
 
+/// Prompt sent when a rebase, push, or force-push is refused because the
+/// remote branch contains commits the local branch never had.
+pub(crate) fn build_remote_divergence_prompt(
+    operation: &str,
+    branch_name: &str,
+    divergence: &git::RemoteDivergence,
+) -> String {
+    let mut out = format!(
+        "The {operation} of branch \"{branch_name}\" was blocked because {} has {} commit(s) that are not in this worktree:\n\n",
+        divergence.remote_ref, divergence.total
+    );
+    for commit in &divergence.commits {
+        let short: String = commit.sha.chars().take(7).collect();
+        out.push_str(&format!(
+            "  {short}  {}: {}\n",
+            commit.author, commit.subject
+        ));
+    }
+    if divergence.total > divergence.commits.len() {
+        out.push_str(&format!(
+            "  ... and {} more commit(s)\n",
+            divergence.total - divergence.commits.len()
+        ));
+    }
+    out.push_str(&format!(
+        "\nDux did not rewrite the local branch and did not push anything.\n\n\
+         Inspect these commits with:\n\
+         `git log --oneline HEAD..{}`\n\
+         `git show <sha>`\n\n\
+         Decide whether they are your own commits from another machine or someone else's work.\n\n\
+         - If they are yours, integrate them into this branch (merge or rebase {}), resolve any conflicts, and verify with:\n\
+           `git merge-base --is-ancestor {} HEAD`\n\
+         - If they are someone else's, do not merge, drop, or overwrite them. Explain the situation and ask how to proceed.\n\n\
+         Do not run `git push --force` or `git push --force-with-lease`. Do not delete or reset the remote branch.\n\
+         When the remote commits are integrated, report what you did so the {operation} can be retried.\n",
+        divergence.remote_ref, divergence.remote_ref, divergence.remote_ref
+    ));
+    out
+}
+
+/// Refresh `origin/<branch>` before comparing the local and remote branches.
+/// Fetching a branch that has never been pushed fails; that is normal, so only
+/// log when a tracking ref already existed.
+fn refresh_remote_branch(worktree: &Path, branch: &str) {
+    let had_tracking_ref = git::remote_tracking_ref_for_branch(worktree, branch).is_some();
+    if let Err(err) = git::fetch_origin_branch(worktree, branch)
+        && had_tracking_ref
+    {
+        logger::warn(&format!(
+            "failed to refresh origin/{branch} before a git operation: {err:#}"
+        ));
+    }
+}
+
+/// Check the remote branch before pushing. Normal pushes refuse to run when
+/// the branch was rebased, and never push over commits the local branch never
+/// contained. Force-pushes use an explicit lease bound to the remote SHA.
+fn execute_push_job(worktree: PathBuf, branch_name: String, force: bool) -> PushOutcome {
+    let current_branch = match git::current_branch(&worktree) {
+        Ok(branch) => branch,
+        Err(err) => {
+            return PushOutcome::Failed(format!("Could not determine the current branch: {err:#}"));
+        }
+    };
+    if current_branch != branch_name {
+        return PushOutcome::Failed(format!(
+            "The worktree is on branch \"{current_branch}\", not \"{branch_name}\". Switch back to the session branch before pushing."
+        ));
+    }
+
+    refresh_remote_branch(&worktree, &branch_name);
+
+    let check = match git::remote_branch_state(&worktree, &branch_name) {
+        Ok(check) => Some(check),
+        Err(err) => {
+            logger::warn(&format!(
+                "could not inspect origin/{branch_name} before pushing: {err:#}"
+            ));
+            None
+        }
+    };
+
+    if let Some(check) = check.as_ref() {
+        match &check.state {
+            git::RemoteBranchState::Missing if force => {
+                return PushOutcome::Failed(format!(
+                    "Could not find origin/{branch_name}. Fetch the branch before force-pushing, or use the regular push command if it has never been published."
+                ));
+            }
+            git::RemoteBranchState::Rewritten if !force => {
+                return PushOutcome::NeedsForcePush {
+                    remote_ref: check.remote_ref.clone(),
+                };
+            }
+            git::RemoteBranchState::Diverged(divergence) => {
+                return PushOutcome::Blocked {
+                    divergence: divergence.clone(),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let result = if force {
+        let expected_sha = match check.as_ref() {
+            Some(check) => check.remote_sha.clone(),
+            None => {
+                return PushOutcome::Failed(format!(
+                    "Could not verify origin/{branch_name}; refusing to force-push without checking the remote branch."
+                ));
+            }
+        };
+        if expected_sha.is_empty() {
+            return PushOutcome::Failed(format!(
+                "Could not resolve the current origin/{branch_name} SHA; refusing to force-push."
+            ));
+        }
+        git::force_push_with_lease(&worktree, &branch_name, &expected_sha)
+    } else {
+        git::push(&worktree)
+    };
+
+    match result {
+        Ok(_) => PushOutcome::Pushed,
+        Err(err) => PushOutcome::Failed(format!("{err:#}")),
+    }
+}
+
 /// Append `bytes` to `buf`, keeping at most `max` trailing bytes. Used to
 /// bound `loading_input_buf` so it cannot grow without bound when the user
 /// pastes large content during the agent loading phase.
@@ -2186,12 +2314,76 @@ impl App {
             );
             return Ok(());
         }
+        let session_id = session.id.clone();
+        let branch_name = session.branch_name.clone();
         let worktree = PathBuf::from(&session.worktree_path);
+        if self.rebases_in_flight.contains(&session_id) {
+            self.set_warning(format!(
+                "\"{branch_name}\" is being rebased. Wait for the rebase to finish before pushing."
+            ));
+            return Ok(());
+        }
+        if self.force_pushes_in_flight.contains(&session_id) {
+            self.set_warning(format!(
+                "A force-push is already in progress for \"{branch_name}\". Wait for it to finish."
+            ));
+            return Ok(());
+        }
         let tx = self.worker_tx.clone();
-        self.set_busy("Pushing to remote…");
+        self.set_busy(format!("Checking origin/{branch_name} before pushing."));
         thread::spawn(move || {
-            let result = git::push(&worktree).map(|_| ()).map_err(|e| e.to_string());
-            let _ = tx.send(WorkerEvent::PushCompleted(result));
+            let outcome = execute_push_job(worktree, branch_name.clone(), false);
+            let _ = tx.send(WorkerEvent::PushCompleted {
+                session_id,
+                branch_name,
+                force: false,
+                outcome,
+            });
+        });
+        Ok(())
+    }
+
+    /// Force-push the selected agent branch with an explicit lease. The remote
+    /// is checked first, so this never discards commits the local branch never
+    /// contained.
+    pub(crate) fn force_push_selected_session(&mut self) -> Result<()> {
+        let Some(session) = self.selected_session() else {
+            self.set_error("Select an agent session before force-pushing.");
+            return Ok(());
+        };
+        if session.is_scratch() {
+            self.set_error(
+                "Scratch agents are not attached to a git repository, so there is nothing to force-push.",
+            );
+            return Ok(());
+        }
+        let session_id = session.id.clone();
+        let branch_name = session.branch_name.clone();
+        let worktree = PathBuf::from(&session.worktree_path);
+        if self.rebases_in_flight.contains(&session_id) {
+            self.set_warning(format!(
+                "\"{branch_name}\" is being rebased. Wait for the rebase to finish before force-pushing."
+            ));
+            return Ok(());
+        }
+        if !self.force_pushes_in_flight.insert(session_id.clone()) {
+            self.set_warning(format!(
+                "Force-push already in progress for \"{branch_name}\". Wait for it to finish."
+            ));
+            return Ok(());
+        }
+        let tx = self.worker_tx.clone();
+        self.set_busy(format!(
+            "Checking origin/{branch_name} before force-pushing."
+        ));
+        thread::spawn(move || {
+            let outcome = execute_push_job(worktree, branch_name.clone(), true);
+            let _ = tx.send(WorkerEvent::PushCompleted {
+                session_id,
+                branch_name,
+                force: true,
+                outcome,
+            });
         });
         Ok(())
     }
@@ -2288,6 +2480,13 @@ impl App {
         };
         let base_ref = update.base_ref.clone();
 
+        if self.force_pushes_in_flight.contains(&session_id) {
+            self.set_warning(format!(
+                "\"{branch_name}\" is being force-pushed. Wait for the force-push to finish before rebasing."
+            ));
+            return;
+        }
+
         if !self.rebases_in_flight.insert(session_id.clone()) {
             self.set_warning(format!(
                 "Rebase already in progress for \"{branch_name}\". Wait for it to finish."
@@ -2296,14 +2495,38 @@ impl App {
         }
 
         let tx = self.worker_tx.clone();
-        self.set_busy(format!("Rebasing \"{branch_name}\" onto {base_ref}."));
+        self.set_busy(format!(
+            "Checking origin/{branch_name} and rebasing onto {base_ref}."
+        ));
         thread::spawn(move || {
+            refresh_remote_branch(&worktree, &branch_name);
+            let remote_branch_existed = match git::remote_branch_state(&worktree, &branch_name) {
+                Ok(check) => match check.state {
+                    git::RemoteBranchState::Diverged(divergence) => {
+                        let _ = tx.send(WorkerEvent::RebaseBlockedByRemote {
+                            session_id,
+                            branch_name,
+                            divergence,
+                        });
+                        return;
+                    }
+                    git::RemoteBranchState::Missing => false,
+                    _ => true,
+                },
+                Err(err) => {
+                    logger::warn(&format!(
+                        "could not inspect origin/{branch_name} before rebasing: {err:#}"
+                    ));
+                    false
+                }
+            };
             let result = git::rebase_onto_stashing_tracked_changes(&worktree, &base_ref)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(WorkerEvent::RebaseCompleted {
                 session_id,
                 branch_name,
                 base_ref,
+                remote_branch_existed,
                 result,
             });
         });
@@ -8055,8 +8278,9 @@ mod tests {
     use super::components::{ButtonPressedTarget, PressedButton};
     use super::{DOUBLE_CLICK_THRESHOLD, MouseTarget, is_terminal_link_click_modifier};
     use crate::app::input::{
-        build_diff_comments_prompt, build_rebase_failed_prompt, opencode_sidebar_boundary,
-        selected_terminal_text_from_snapshot, startup_command_log_visual_lines,
+        build_diff_comments_prompt, build_rebase_failed_prompt, build_remote_divergence_prompt,
+        execute_push_job, opencode_sidebar_boundary, selected_terminal_text_from_snapshot,
+        startup_command_log_visual_lines,
     };
     use crate::app::{
         AgentLaunchKind, App, BaseBranchUpdate, BranchWarningKind, CenterMode,
@@ -8067,7 +8291,7 @@ mod tests {
         LeftSection, MacroBarState, MacroDeliveryState, MouseClickTarget, MouseLayoutState,
         NameNewAgentFocus, NonDefaultBranchAction, OverlayCheckbox, OverlayCheckboxId,
         OverlayMouseLayout, OverlayMouseLayoutState, PendingMacroSend, PickProjectWorktreePrompt,
-        ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget, QueuedDiffComment,
+        ProcessInfo, ProjectWorktreeEntry, PromptState, PullTarget, PushOutcome, QueuedDiffComment,
         ResolvedPullRequest, ResourceStats, RightSection, RuntimeTargetId, StartupCommandLogPrompt,
         TermGridPos, TerminalSelection, TextInput, WatchedWorktree, WorkerEvent,
         WorktreeCleanupCandidate,
@@ -8075,10 +8299,11 @@ mod tests {
     use crate::clipboard::Clipboard;
     use crate::config::{Config, DuxPaths, ProjectConfig};
     use crate::editor::{DetectedEditor, EditorKind};
+    use crate::git;
     use crate::keybindings::{Action, BINDING_DEFS, BindingScope, RuntimeBindings};
     use crate::model::{
         AgentSession, ChangedFile, CompanionTerminalStatus, PrInfo, PrState, Project,
-        ProjectBranchStatus, ProviderKind, SessionStatus, SessionSurface,
+        ProjectBranchStatus, ProviderKind, SCRATCH_PROJECT_ID, SessionStatus, SessionSurface,
     };
     use crate::pty::PtyClient;
     use crate::statusline::StatusLine;
@@ -8188,6 +8413,19 @@ mod tests {
             })
             .unwrap();
         app.drain_events();
+    }
+
+    fn test_remote_divergence() -> git::RemoteDivergence {
+        git::RemoteDivergence {
+            remote_ref: "origin/agent-branch".to_string(),
+            remote_sha: "abcdef1234567890".to_string(),
+            commits: vec![git::RemoteOnlyCommit {
+                sha: "1234567890abcdef".to_string(),
+                author: "Alice".to_string(),
+                subject: "colleague change".to_string(),
+            }],
+            total: 2,
+        }
     }
 
     fn test_app(bindings: RuntimeBindings) -> App {
@@ -8322,6 +8560,7 @@ mod tests {
             agent_launches_in_flight: std::collections::HashSet::new(),
             pulls_in_flight: std::collections::HashSet::new(),
             rebases_in_flight: std::collections::HashSet::new(),
+            force_pushes_in_flight: std::collections::HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),
@@ -16776,6 +17015,22 @@ cyan = "#00ffff"
     }
 
     #[test]
+    fn remote_divergence_prompt_lists_commits_and_forbids_force_push() {
+        let divergence = test_remote_divergence();
+
+        let prompt = build_remote_divergence_prompt("rebase", "agent-branch", &divergence);
+
+        assert!(prompt.contains("origin/agent-branch"));
+        assert!(prompt.contains("1234567"));
+        assert!(prompt.contains("Alice: colleague change"));
+        assert!(prompt.contains("and 1 more"));
+        assert!(prompt.contains("git merge-base --is-ancestor origin/agent-branch HEAD"));
+        assert!(prompt.contains("Do not run `git push --force`"));
+        assert!(prompt.contains("git push --force-with-lease"));
+        assert!(!prompt.contains("git rebase --continue"));
+    }
+
+    #[test]
     fn rebase_failure_is_sent_to_running_agent() {
         let mut app = test_app(default_bindings());
         let session_id = app.sessions[0].id.clone();
@@ -16796,6 +17051,7 @@ cyan = "#00ffff"
                 session_id,
                 branch_name: "agent-branch".to_string(),
                 base_ref: "origin/main".to_string(),
+                remote_branch_existed: false,
                 result: Err("CONFLICT (content): Merge conflict in src/main.rs".to_string()),
             })
             .expect("send rebase failure");
@@ -16809,6 +17065,153 @@ cyan = "#00ffff"
             app.status
                 .message()
                 .contains("Sent the error details to the agent")
+        );
+    }
+
+    #[test]
+    fn rebase_blocked_by_remote_sends_prompt_to_agent() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "cat; sleep 0.5".to_string()],
+            std::path::Path::new("."),
+            10,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id.clone(), client);
+        app.rebases_in_flight.insert(session_id.clone());
+
+        app.worker_tx
+            .send(WorkerEvent::RebaseBlockedByRemote {
+                session_id,
+                branch_name: "agent-branch".to_string(),
+                divergence: test_remote_divergence(),
+            })
+            .expect("send blocked rebase");
+        app.drain_events();
+
+        assert!(app.rebases_in_flight.is_empty());
+        assert_eq!(app.focus, FocusPane::Center);
+        assert_eq!(app.input_target, InputTarget::Agent);
+        assert!(app.status.message().contains("Rebase paused"));
+        assert!(
+            app.status
+                .message()
+                .contains("Sent the details to the agent")
+        );
+    }
+
+    #[test]
+    fn force_push_blocked_by_remote_sends_prompt_and_clears_in_flight() {
+        let mut app = test_app(default_bindings());
+        let session_id = app.sessions[0].id.clone();
+        let client = PtyClient::spawn(
+            "sh",
+            &["-c".to_string(), "cat; sleep 0.5".to_string()],
+            std::path::Path::new("."),
+            10,
+            80,
+            100,
+        )
+        .expect("spawn pty");
+        app.providers.insert(session_id.clone(), client);
+        app.force_pushes_in_flight.insert(session_id.clone());
+
+        app.worker_tx
+            .send(WorkerEvent::PushCompleted {
+                session_id,
+                branch_name: "agent-branch".to_string(),
+                force: true,
+                outcome: PushOutcome::Blocked {
+                    divergence: test_remote_divergence(),
+                },
+            })
+            .expect("send blocked force-push");
+        app.drain_events();
+
+        assert!(app.force_pushes_in_flight.is_empty());
+        assert!(app.status.message().contains("Force-push paused"));
+        assert!(
+            app.status
+                .message()
+                .contains("Sent the details to the agent")
+        );
+    }
+
+    #[test]
+    fn push_completed_needs_force_push_points_to_palette_action() {
+        let mut app = test_app(default_bindings());
+
+        app.worker_tx
+            .send(WorkerEvent::PushCompleted {
+                session_id: "session-1".to_string(),
+                branch_name: "agent-branch".to_string(),
+                force: false,
+                outcome: PushOutcome::NeedsForcePush {
+                    remote_ref: "origin/agent-branch".to_string(),
+                },
+            })
+            .expect("send push result");
+        app.drain_events();
+
+        assert!(app.status.message().contains("Push blocked"));
+        assert!(app.status.message().contains("force-push-to-remote"));
+    }
+
+    #[test]
+    fn force_push_palette_command_is_available_for_project_sessions_only() {
+        let mut app = test_app(default_bindings());
+
+        assert!(
+            app.filtered_palette_commands("force-push")
+                .iter()
+                .any(|binding| binding.action == Action::ForcePushToRemote)
+        );
+
+        app.sessions[0].project_id = SCRATCH_PROJECT_ID.to_string();
+        assert!(
+            app.filtered_palette_commands("force-push")
+                .iter()
+                .all(|binding| binding.action != Action::ForcePushToRemote)
+        );
+    }
+
+    #[test]
+    fn execute_push_job_requires_force_push_after_a_rewrite() {
+        let bare = tempdir().unwrap();
+        run_git(bare.path(), &["init", "--bare", "-b", "main"]);
+
+        let clone = tempdir().unwrap();
+        run_git(clone.path(), &["clone", bare.path().to_str().unwrap(), "."]);
+        run_git(clone.path(), &["config", "user.name", "test"]);
+        run_git(clone.path(), &["config", "user.email", "t@t"]);
+        std::fs::write(clone.path().join("file.txt"), "one\n").unwrap();
+        run_git(clone.path(), &["add", "-A"]);
+        run_git(clone.path(), &["commit", "-m", "initial"]);
+        run_git(clone.path(), &["push", "-u", "origin", "main"]);
+        run_git(clone.path(), &["commit", "--amend", "-m", "amended"]);
+        let rewritten_head = git::rev_parse_commit(clone.path(), "HEAD")
+            .unwrap()
+            .expect("rewritten HEAD");
+
+        let outcome = execute_push_job(clone.path().to_path_buf(), "main".to_string(), false);
+        assert_eq!(
+            outcome,
+            PushOutcome::NeedsForcePush {
+                remote_ref: "origin/main".to_string()
+            }
+        );
+
+        let outcome = execute_push_job(clone.path().to_path_buf(), "main".to_string(), true);
+        assert_eq!(outcome, PushOutcome::Pushed);
+
+        git::fetch_origin_branch(clone.path(), "main").unwrap();
+        assert_eq!(
+            git::rev_parse_commit(clone.path(), "origin/main").unwrap(),
+            Some(rewritten_head)
         );
     }
 

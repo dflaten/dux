@@ -332,6 +332,276 @@ pub fn rebase_onto_stashing_tracked_changes(repo_path: &Path, base_ref: &str) ->
     Ok(())
 }
 
+/// A commit that exists on the remote branch but was never part of the local
+/// branch's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteOnlyCommit {
+    pub sha: String,
+    pub author: String,
+    pub subject: String,
+}
+
+/// A remote branch that has commits the local branch never contained.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDivergence {
+    pub remote_ref: String,
+    pub remote_sha: String,
+    pub commits: Vec<RemoteOnlyCommit>,
+    pub total: usize,
+}
+
+/// How `origin/<branch>` relates to the local branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteBranchState {
+    /// No remote-tracking ref exists; the branch has never been pushed.
+    Missing,
+    /// The remote tip is an ancestor of the local branch, so a normal push
+    /// fast-forwards safely.
+    FastForward,
+    /// The remote tip was once part of this branch's history (for example,
+    /// before a local rebase) but is no longer an ancestor. A normal push is
+    /// rejected; a lease-bound force-push only replaces our own old commits.
+    Rewritten,
+    /// The remote has commits that were never part of this branch's history.
+    /// Force-pushing would discard someone else's work.
+    Diverged(RemoteDivergence),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteBranchCheck {
+    pub remote_ref: String,
+    pub remote_sha: String,
+    pub state: RemoteBranchState,
+}
+
+/// Resolve `ref_name` to a commit SHA, or `None` when the ref does not exist.
+pub fn rev_parse_commit(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{ref_name}^{{commit}}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// Return true when `ancestor` is reachable from `descendant`.
+pub fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(anyhow!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// Return the commit SHAs recorded in the branch's reflog. These let us
+/// recognize our own pre-rebase tips after they have been rewritten away.
+fn branch_reflog_tips(repo_path: &Path, branch: &str) -> Result<Vec<String>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rev-list",
+            "-g",
+            branch_ref.as_str(),
+        ])
+        .output()?;
+    if !output.status.success() {
+        // No reflog (or an unborn branch); HEAD still covers reachability.
+        return Ok(Vec::new());
+    }
+    let mut tips: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && line.chars().all(|c| c.is_ascii_hexdigit())
+                && !line.chars().all(|c| c == '0')
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    tips.sort();
+    tips.dedup();
+    Ok(tips)
+}
+
+/// Tips that represent history this branch has contained: its current tip plus
+/// every commit the branch pointed at in its reflog.
+fn local_history_tips(repo_path: &Path, branch: &str) -> Result<Vec<String>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    if rev_parse_commit(repo_path, &branch_ref)?.is_none() {
+        return Err(anyhow!("local branch \"{branch}\" does not exist"));
+    }
+    let mut tips = vec![branch_ref];
+    tips.extend(branch_reflog_tips(repo_path, branch)?);
+    Ok(tips)
+}
+
+fn remote_only_count(repo_path: &Path, remote_sha: &str, tips: &[String]) -> Result<usize> {
+    let mut args = vec![
+        "-C".to_string(),
+        repo_path.to_string_lossy().to_string(),
+        "rev-list".to_string(),
+        "--count".to_string(),
+        remote_sha.to_string(),
+        "--not".to_string(),
+    ];
+    args.extend(tips.iter().cloned());
+    let output = Command::new("git").args(&args).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git rev-list --count {remote_sha} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0))
+}
+
+const REMOTE_DIVERGENCE_LIST_LIMIT: usize = 20;
+
+fn remote_only_commits(
+    repo_path: &Path,
+    remote_sha: &str,
+    tips: &[String],
+) -> Result<Vec<RemoteOnlyCommit>> {
+    let mut args = vec![
+        "-C".to_string(),
+        repo_path.to_string_lossy().to_string(),
+        "log".to_string(),
+        format!("--max-count={REMOTE_DIVERGENCE_LIST_LIMIT}"),
+        "--format=%H%x00%an%x00%s".to_string(),
+        remote_sha.to_string(),
+        "--not".to_string(),
+    ];
+    args.extend(tips.iter().cloned());
+    let output = Command::new("git").args(&args).output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git log {remote_sha} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut commits = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(3, '\0');
+        let (Some(sha), Some(author), Some(subject)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if sha.is_empty() {
+            continue;
+        }
+        commits.push(RemoteOnlyCommit {
+            sha: sha.to_string(),
+            author: author.to_string(),
+            subject: subject.to_string(),
+        });
+    }
+    Ok(commits)
+}
+
+/// Classify `origin/<branch>` against the local branch without fetching.
+///
+/// Callers that need fresh remote state should fetch the branch first.
+pub fn remote_branch_state(repo_path: &Path, branch: &str) -> Result<RemoteBranchCheck> {
+    let remote_ref = format!("origin/{branch}");
+    let Some(remote_sha) = rev_parse_commit(repo_path, &remote_ref)? else {
+        return Ok(RemoteBranchCheck {
+            remote_ref,
+            remote_sha: String::new(),
+            state: RemoteBranchState::Missing,
+        });
+    };
+
+    if is_ancestor(repo_path, &remote_sha, "HEAD")? {
+        return Ok(RemoteBranchCheck {
+            remote_ref,
+            remote_sha,
+            state: RemoteBranchState::FastForward,
+        });
+    }
+
+    let tips = local_history_tips(repo_path, branch)?;
+    let total = remote_only_count(repo_path, &remote_sha, &tips)?;
+    if total == 0 {
+        return Ok(RemoteBranchCheck {
+            remote_ref,
+            remote_sha,
+            state: RemoteBranchState::Rewritten,
+        });
+    }
+
+    let commits = remote_only_commits(repo_path, &remote_sha, &tips)?;
+    let divergence = RemoteDivergence {
+        remote_ref: remote_ref.clone(),
+        remote_sha: remote_sha.clone(),
+        commits,
+        total,
+    };
+    Ok(RemoteBranchCheck {
+        remote_ref,
+        remote_sha,
+        state: RemoteBranchState::Diverged(divergence),
+    })
+}
+
+/// Force-push `branch` only if the remote is still at `expected_sha`.
+///
+/// This replaces an already-published branch tip (for example after a local
+/// rebase) without clobbering a commit someone else pushed in the meantime.
+pub fn force_push_with_lease(
+    worktree_path: &Path,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<String> {
+    let wt = worktree_path.to_string_lossy();
+    let lease = format!("--force-with-lease={branch}:{expected_sha}");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            wt.as_ref(),
+            "push",
+            lease.as_str(),
+            "-u",
+            "origin",
+            branch,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git push --force-with-lease failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 pub fn ahead_behind(repo_path: &Path, left_ref: &str, right_ref: &str) -> Result<(usize, usize)> {
     let range = format!("{left_ref}...{right_ref}");
     let output = Command::new("git")
@@ -1785,6 +2055,34 @@ mod tests {
         run_git(cwd, &["commit", "-m", message]);
     }
 
+    /// Create a bare origin plus a clone that already has `main` and `feature`
+    /// pushed. Both temp dirs must stay alive for the duration of the test.
+    fn init_remote_with_feature() -> (tempfile::TempDir, tempfile::TempDir) {
+        let bare = tempfile::tempdir().unwrap();
+        run_git(bare.path(), &["init", "--bare", "-b", "main"]);
+
+        let clone = tempfile::tempdir().unwrap();
+        run_git(clone.path(), &["clone", bare.path().to_str().unwrap(), "."]);
+        run_git(clone.path(), &["config", "user.name", "test"]);
+        run_git(clone.path(), &["config", "user.email", "t@t"]);
+        fs::write(clone.path().join("main.txt"), "main\n").unwrap();
+        commit_all(clone.path(), "initial");
+        run_git(clone.path(), &["push", "-u", "origin", "main"]);
+        run_git(clone.path(), &["checkout", "-b", "feature"]);
+        fs::write(clone.path().join("feature.txt"), "feature\n").unwrap();
+        commit_all(clone.path(), "feature commit");
+        run_git(clone.path(), &["push", "-u", "origin", "feature"]);
+        (bare, clone)
+    }
+
+    fn clone_remote(bare: &Path) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["clone", bare.to_str().unwrap(), "."]);
+        run_git(dir.path(), &["config", "user.name", "test"]);
+        run_git(dir.path(), &["config", "user.email", "t@t"]);
+        dir
+    }
+
     #[test]
     fn ahead_behind_counts_base_commits_missing_from_branch() {
         let repo = init_test_repo();
@@ -1821,6 +2119,88 @@ mod tests {
         assert!(has_tracked_changes(&wt).unwrap());
         let (_ahead, behind) = ahead_behind(&wt, "HEAD", "main").unwrap();
         assert_eq!(behind, 0);
+    }
+
+    #[test]
+    fn remote_branch_state_reports_missing_without_tracking_ref() {
+        let repo = init_test_repo();
+        let check = remote_branch_state(repo.path(), "main").unwrap();
+
+        assert_eq!(check.state, RemoteBranchState::Missing);
+        assert!(check.remote_sha.is_empty());
+    }
+
+    #[test]
+    fn remote_branch_state_reports_fast_forward_when_local_is_ahead() {
+        let (_bare, clone) = init_remote_with_feature();
+        fs::write(clone.path().join("local.txt"), "local\n").unwrap();
+        commit_all(clone.path(), "local commit");
+
+        let check = remote_branch_state(clone.path(), "feature").unwrap();
+
+        assert_eq!(check.state, RemoteBranchState::FastForward);
+    }
+
+    #[test]
+    fn remote_branch_state_reports_rewritten_after_amend() {
+        let (_bare, clone) = init_remote_with_feature();
+        run_git(clone.path(), &["commit", "--amend", "-m", "amended"]);
+
+        let check = remote_branch_state(clone.path(), "feature").unwrap();
+
+        assert_eq!(check.state, RemoteBranchState::Rewritten);
+        let expected = check.remote_sha.clone();
+        force_push_with_lease(clone.path(), "feature", &expected).unwrap();
+        fetch_origin_branch(clone.path(), "feature").unwrap();
+        assert_eq!(
+            rev_parse_commit(clone.path(), "origin/feature").unwrap(),
+            rev_parse_commit(clone.path(), "HEAD").unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_branch_state_reports_diverged_after_colleague_push() {
+        let (bare, clone) = init_remote_with_feature();
+        let colleague = clone_remote(bare.path());
+        run_git(colleague.path(), &["checkout", "feature"]);
+        fs::write(colleague.path().join("colleague.txt"), "colleague\n").unwrap();
+        commit_all(colleague.path(), "colleague commit");
+        run_git(colleague.path(), &["push", "origin", "feature"]);
+        fetch_origin_branch(clone.path(), "feature").unwrap();
+
+        let check = remote_branch_state(clone.path(), "feature").unwrap();
+
+        match check.state {
+            RemoteBranchState::Diverged(divergence) => {
+                assert_eq!(divergence.total, 1);
+                assert_eq!(divergence.commits.len(), 1);
+                assert!(divergence.commits[0].subject.contains("colleague"));
+            }
+            other => panic!("expected diverged state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_push_with_lease_rejects_stale_expected_tip() {
+        let (bare, clone) = init_remote_with_feature();
+        let colleague = clone_remote(bare.path());
+        run_git(colleague.path(), &["checkout", "feature"]);
+        fs::write(colleague.path().join("colleague.txt"), "colleague\n").unwrap();
+        commit_all(colleague.path(), "colleague commit");
+        run_git(colleague.path(), &["push", "origin", "feature"]);
+
+        // The local tracking ref still points at the original feature commit.
+        let stale = rev_parse_commit(clone.path(), "origin/feature")
+            .unwrap()
+            .expect("tracking ref");
+
+        assert!(force_push_with_lease(clone.path(), "feature", &stale).is_err());
+
+        fetch_origin_branch(clone.path(), "feature").unwrap();
+        assert_eq!(
+            rev_parse_commit(clone.path(), "origin/feature").unwrap(),
+            rev_parse_commit(colleague.path(), "HEAD").unwrap()
+        );
     }
 
     #[test]
