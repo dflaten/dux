@@ -152,6 +152,7 @@ pub struct App {
     pub(crate) agent_launches_in_flight: HashSet<String>,
     pub(crate) pulls_in_flight: HashSet<String>,
     pub(crate) rebases_in_flight: HashSet<String>,
+    pub(crate) force_pushes_in_flight: HashSet<String>,
     pub(crate) resource_stats_in_flight: bool,
     pub(crate) worktree_cleanup_pending: usize,
     pub(crate) worktree_cleanup_removed: Vec<WorktreeCleanupCandidate>,
@@ -470,6 +471,21 @@ pub(crate) struct WatchedWorktree {
 pub(crate) struct BaseBranchUpdate {
     pub(crate) base_ref: String,
     pub(crate) commits: usize,
+}
+
+/// Result of a push after checking the remote branch first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    Pushed,
+    /// The branch was rebased locally; a normal push would be rejected.
+    NeedsForcePush {
+        remote_ref: String,
+    },
+    /// The remote has commits that were never part of the local branch.
+    Blocked {
+        divergence: git::RemoteDivergence,
+    },
+    Failed(String),
 }
 
 pub(crate) fn base_branch_update_for(path: &Path, base_ref: &str) -> Option<BaseBranchUpdate> {
@@ -2087,7 +2103,12 @@ pub(crate) enum WorkerEvent {
     },
     CommitMessageGenerated(String),
     CommitMessageFailed(String),
-    PushCompleted(Result<(), String>),
+    PushCompleted {
+        session_id: String,
+        branch_name: String,
+        force: bool,
+        outcome: PushOutcome,
+    },
     PullCompleted {
         repo_path: String,
         target: PullTarget,
@@ -2097,7 +2118,15 @@ pub(crate) enum WorkerEvent {
         session_id: String,
         branch_name: String,
         base_ref: String,
+        /// True when the remote branch still points at pre-rebase commits and
+        /// a normal push would be rejected.
+        needs_force_push: bool,
         result: Result<(), String>,
+    },
+    RebaseBlockedByRemote {
+        session_id: String,
+        branch_name: String,
+        divergence: git::RemoteDivergence,
     },
     BrowserEntriesReady {
         dir: PathBuf,
@@ -2397,6 +2426,7 @@ impl App {
             agent_launches_in_flight: HashSet::new(),
             pulls_in_flight: HashSet::new(),
             rebases_in_flight: HashSet::new(),
+            force_pushes_in_flight: HashSet::new(),
             resource_stats_in_flight: false,
             worktree_cleanup_pending: 0,
             worktree_cleanup_removed: Vec::new(),
@@ -2849,9 +2879,15 @@ impl App {
             Action::OpenMacroBar => {
                 self.selected_session().is_some() && !self.config.macros.entries.is_empty()
             }
-            Action::RebaseCurrentBranch => self
-                .selected_session()
-                .is_some_and(|session| self.base_branch_updates.contains_key(&session.id)),
+            Action::RebaseCurrentBranch => self.selected_session().is_some_and(|session| {
+                self.base_branch_updates.contains_key(&session.id)
+                    && !self.force_pushes_in_flight.contains(&session.id)
+            }),
+            Action::ForcePushToRemote => self.selected_session().is_some_and(|session| {
+                !session.is_scratch()
+                    && !self.rebases_in_flight.contains(&session.id)
+                    && !self.force_pushes_in_flight.contains(&session.id)
+            }),
             Action::ConvertScratchToProject | Action::MoveScratchToProject => {
                 self.selected_session()
                     .is_some_and(|session| session.is_scratch())
@@ -2979,6 +3015,7 @@ impl App {
                 self.rebase_selected_session_onto_base();
                 Ok(())
             }
+            "force-push-to-remote" => self.force_push_selected_session(),
             "delete-project" => self.delete_selected_project(),
             "remove-project" => self.remove_selected_project(),
             "delete-agent" => self.confirm_delete_selected_session(),
