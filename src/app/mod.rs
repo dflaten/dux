@@ -2118,7 +2118,9 @@ pub(crate) enum WorkerEvent {
         session_id: String,
         branch_name: String,
         base_ref: String,
-        remote_branch_existed: bool,
+        /// True when the remote branch still points at pre-rebase commits and
+        /// a normal push would be rejected.
+        needs_force_push: bool,
         result: Result<(), String>,
     },
     RebaseBlockedByRemote {

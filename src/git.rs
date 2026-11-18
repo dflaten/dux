@@ -415,16 +415,23 @@ pub fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> Result
     }
 }
 
+/// Cap the reflog scan so a very long-lived branch cannot overflow the
+/// command line. Dropping older entries only makes the divergence check more
+/// conservative.
+const REMOTE_DIVERGENCE_REFLOG_LIMIT: usize = 500;
+
 /// Return the commit SHAs recorded in the branch's reflog. These let us
 /// recognize our own pre-rebase tips after they have been rewritten away.
 fn branch_reflog_tips(repo_path: &Path, branch: &str) -> Result<Vec<String>> {
     let branch_ref = format!("refs/heads/{branch}");
+    let max_count = format!("--max-count={REMOTE_DIVERGENCE_REFLOG_LIMIT}");
     let output = Command::new("git")
         .args([
             "-C",
             repo_path.to_string_lossy().as_ref(),
             "rev-list",
             "-g",
+            max_count.as_str(),
             branch_ref.as_str(),
         ])
         .output()?;
@@ -539,7 +546,12 @@ pub fn remote_branch_state(repo_path: &Path, branch: &str) -> Result<RemoteBranc
         });
     };
 
-    if is_ancestor(repo_path, &remote_sha, "HEAD")? {
+    let tips = local_history_tips(repo_path, branch)?;
+    let Some(branch_tip) = tips.first() else {
+        return Err(anyhow!("local branch \"{branch}\" has no tip"));
+    };
+
+    if is_ancestor(repo_path, &remote_sha, branch_tip)? {
         return Ok(RemoteBranchCheck {
             remote_ref,
             remote_sha,
@@ -547,7 +559,6 @@ pub fn remote_branch_state(repo_path: &Path, branch: &str) -> Result<RemoteBranc
         });
     }
 
-    let tips = local_history_tips(repo_path, branch)?;
     let total = remote_only_count(repo_path, &remote_sha, &tips)?;
     if total == 0 {
         return Ok(RemoteBranchCheck {

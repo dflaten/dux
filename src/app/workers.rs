@@ -272,14 +272,14 @@ impl App {
                     session_id,
                     branch_name,
                     base_ref,
-                    remote_branch_existed,
+                    needs_force_push,
                     result,
                 } => {
                     self.rebases_in_flight.remove(&session_id);
                     match result {
                         Ok(()) => {
                             self.base_branch_updates.remove(&session_id);
-                            let message = if remote_branch_existed {
+                            let message = if needs_force_push {
                                 let hint = self.force_push_hint();
                                 format!(
                                     "Rebased \"{branch_name}\" onto {base_ref}. The remote branch still has the old commits. {hint}"
