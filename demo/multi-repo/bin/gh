@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Minimal deterministic `gh` stand-in for the dux multi-repo demo.
+# Only the commands dux's PR integration calls are implemented.
+set -u
+
+pr_json_for_branch() {
+  case "$1" in
+    feature/gift-cards)
+      cat <<'JSON'
+{
+  "number": 412,
+  "state": "OPEN",
+  "title": "Add gift card redemption to the checkout flow",
+  "url": "https://github.com/acme/storefront/pull/412",
+  "isDraft": false,
+  "headRefName": "feature/gift-cards",
+  "baseRefName": "main"
+}
+JSON
+      ;;
+    add-gift-card-api)
+      cat <<'JSON'
+{
+  "number": 98,
+  "state": "OPEN",
+  "title": "Add gift card apply endpoint",
+  "url": "https://github.com/acme/checkout-api/pull/98",
+  "isDraft": true,
+  "headRefName": "add-gift-card-api",
+  "baseRefName": "main"
+}
+JSON
+      ;;
+    add-gift-card-ledger)
+      cat <<'JSON'
+{
+  "number": 57,
+  "state": "OPEN",
+  "title": "Record gift card ledger entries",
+  "url": "https://github.com/acme/billing-service/pull/57",
+  "isDraft": false,
+  "headRefName": "add-gift-card-ledger",
+  "baseRefName": "main"
+}
+JSON
+      ;;
+    *)
+      echo '[]'
+      ;;
+  esac
+}
+
+pr_json_for_number() {
+  case "$1" in
+    412) pr_json_for_branch feature/gift-cards ;;
+    98) pr_json_for_branch add-gift-card-api ;;
+    57) pr_json_for_branch add-gift-card-ledger ;;
+    *)
+      echo "no pull requests found for branch" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
+  branch=""
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head)
+        branch=${2:-}
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  case "$(pr_json_for_branch "$branch")" in
+    '[]') echo '[]' ;;
+    *) printf '[%s]\n' "$(pr_json_for_branch "$branch")" ;;
+  esac
+  exit 0
+fi
+
+if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
+  number=${3:-}
+  pr_json_for_number "$number"
+  exit 0
+fi
+
+echo "gh demo shim: unsupported command: $*" >&2
+exit 1
