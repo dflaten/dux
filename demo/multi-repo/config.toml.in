@@ -1,0 +1,78 @@
+# Isolated configuration for the multi-repo screenshot demo.
+#
+# setup.sh copies this file into the demo's DUX_HOME and replaces
+# __DEMO_ROOT__ with the absolute demo work directory. The provider command is
+# on PATH because env.sh prepends demo/multi-repo/bin.
+
+[defaults]
+provider = "claude"
+start_directory = "__DEMO_ROOT__/repos"
+enable_randomized_pet_name_by_default = false
+pull_before_creating_agent_by_default = false
+
+[agent_control]
+enabled = true
+allow_unregistered_repos = true
+
+[providers.claude]
+# Deterministic stand-in for an AI coding CLI so the screenshot is stable.
+command = "dux-demo-agent"
+args = []
+resume_args = ["--continue"]
+fork_args = []
+resume_wait_timeout_ms = 0
+oneshot_args = ["--demo", "{prompt}"]
+oneshot_output = "stdout"
+install_hint = "ensure demo/multi-repo/bin is on PATH"
+forward_scroll = false
+
+[terminal]
+command = "/bin/bash"
+args = ["-l"]
+
+[startup_command_terminal]
+command = "$SHELL"
+args = ["-l", "-c"]
+
+[logging]
+level = "info"
+path = "dux.log"
+
+[ui]
+left_width_pct = 24
+right_width_pct = 30
+hide_scratch_right_pane = true
+empty_project_separator_min_projects = 2
+agent_scrollback_lines = 10000
+branch_sync_interval = 0
+base_branch_fetch_interval = 0
+show_diff_line_numbers = true
+github_integration = true
+auto_reopen_agents = true
+pr_banner_position = "bottom"
+github_poll_interval_seconds = 15
+pr_section = true
+pr_section_max_rows = 4
+pr_section_show_related = true
+theme = "dux_dark"
+
+[editor]
+default = "cursor"
+
+[[projects]]
+id = "11111111-1111-4111-8111-111111111111"
+path = "__DEMO_ROOT__/repos/storefront"
+name = "storefront"
+auto_reopen_agents = true
+
+[[projects]]
+id = "22222222-2222-4222-8222-222222222222"
+path = "__DEMO_ROOT__/repos/checkout-api"
+name = "checkout-api"
+auto_reopen_agents = true
+
+[[projects]]
+id = "33333333-3333-4333-8333-333333333333"
+path = "__DEMO_ROOT__/repos/billing-service"
+name = "billing-service"
+auto_reopen_agents = true

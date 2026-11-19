@@ -1,4 +1,4 @@
-.PHONY: run install fmt fmt-check lint lint-fix profiling
+.PHONY: run install fmt fmt-check lint lint-fix profiling screenshots
 
 run:
 	cargo run
@@ -36,3 +36,7 @@ lint-fix:
 profiling:
 	@command -v flamegraph >/dev/null 2>&1 || { echo "Error: 'flamegraph' not found. Install it with: cargo install flamegraph"; exit 1; }
 	cargo flamegraph --profile profiling --bin dux -o flamegraph.svg
+
+screenshots:
+	cargo build
+	./demo/multi-repo/capture.sh

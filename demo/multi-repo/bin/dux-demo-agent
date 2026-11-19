@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Deterministic stand-in for an AI coding CLI, used only by the screenshot demo.
+# The origin agent prints a plausible transcript and asks the running dux
+# instance to split work into two related repositories.
+set -u
+
+stty -echo 2>/dev/null || true
+trap 'stty echo 2>/dev/null || true' EXIT
+
+DEMO_ROOT=${DUX_DEMO_ROOT:?DUX_DEMO_ROOT is not set}
+FIXTURES=${DUX_DEMO_FIXTURES:?DUX_DEMO_FIXTURES is not set}
+
+RESET=$'\033[0m'
+DIM=$'\033[38;5;244m'
+MUTED=$'\033[38;5;246m'
+TEXT=$'\033[38;5;252m'
+GREEN=$'\033[38;5;114m'
+YELLOW=$'\033[38;5;221m'
+PURPLE=$'\033[38;5;177m'
+BOLD=$'\033[1m'
+
+line() { printf '%b\n' "$*"; }
+pause() { sleep "${1:-0.25}"; }
+
+repo_url=$(git config --get remote.origin.url 2>/dev/null || true)
+repo=${repo_url##*/}
+repo=${repo%.git}
+branch=${DUX_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}
+
+case "$repo" in
+  storefront) role=origin ;;
+  checkout-api) role=api ;;
+  billing-service) role=billing ;;
+  *) role=generic ;;
+esac
+
+printf '\033[2J\033[H'
+
+if [ "$role" = origin ]; then
+  line "${DIM}  Claude Code ${RESET}${DIM}· demo session${RESET}"
+  line ""
+  line "${PURPLE}✻${RESET} ${BOLD}Gift cards across checkout${RESET}"
+  line "${DIM}  storefront · ${branch}${RESET}"
+  line ""
+  pause 0.5
+
+  line "${GREEN}●${RESET} I'll trace the checkout flow before changing anything."
+  pause 0.5
+  line "  ${DIM}Read${RESET}  src/pages/checkout.tsx"
+  line "  ${DIM}⎿  Read 76 lines${RESET}"
+  pause 0.3
+  line "  ${DIM}Read${RESET}  src/components/PaymentForm.tsx"
+  line "  ${DIM}⎿  Read 118 lines${RESET}"
+  pause 0.3
+  line "  ${DIM}Read${RESET}  src/lib/api.ts"
+  line "  ${DIM}⎿  Read 64 lines${RESET}"
+  pause 0.6
+  line ""
+  line "${GREEN}●${RESET} This change crosses three repositories:"
+  line "  ${TEXT}·${RESET} ${TEXT}storefront${RESET}       gift card field + checkout API call"
+  line "  ${TEXT}·${RESET} ${TEXT}checkout-api${RESET}     validate and apply the balance"
+  line "  ${TEXT}·${RESET} ${TEXT}billing-service${RESET}  record the redemption ledger entry"
+  line ""
+  line "${GREEN}●${RESET} I'll split the API and billing work into linked agents so"
+  line "  each repository gets its own worktree, branch, and PR."
+  pause 0.8
+  line ""
+
+  run_split() {
+    local target_repo=$1
+    local target_name=$2
+    local prompt=$3
+    line "${YELLOW}●${RESET} ${BOLD}dux split-out${RESET}  ${TEXT}${target_repo}${RESET} / ${target_name}"
+    if "${DUX_BIN:-dux}" agent split-out \
+      --repo "$DEMO_ROOT/repos/$target_repo" \
+      --name "$target_name" \
+      --prompt "$prompt" \
+      --json >"$DEMO_ROOT/split-$target_name.json" 2>"$DEMO_ROOT/split-$target_name.err"; then
+      line "  ${GREEN}⎿${RESET} worktree created · related agent launched"
+    else
+      line "  ${YELLOW}⎿${RESET} split-out failed: $(tr '\n' ' ' <"$DEMO_ROOT/split-$target_name.err" | cut -c1-70)"
+    fi
+    pause 0.7
+  }
+
+  if "${DUX_BIN:-dux}" agent related --json 2>/dev/null | grep -q 'add-gift-card-api'; then
+    line "${GREEN}●${RESET} Related agents are already linked under Multi-repo work."
+    line "  ${DIM}Skipping split-out so the existing worktrees and PRs are reused.${RESET}"
+    pause 0.5
+  else
+    run_split checkout-api add-gift-card-api \
+      "Add POST /v1/gift-cards/apply to checkout-api. Validate the card, apply a partial or full balance with an idempotency key, and return the remaining balance. Include tests for expired, drained, and duplicate-idempotency cases. Do not change the billing ledger contract."
+
+    run_split billing-service add-gift-card-ledger \
+      "Record gift card redemptions in the billing ledger. Add a balanced debit/credit entry for each applied gift card amount, keyed by the checkout idempotency key. Include tests for partial redemption and duplicate events. Do not change the storefront UI."
+  fi
+
+  line ""
+  line "${GREEN}●${RESET} Both related agents are running. I'll keep the storefront"
+  line "  changes moving here and reconcile the API contract when their"
+  line "  pull requests land."
+  line ""
+  line "${DIM}  Waiting on related PRs…${RESET}"
+  sleep 3600
+  exit 0
+fi
+
+if [ "$role" = api ]; then
+  line "${DIM}  Claude Code ${RESET}${DIM}· related agent${RESET}"
+  line ""
+  line "${PURPLE}✻${RESET} ${BOLD}add-gift-card-api${RESET}"
+  line "${DIM}  checkout-api · ${branch}${RESET}"
+  line ""
+  pause 0.4
+  line "${GREEN}●${RESET} Reading the payment service before adding the endpoint."
+  line "  ${DIM}Read${RESET}  internal/payments/giftcard.go"
+  line "  ${DIM}Read${RESET}  internal/httpapi/routes.go"
+  pause 0.5
+  line ""
+  line "${GREEN}●${RESET} Implementing ${TEXT}POST /v1/gift-cards/apply${RESET}"
+  line "  ${GREEN}✓${RESET} lookup card and reject expired or drained balances"
+  line "  ${GREEN}✓${RESET} apply partial balance with an idempotency key"
+  line "  ${GREEN}✓${RESET} return remaining balance and receipt line"
+  cp -R "$FIXTURES/checkout-api-after/." "$PWD/"
+  pause 0.4
+  line ""
+  line "${GREEN}●${RESET} Writing tests for the edge cases"
+  line "  ${GREEN}✓${RESET} expired card"
+  line "  ${GREEN}✓${RESET} drained card"
+  line "  ${GREEN}✓${RESET} duplicate idempotency key"
+  pause 0.5
+  line ""
+  line "${GREEN}●${RESET} ${BOLD}go test ./...${RESET}"
+  line "  ${GREEN}ok${RESET}  checkout-api/internal/payments  0.41s"
+  line "  ${GREEN}ok${RESET}  checkout-api/internal/httpapi   0.58s"
+  line ""
+  line "${DIM}  PR #98 is linked to this worktree.${RESET}"
+  line "${DIM}  Waiting for the storefront contract review.${RESET}"
+  sleep 3600
+  exit 0
+fi
+
+if [ "$role" = billing ]; then
+  line "${DIM}  Claude Code ${RESET}${DIM}· related agent${RESET}"
+  line ""
+  line "${PURPLE}✻${RESET} ${BOLD}add-gift-card-ledger${RESET}"
+  line "${DIM}  billing-service · ${branch}${RESET}"
+  line ""
+  pause 0.4
+  line "${GREEN}●${RESET} Reading the ledger writer and event consumer."
+  line "  ${DIM}Read${RESET}  app/ledger/entries.py"
+  line "  ${DIM}Read${RESET}  app/consumers/checkout_events.py"
+  pause 0.5
+  line ""
+  line "${GREEN}●${RESET} Recording gift card redemptions as balanced ledger entries"
+  line "  ${GREEN}✓${RESET} debit gift_card_liability"
+  line "  ${GREEN}✓${RESET} credit deferred_revenue"
+  line "  ${GREEN}✓${RESET} dedupe on the checkout idempotency key"
+  cp -R "$FIXTURES/billing-service-after/." "$PWD/"
+  pause 0.4
+  line ""
+  line "${GREEN}●${RESET} ${BOLD}pytest -q${RESET}"
+  line "  ${GREEN}18 passed${RESET} in 1.24s"
+  line ""
+  line "${DIM}  PR #57 is linked to this worktree.${RESET}"
+  line "${DIM}  Waiting for the API contract PR.${RESET}"
+  sleep 3600
+  exit 0
+fi
+
+line "${DIM}  Claude Code ${RESET}${DIM}· related agent${RESET}"
+line ""
+line "${GREEN}●${RESET} Working in ${TEXT}${repo}${RESET} on ${MUTED}${branch}${RESET}."
+line "${DIM}  Waiting for the origin agent to finish.${RESET}"
+sleep 3600

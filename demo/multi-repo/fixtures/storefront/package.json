@@ -1,0 +1,12 @@
+{
+  "name": "storefront",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "next": "15.2.0",
+    "react": "19.0.0"
+  }
+}
