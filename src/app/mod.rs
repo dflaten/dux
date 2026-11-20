@@ -91,6 +91,8 @@ pub struct App {
     pub(crate) delegations: Vec<Delegation>,
     /// Delegations waiting for the single creation pipeline slot.
     pub(crate) delegation_queue: VecDeque<QueuedDelegation>,
+    /// Prepared delegations waiting for an unrelated create to finish.
+    pub(crate) pending_delegation_plans: VecDeque<SplitOutPlan>,
     /// request id -> delegation id for in-flight control requests.
     pub(crate) delegation_request_ids: HashMap<String, String>,
     pub(crate) staged_files: Vec<ChangedFile>,
@@ -2073,6 +2075,7 @@ pub(crate) enum CreateAgentRequest {
         source_session: Box<AgentSession>,
         group_id: String,
         parent_session_id: String,
+        root_session_id: String,
         depth: u32,
         brief_path: String,
         project: Project,
@@ -2135,6 +2138,7 @@ pub(crate) struct SplitOutCreateRequest {
     pub(crate) source_session: AgentSession,
     pub(crate) group_id: String,
     pub(crate) parent_session_id: String,
+    pub(crate) root_session_id: String,
     pub(crate) depth: u32,
     pub(crate) brief_path: String,
     pub(crate) project: Project,
@@ -2489,6 +2493,7 @@ impl App {
             groups,
             delegations,
             delegation_queue: VecDeque::new(),
+            pending_delegation_plans: VecDeque::new(),
             delegation_request_ids: HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),

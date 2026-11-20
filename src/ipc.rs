@@ -120,6 +120,27 @@ impl ControlRequest {
                 delegation_id,
                 text,
                 submit,
+                message_only: false,
+            },
+        }
+    }
+
+    pub fn delegation_message(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        text: String,
+        submit: bool,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationFollowup {
+                source_session_id,
+                session_id,
+                delegation_id,
+                text,
+                submit,
+                message_only: true,
             },
         }
     }
@@ -211,6 +232,8 @@ pub enum ControlCommand {
         delegation_id: Option<String>,
         text: String,
         submit: bool,
+        #[serde(default)]
+        message_only: bool,
     },
     DelegationCancel {
         source_session_id: Option<String>,

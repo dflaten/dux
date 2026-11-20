@@ -1802,6 +1802,17 @@ impl App {
         self.mark_session_desired_running(&session.id, true);
         self.mark_session_status(&session.id, SessionStatus::Active);
         self.mark_session_provider_started(&session.id);
+        if let Some(delegation) = self
+            .delegations
+            .iter_mut()
+            .find(|delegation| delegation.child_session_id.as_deref() == Some(session.id.as_str()))
+            && delegation.state == DelegationState::Interrupted
+        {
+            delegation.state = DelegationState::Running;
+            delegation.state_reason = None;
+            delegation.updated_at = Utc::now();
+            let _ = self.session_store.upsert_delegation(delegation);
+        }
 
         match request.kind {
             AgentLaunchKind::Reconnect {
@@ -4976,7 +4987,7 @@ pub(crate) fn run_split_out_prepare_job(
     };
     let source_session_id = source_session.id.clone();
 
-    let (mut project, project_is_new) = if let Some(query) = params.project.as_deref() {
+    let (project, project_is_new) = if let Some(query) = params.project.as_deref() {
         let found = projects
             .iter()
             .find(|project| project.id == query || project.name.eq_ignore_ascii_case(query));
@@ -5143,9 +5154,6 @@ pub(crate) fn run_split_out_prepare_job(
         }
     };
     let base_branch = base_label.clone();
-    if project_is_new {
-        project.leading_branch = Some(base_branch.clone());
-    }
 
     let name = match resolve_split_out_name(
         &repo_path,
@@ -5622,15 +5630,13 @@ pub(crate) fn run_split_out_create_job(
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
 ) {
+    let delegation_env = super::control::delegation_control_env(&paths, &request);
     let SplitOutCreateRequest {
         request_id,
         delegation_id,
         source_session_id,
-        source_session,
         group_id,
         parent_session_id,
-        depth,
-        brief_path,
         project,
         name,
         base_branch,
@@ -5639,6 +5645,7 @@ pub(crate) fn run_split_out_create_job(
         provider,
         handoff_prompt,
         project_added,
+        ..
     } = request;
     let _ = source_session_id;
     let repo_path = PathBuf::from(&project.path);
@@ -5741,15 +5748,7 @@ pub(crate) fn run_split_out_create_job(
         updated_at: Utc::now(),
     };
     env.extend(super::control::agent_control_env(&paths, &session));
-    env.extend(super::control::delegation_control_env(
-        &paths,
-        &delegation_id,
-        &group_id,
-        &parent_session_id,
-        depth,
-        &brief_path,
-        &source_session,
-    ));
+    env.extend(delegation_env);
 
     let startup_result = project
         .startup_command
@@ -6256,6 +6255,7 @@ mod tests {
                 source_session: source.clone(),
                 group_id: "group-1".to_string(),
                 parent_session_id: source.id.clone(),
+                root_session_id: source.id.clone(),
                 depth: 1,
                 brief_path: tmp.path().join("brief.md").to_string_lossy().to_string(),
                 project,

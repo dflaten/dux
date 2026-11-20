@@ -27,7 +27,9 @@ Still deferred from the full proposal:
   role badges, and search by delegation state;
 - `allowed_repo_roots` and narrower agent-control repository policy;
 - snapshot support for explicitly included ignored files;
-- parent PTY notifications and a persistent follow-up delivery queue.
+- parent PTY notifications and a persistent follow-up delivery queue;
+- lazy synthesis of delegation rows for split-out sessions created before this
+  migration (`dux agent related` and the sidebar tree still show them).
 
 ## TL;DR
 

@@ -8266,6 +8266,7 @@ mod tests {
             groups: Vec::new(),
             delegations: Vec::new(),
             delegation_queue: std::collections::VecDeque::new(),
+            pending_delegation_plans: std::collections::VecDeque::new(),
             delegation_request_ids: std::collections::HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),

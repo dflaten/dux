@@ -921,6 +921,7 @@ impl App {
                 source_session,
                 group_id,
                 parent_session_id,
+                root_session_id,
                 depth,
                 brief_path,
                 project,
@@ -944,6 +945,7 @@ impl App {
                     source_session: *source_session,
                     group_id,
                     parent_session_id,
+                    root_session_id,
                     depth,
                     brief_path,
                     project,
@@ -3959,6 +3961,7 @@ mod tests {
             groups: Vec::new(),
             delegations: Vec::new(),
             delegation_queue: std::collections::VecDeque::new(),
+            pending_delegation_plans: std::collections::VecDeque::new(),
             delegation_request_ids: std::collections::HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
@@ -4290,6 +4293,7 @@ mod tests {
                 ..Default::default()
             },
             tx,
+            false,
         );
         let response = rx
             .recv_timeout(std::time::Duration::from_secs(2))

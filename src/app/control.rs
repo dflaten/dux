@@ -36,6 +36,12 @@ impl App {
 
     fn handle_control_request(&mut self, incoming: IncomingControlRequest) {
         let IncomingControlRequest { request, respond } = incoming;
+        if matches!(
+            &request.command,
+            ControlCommand::DelegationStatus { .. } | ControlCommand::DelegationResult { .. }
+        ) {
+            self.import_pending_delegation_results();
+        }
         if !self.config.agent_control.enabled {
             let _ = respond.send(ControlResponse::error(
                 "disabled",
@@ -59,8 +65,11 @@ impl App {
             } => {
                 self.handle_link_pull_request(source_session_id, input, respond);
             }
-            ControlCommand::SplitOut(params) | ControlCommand::Delegate(params) => {
-                self.handle_split_out_request(params, respond);
+            ControlCommand::SplitOut(params) => {
+                self.handle_split_out_request(params, respond, true);
+            }
+            ControlCommand::Delegate(params) => {
+                self.handle_split_out_request(params, respond, false);
             }
             ControlCommand::DelegationStatus {
                 source_session_id,
@@ -108,6 +117,7 @@ impl App {
                 delegation_id,
                 text,
                 submit,
+                message_only,
             } => {
                 let response = self.handle_delegation_followup(
                     source_session_id.as_deref(),
@@ -115,6 +125,7 @@ impl App {
                     delegation_id.as_deref(),
                     &text,
                     submit,
+                    message_only,
                 );
                 let _ = respond.send(response);
             }
@@ -211,6 +222,7 @@ impl App {
         &mut self,
         params: SplitOutParams,
         respond: Sender<ControlResponse>,
+        legacy_split_out: bool,
     ) {
         if !self.config.orchestration.enabled {
             let _ = respond.send(ControlResponse::error(
@@ -229,6 +241,30 @@ impl App {
                 ),
             ));
             return;
+        }
+        if let Some(mode) = params.base_mode.as_deref().and_then(BaseMode::from_str) {
+            if mode == BaseMode::Ref && params.base.is_none() {
+                let _ = respond.send(ControlResponse::error(
+                    "invalid_base",
+                    "--base-mode ref requires --base <ref>.",
+                ));
+                return;
+            }
+            if mode == BaseMode::SiblingHead && params.base_session.is_none() {
+                let _ = respond.send(ControlResponse::error(
+                    "invalid_base",
+                    "--base-mode sibling-head requires --base-session <id>.",
+                ));
+                return;
+            }
+            if mode == BaseMode::ParentSnapshot && !self.config.orchestration.allow_parent_snapshot
+            {
+                let _ = respond.send(ControlResponse::error(
+                    "invalid_base",
+                    "parent-snapshot is disabled by [orchestration] allow_parent_snapshot.",
+                ));
+                return;
+            }
         }
         if let Some(provider) = params.provider.as_deref()
             && self.config.providers.get(provider).is_none()
@@ -377,7 +413,11 @@ impl App {
         let request_id = Uuid::new_v4().to_string();
         self.delegation_request_ids
             .insert(request_id.clone(), delegation_id.clone());
-        let early = !params.wait_for_launch;
+        let early = if legacy_split_out {
+            params.no_wait
+        } else {
+            params.no_wait || !params.wait_for_launch
+        };
         if early {
             let _ = respond.send(self.delegation_response(&delegation, false));
         } else {
@@ -567,7 +607,14 @@ impl App {
     }
 
     pub(crate) fn pump_delegation_queue(&mut self) {
-        if self.split_out_in_flight || self.create_agent_in_flight {
+        if self.create_agent_in_flight {
+            return;
+        }
+        if let Some(plan) = self.pending_delegation_plans.pop_front() {
+            self.begin_split_out_create(plan);
+            return;
+        }
+        if self.split_out_in_flight {
             return;
         }
         let Some(item) = self.delegation_queue.pop_front() else {
@@ -714,11 +761,10 @@ impl App {
 
     fn begin_split_out_create(&mut self, plan: SplitOutPlan) {
         if self.create_agent_in_flight {
-            self.fail_split_out(
-                &plan.request_id,
-                "busy",
-                "An agent is already being created or forked. Wait for it to finish, then retry split-out.",
-            );
+            // A user-created agent grabbed the creation slot while this
+            // delegation was preparing. Keep the resolved plan and start it
+            // as soon as that create finishes.
+            self.pending_delegation_plans.push_back(plan);
             return;
         }
         let Some(source_session) = self
@@ -774,6 +820,10 @@ impl App {
             "You are a delegated dux agent. Read the task brief at {} and complete it. When done, run \"$DUX_BIN\" agent finish --status success --summary-file - and pass your summary on stdin. If you need a decision, use --status blocked.",
             plan.brief_path
         ));
+        let root_session_id = group
+            .origin_session_id
+            .clone()
+            .unwrap_or_else(|| source_session.id.clone());
         let request = CreateAgentRequest::SplitOut {
             request_id: plan.request_id,
             delegation_id: plan.delegation_id,
@@ -781,6 +831,7 @@ impl App {
             source_session: Box::new(source_session.clone()),
             group_id: group.id,
             parent_session_id: source_session.id,
+            root_session_id,
             depth: plan.depth,
             brief_path: plan.brief_path,
             project: plan.project,
@@ -1023,11 +1074,91 @@ impl App {
                     delegation.result_path = Some(path.to_string_lossy().to_string());
                     delegation.state = result.state();
                     delegation.state_reason = None;
+                    delegation.error = None;
                     delegation.finished_at = Some(Utc::now());
                     delegation.updated_at = Utc::now();
                 }
             }
             let _ = self.session_store.upsert_delegation(delegation);
+        }
+    }
+
+    /// Import a result file whose callback was lost while dux was busy. The
+    /// CLI writes the file before sending the control request, so polling
+    /// status is enough to recover a missed finish without a background timer.
+    fn import_pending_delegation_results(&mut self) {
+        let mut imported = false;
+        for delegation in &mut self.delegations {
+            if delegation.state == DelegationState::Cancelled
+                || delegation.state == DelegationState::Resuming
+                || delegation.result_id.is_some()
+            {
+                continue;
+            }
+            let path = self
+                .paths
+                .root
+                .join("delegations")
+                .join(&delegation.id)
+                .join("result.json");
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.len() > self.config.orchestration.result_max_bytes as u64 {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(result) = serde_json::from_str::<DelegationResult>(&raw) else {
+                // The CLI may still be writing the file. The next poll retries.
+                continue;
+            };
+            delegation.result_id = Some(if result.result_id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                result.result_id.clone()
+            });
+            delegation.result_status = Some(result.status.clone());
+            delegation.result_summary = Some(truncate_summary(
+                &result.summary,
+                self.config.orchestration.result_max_bytes.min(8192),
+            ));
+            delegation.result_path = Some(path.to_string_lossy().to_string());
+            delegation.state = result.state();
+            delegation.state_reason = None;
+            delegation.error = None;
+            delegation.finished_at = Some(Utc::now());
+            delegation.updated_at = Utc::now();
+            let _ = self.session_store.upsert_delegation(delegation);
+            imported = true;
+        }
+        if imported {
+            self.rebuild_left_items();
+        }
+    }
+
+    fn fail_delegation_result_write(&mut self, delegation_id: &str, message: &str) {
+        let mut changed = false;
+        if let Some(delegation) = self
+            .delegations
+            .iter_mut()
+            .find(|delegation| delegation.id == delegation_id)
+            && delegation.state != DelegationState::Cancelled
+        {
+            delegation.state = DelegationState::Failed;
+            delegation.state_reason = Some("result_write_failed".to_string());
+            delegation.error = Some(message.to_string());
+            delegation.finished_at = Some(Utc::now());
+            delegation.updated_at = Utc::now();
+            let _ = self.session_store.upsert_delegation(delegation);
+            changed = true;
+        }
+        if changed {
+            self.rebuild_left_items();
+            self.set_error(format!(
+                "A delegated agent finished, but its result could not be stored: {message}"
+            ));
         }
     }
 
@@ -1268,12 +1399,18 @@ impl App {
     ) -> ControlResponse {
         let target = session_id.or(source_session_id);
         let delegations = if let Some(id) = delegation_id {
-            self.delegations
+            let Some(delegation) = self
+                .delegations
                 .iter()
                 .find(|delegation| delegation.id == id)
                 .cloned()
-                .into_iter()
-                .collect::<Vec<_>>()
+            else {
+                return ControlResponse::error(
+                    "delegation_not_found",
+                    "No delegation matches that id.",
+                );
+            };
+            vec![delegation]
         } else if let Some(session) = target {
             self.delegation_subtree(session)
         } else {
@@ -1308,17 +1445,21 @@ impl App {
                 "No delegation matches that session or delegation id.",
             );
         };
-        let result_path = delegation.result_path.clone().or_else(|| {
-            let dir = self.paths.root.join("delegations").join(&delegation.id);
-            let current = dir.join("result.json");
-            if current.exists() {
-                return Some(current.to_string_lossy().to_string());
-            }
-            (1..=delegation.iteration).rev().find_map(|iteration| {
-                let path = dir.join(format!("result-{iteration}.json"));
-                path.exists().then(|| path.to_string_lossy().to_string())
+        let result_path = if delegation.state.is_active() && delegation.result_summary.is_none() {
+            None
+        } else {
+            delegation.result_path.clone().or_else(|| {
+                let dir = self.paths.root.join("delegations").join(&delegation.id);
+                let current = dir.join("result.json");
+                if current.exists() {
+                    return Some(current.to_string_lossy().to_string());
+                }
+                (1..=delegation.iteration).rev().find_map(|iteration| {
+                    let path = dir.join(format!("result-{iteration}.json"));
+                    path.exists().then(|| path.to_string_lossy().to_string())
+                })
             })
-        });
+        };
         let mut response = ControlResponse::success().with_message(format!(
             "Delegation \"{}\" is {}.",
             delegation.title,
@@ -1409,17 +1550,18 @@ impl App {
             }
         };
         if encoded.len() > self.config.orchestration.result_max_bytes {
-            return ControlResponse::error(
-                "result_too_large",
-                format!(
-                    "Result is too large ({} bytes, limit {}).",
-                    encoded.len(),
-                    self.config.orchestration.result_max_bytes
-                ),
+            let message = format!(
+                "Result is too large ({} bytes, limit {}).",
+                encoded.len(),
+                self.config.orchestration.result_max_bytes
             );
+            self.fail_delegation_result_write(&delegation_id, &message);
+            return ControlResponse::error("result_too_large", message);
         }
         if let Err(err) = write_delegation_file(Path::new(&path), &encoded) {
-            return ControlResponse::error("result_write_failed", err.to_string());
+            let message = err.to_string();
+            self.fail_delegation_result_write(&delegation_id, &message);
+            return ControlResponse::error("result_write_failed", message);
         }
         let delegation = &mut self.delegations[delegation_index];
         let was_cancelled = delegation.state == DelegationState::Cancelled;
@@ -1475,7 +1617,9 @@ impl App {
         delegation_id: Option<&str>,
         text: &str,
         submit: bool,
+        message_only: bool,
     ) -> ControlResponse {
+        self.import_pending_delegation_results();
         if text.trim().is_empty() {
             return ControlResponse::error("invalid_text", "Follow-up text is empty.");
         }
@@ -1540,6 +1684,15 @@ impl App {
                 format!("Could not write to the delegated agent: {err}"),
             );
         }
+        if message_only {
+            let mut response = ControlResponse::success().with_message(format!(
+                "Sent a message to delegated agent \"{}\".",
+                delegation.title
+            ));
+            response.delegation_id = Some(delegation.id);
+            response.delegation_state = Some(delegation.state.as_str().to_string());
+            return response;
+        }
         let state = if delegation.state.is_resumable() {
             DelegationState::Running
         } else {
@@ -1568,6 +1721,8 @@ impl App {
                 row.result_summary = None;
                 row.result_path = None;
                 row.finished_at = None;
+                row.integrated_at = None;
+                row.integration_commit = None;
             }
             row.state = state;
             row.state_reason = Some("follow-up delivered".to_string());
@@ -1698,14 +1853,16 @@ impl App {
                 "No delegation matches that id.",
             );
         };
-        if !matches!(
-            old.state,
-            DelegationState::Failed | DelegationState::Interrupted
-        ) {
+        if old.child_session_id.is_some()
+            || !matches!(
+                old.state,
+                DelegationState::Failed | DelegationState::Interrupted
+            )
+        {
             return ControlResponse::error(
                 "not_retryable",
                 format!(
-                    "Delegation is {}; only failed or interrupted launches can be retried.",
+                    "Delegation is {} and already has a child session; cancel or delete it before retrying.",
                     old.state.as_str()
                 ),
             );
@@ -1741,7 +1898,7 @@ impl App {
             brief_sha256: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        self.handle_split_out_request(params, tx);
+        self.handle_split_out_request(params, tx, false);
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(response) => response,
             Err(_) => ControlResponse::error(
@@ -1757,6 +1914,7 @@ impl App {
         session_id: String,
         respond: Sender<ControlResponse>,
     ) {
+        self.import_pending_delegation_results();
         if source_session_id.is_some() && !self.config.orchestration.allow_agent_integration {
             let _ = respond.send(ControlResponse::error(
                 "integration_requires_user",
@@ -1779,6 +1937,20 @@ impl App {
                     delegation.state.as_str()
                 ),
             ));
+            return;
+        }
+        if delegation.integrated_at.is_some() {
+            let _ = respond.send(ControlResponse::success().with_message(format!(
+                "Delegation \"{}\" was already integrated{}.",
+                delegation.title,
+                delegation
+                    .integration_commit
+                    .as_deref()
+                    .map(|commit| {
+                        format!(" ({})", commit.chars().take(7).collect::<String>())
+                    })
+                    .unwrap_or_default()
+            )));
             return;
         }
         let Some(child) = self
@@ -2021,27 +2193,28 @@ pub(crate) fn agent_control_env(paths: &DuxPaths, session: &AgentSession) -> Vec
 /// stable for the life of the delegation, including follow-up iterations.
 pub(crate) fn delegation_control_env(
     paths: &DuxPaths,
-    delegation_id: &str,
-    group_id: &str,
-    parent_session_id: &str,
-    depth: u32,
-    brief_path: &str,
-    parent: &AgentSession,
+    request: &SplitOutCreateRequest,
 ) -> Vec<(String, String)> {
-    let dir = paths.root.join("delegations").join(delegation_id);
+    let dir = paths.root.join("delegations").join(&request.delegation_id);
     vec![
-        ("DUX_DELEGATION_ID".to_string(), delegation_id.to_string()),
+        (
+            "DUX_DELEGATION_ID".to_string(),
+            request.delegation_id.clone(),
+        ),
         (
             "DUX_PARENT_SESSION_ID".to_string(),
-            parent_session_id.to_string(),
+            request.parent_session_id.clone(),
         ),
         (
             "DUX_ROOT_SESSION_ID".to_string(),
-            parent_session_id.to_string(),
+            request.root_session_id.clone(),
         ),
-        ("DUX_GROUP_ID".to_string(), group_id.to_string()),
-        ("DUX_DELEGATION_DEPTH".to_string(), depth.to_string()),
-        ("DUX_BRIEF_FILE".to_string(), brief_path.to_string()),
+        ("DUX_GROUP_ID".to_string(), request.group_id.clone()),
+        (
+            "DUX_DELEGATION_DEPTH".to_string(),
+            request.depth.to_string(),
+        ),
+        ("DUX_BRIEF_FILE".to_string(), request.brief_path.clone()),
         (
             "DUX_RESULT_FILE".to_string(),
             dir.join("result.json").to_string_lossy().to_string(),
@@ -2052,8 +2225,11 @@ pub(crate) fn delegation_control_env(
         ),
         (
             "DUX_PARENT_WORKTREE".to_string(),
-            parent.worktree_path.clone(),
+            request.source_session.worktree_path.clone(),
         ),
-        ("DUX_PARENT_BRANCH".to_string(), parent.branch_name.clone()),
+        (
+            "DUX_PARENT_BRANCH".to_string(),
+            request.source_session.branch_name.clone(),
+        ),
     ]
 }

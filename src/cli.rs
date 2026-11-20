@@ -1486,6 +1486,10 @@ fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
 }
 
 fn run_agent_followup(args: &[String], paths: &DuxPaths) -> Result<()> {
+    run_agent_followup_inner(args, paths, false)
+}
+
+fn run_agent_followup_inner(args: &[String], paths: &DuxPaths, message_only: bool) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1528,20 +1532,28 @@ fn run_agent_followup(args: &[String], paths: &DuxPaths) -> Result<()> {
         text = Some(read_brief_file(&path, 256 * 1024)?);
     }
     let text = text.ok_or_else(|| anyhow!("followup requires --text or --text-file."))?;
-    let request = crate::ipc::ControlRequest::delegation_followup(
-        source_session_id,
-        session_id,
-        delegation_id,
-        text,
-        submit,
-    );
+    let request = if message_only {
+        crate::ipc::ControlRequest::delegation_message(
+            source_session_id,
+            session_id,
+            delegation_id,
+            text,
+            submit,
+        )
+    } else {
+        crate::ipc::ControlRequest::delegation_followup(
+            source_session_id,
+            session_id,
+            delegation_id,
+            text,
+            submit,
+        )
+    };
     send_and_print_request(paths, request, json)
 }
 
 fn run_agent_message(args: &[String], paths: &DuxPaths) -> Result<()> {
-    // `message` and `followup` share the same control path today; followup is
-    // the task-level iteration command and message is the best-effort variant.
-    run_agent_followup(args, paths)
+    run_agent_followup_inner(args, paths, true)
 }
 
 fn run_agent_cancel(args: &[String], paths: &DuxPaths) -> Result<()> {
