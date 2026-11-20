@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::Context;
+use anyhow::{Context, bail};
 
 const MACRO_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const MACRO_AGENT_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,6 +32,7 @@ impl App {
                 WorkerEvent::CreateAgentFailed(message) => {
                     self.create_agent_in_flight = false;
                     self.set_error(message);
+                    self.pump_delegation_queue();
                 }
                 WorkerEvent::SplitOutPrepared { plan } => {
                     self.handle_split_out_prepared(*plan);
@@ -42,6 +43,13 @@ impl App {
                     message,
                 } => {
                     self.fail_split_out(&request_id, code, message);
+                }
+                WorkerEvent::DelegationIntegrated {
+                    request_id,
+                    delegation_id,
+                    result,
+                } => {
+                    self.finish_delegation_integration(request_id, delegation_id, result);
                 }
                 WorkerEvent::ScratchConversionCompleted { result } => {
                     self.scratch_conversion_in_flight = false;
@@ -1127,6 +1135,20 @@ impl App {
                 self.mark_session_desired_running(session_id, false);
             }
             self.mark_session_status(session_id, SessionStatus::Detached);
+            if let Some(delegation) = self.delegations.iter_mut().find(|delegation| {
+                delegation.child_session_id.as_deref() == Some(session_id.as_str())
+            }) && delegation.state.is_active()
+            {
+                delegation.state = DelegationState::Exited;
+                delegation.state_reason = Some(match exit_success {
+                    Some(true) => "child PTY exited without a finish report".to_string(),
+                    Some(false) => "child PTY exited with a non-zero status".to_string(),
+                    None => "child PTY exited without a finish report".to_string(),
+                });
+                delegation.finished_at = Some(Utc::now());
+                delegation.updated_at = Utc::now();
+                let _ = self.session_store.upsert_delegation(delegation);
+            }
         }
         if !exited.is_empty() {
             // If the currently-viewed session just exited (and was not retried),
@@ -1601,6 +1623,7 @@ impl App {
             focus_on_ready,
             handoff_prompt,
             project_added,
+            delegation_id,
         } = request.kind.clone()
         {
             self.create_agent_in_flight = false;
@@ -1634,6 +1657,28 @@ impl App {
             self.detach_conflicting_worktree_session(&session.worktree_path, &session.id);
             self.providers.insert(session.id.clone(), client);
             self.sessions.insert(0, session.clone());
+            if let Some(delegation_id) = delegation_id.as_deref()
+                && let Some(delegation) = self
+                    .delegations
+                    .iter_mut()
+                    .find(|delegation| delegation.id == delegation_id)
+            {
+                delegation.child_session_id = Some(session.id.clone());
+                if matches!(
+                    delegation.state,
+                    DelegationState::Queued
+                        | DelegationState::Preparing
+                        | DelegationState::Starting
+                        | DelegationState::Interrupted
+                        | DelegationState::Resuming
+                ) {
+                    delegation.state = DelegationState::Running;
+                    delegation.state_reason = None;
+                }
+                delegation.started_at = Some(Utc::now());
+                delegation.updated_at = Utc::now();
+                let _ = self.session_store.upsert_delegation(delegation);
+            }
             if let Some(pr) = request.source_pr.as_ref()
                 && let Err(err) = self.link_imported_pull_request(&session.id, pr)
             {
@@ -1733,6 +1778,7 @@ impl App {
                 ));
             } else {
                 self.set_info(status_message);
+                self.pump_delegation_queue();
             }
             return;
         }
@@ -2067,6 +2113,7 @@ impl App {
                 ));
                 self.mark_session_status(&session.id, SessionStatus::Detached);
             }
+            self.pump_delegation_queue();
             return;
         }
 
@@ -2084,6 +2131,7 @@ impl App {
                     );
                 } else {
                     self.set_error(message);
+                    self.pump_delegation_queue();
                 }
             }
             AgentLaunchKind::Reconnect { .. } => {
@@ -2606,6 +2654,9 @@ impl App {
                 let Some(watched_worktree) = watched_worktree else {
                     continue;
                 };
+                if watched_worktree.fetch_branch.trim().is_empty() {
+                    continue;
+                }
                 if let Err(err) =
                     git::fetch_origin_branch(&watched_worktree.path, &watched_worktree.fetch_branch)
                 {
@@ -3982,6 +4033,7 @@ pub(crate) fn run_create_agent_job(
             focus_on_ready: true,
             handoff_prompt: None,
             project_added: false,
+            delegation_id: None,
         },
     };
     run_agent_launch_job(request, worker_tx);
@@ -4898,20 +4950,27 @@ fn send_split_out_failure(
 }
 
 pub(crate) fn run_split_out_prepare_job(
-    request_id: String,
-    params: SplitOutParams,
-    source_session: Option<AgentSession>,
-    projects: Vec<Project>,
-    config: Config,
-    paths: DuxPaths,
+    request: SplitOutPrepareRequest,
     worker_tx: Sender<WorkerEvent>,
 ) {
+    let SplitOutPrepareRequest {
+        request_id,
+        delegation_id,
+        depth,
+        brief_path,
+        params,
+        source_session,
+        projects,
+        sessions,
+        config,
+        paths,
+    } = request;
     let Some(source_session) = source_session else {
         send_split_out_failure(
             &worker_tx,
             &request_id,
             "invalid_source",
-            "split-out requires a source agent session.",
+            "delegation requires a source agent session.",
         );
         return;
     };
@@ -4993,12 +5052,17 @@ pub(crate) fn run_split_out_prepare_job(
                 }
             }
         }
+    } else if let Some(project) = projects
+        .iter()
+        .find(|project| project.id == source_session.project_id)
+    {
+        (project.clone(), false)
     } else {
         send_split_out_failure(
             &worker_tx,
             &request_id,
             "invalid_request",
-            "split-out requires --repo <path> or --project <id|name>.",
+            "delegation requires --repo <path>, --project <id|name>, or a source project.",
         );
         return;
     };
@@ -5038,13 +5102,47 @@ pub(crate) fn run_split_out_prepare_job(
         return;
     }
 
-    let base_branch = match resolve_split_out_base(&repo_path, &project, params.base.as_deref()) {
-        Ok(branch) => branch,
+    let source_repo_path = source_session
+        .project_path
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| {
+            projects
+                .iter()
+                .find(|project| project.id == source_session.project_id)
+                .map(|project| PathBuf::from(&project.path))
+        });
+    let same_repo = source_repo_path.as_deref().is_some_and(|source_path| {
+        let canonical_source = source_path
+            .canonicalize()
+            .unwrap_or_else(|_| source_path.to_path_buf());
+        canonical_source == repo_path
+    });
+    if same_repo && !config.orchestration.allow_same_repo {
+        send_split_out_failure(
+            &worker_tx,
+            &request_id,
+            "policy_rejected",
+            "Same-repo delegation is disabled by [orchestration] allow_same_repo.",
+        );
+        return;
+    }
+    let (base_ref, base_label) = match resolve_delegation_base(
+        &repo_path,
+        &project,
+        &source_session,
+        &sessions,
+        same_repo,
+        &params,
+        &config,
+    ) {
+        Ok(base) => base,
         Err(err) => {
             send_split_out_failure(&worker_tx, &request_id, "invalid_base", err.to_string());
             return;
         }
     };
+    let base_branch = base_label.clone();
     if project_is_new {
         project.leading_branch = Some(base_branch.clone());
     }
@@ -5096,7 +5194,7 @@ pub(crate) fn run_split_out_prepare_job(
         .map(|prompt| prompt.trim_end().to_string())
         .filter(|prompt| !prompt.trim().is_empty());
     if let Some(prompt) = prompt.as_deref()
-        && prompt.len() > crate::ipc::MAX_CONTROL_MESSAGE_BYTES
+        && prompt.len() > config.orchestration.brief_max_bytes
     {
         send_split_out_failure(
             &worker_tx,
@@ -5105,7 +5203,7 @@ pub(crate) fn run_split_out_prepare_job(
             format!(
                 "Handoff prompt is too large ({} bytes, limit {}).",
                 prompt.len(),
-                crate::ipc::MAX_CONTROL_MESSAGE_BYTES
+                config.orchestration.brief_max_bytes
             ),
         );
         return;
@@ -5115,15 +5213,278 @@ pub(crate) fn run_split_out_prepare_job(
     let _ = worker_tx.send(WorkerEvent::SplitOutPrepared {
         plan: Box::new(SplitOutPlan {
             request_id,
+            delegation_id,
             source_session_id,
             project,
             project_is_new,
             base_branch: Some(base_branch),
+            base_ref: Some(base_ref),
+            base_label,
+            depth,
+            brief_path,
             name: Some(name),
             provider: Some(provider),
-            prompt,
         }),
     });
+}
+
+fn resolve_delegation_base(
+    repo_path: &Path,
+    project: &Project,
+    source: &AgentSession,
+    sessions: &[AgentSession],
+    same_repo: bool,
+    params: &SplitOutParams,
+    config: &Config,
+) -> Result<(String, String)> {
+    let default_mode = if same_repo {
+        config.orchestration.same_repo_default_base.as_str()
+    } else {
+        config.orchestration.cross_repo_default_base.as_str()
+    };
+    let mode = if let Some(raw) = params.base_mode.as_deref() {
+        BaseMode::from_str(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown --base-mode \"{raw}\". Use leading, ref, parent-head, parent-snapshot, or sibling-head."
+            )
+        })?
+    } else {
+        BaseMode::from_str(default_mode).unwrap_or(BaseMode::Leading)
+    };
+    if mode.requires_same_repo() && !same_repo {
+        bail!(
+            "base mode {} requires the target to be the parent's own repository.",
+            mode.as_str()
+        );
+    }
+    match mode {
+        BaseMode::Leading => {
+            let branch = match params.base.as_deref() {
+                Some(base) => base.to_string(),
+                None => resolve_split_out_base(repo_path, project, None)?,
+            };
+            let sha = resolve_ref_sha(repo_path, &branch)?;
+            Ok((sha, branch))
+        }
+        BaseMode::Ref => {
+            let base = params
+                .base
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--base-mode ref requires --base <ref>."))?;
+            let sha = resolve_ref_sha(repo_path, base)?;
+            Ok((sha, base.to_string()))
+        }
+        BaseMode::ParentHead => {
+            let sha = git::head_commit(Path::new(&source.worktree_path))?;
+            Ok((
+                sha.clone(),
+                format!("parent: {} @ {}", source.branch_name, short_sha(&sha)),
+            ))
+        }
+        BaseMode::ParentSnapshot => {
+            if !config.orchestration.allow_parent_snapshot {
+                bail!("parent-snapshot is disabled by [orchestration] allow_parent_snapshot.");
+            }
+            let sha = git::snapshot_worktree_commit(Path::new(&source.worktree_path))?;
+            Ok((
+                sha.clone(),
+                format!("parent snapshot @ {}", short_sha(&sha)),
+            ))
+        }
+        BaseMode::SiblingHead => {
+            let sibling_id = params.base_session.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--base-mode sibling-head requires --base-session <id>.")
+            })?;
+            let sibling = sessions
+                .iter()
+                .find(|session| session.id == sibling_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("sibling session \"{sibling_id}\" was not found.")
+                })?;
+            if sibling.project_id != source.project_id {
+                bail!("sibling-head requires a sibling in the same repository.");
+            }
+            let sha = git::head_commit(Path::new(&sibling.worktree_path))?;
+            Ok((
+                sha.clone(),
+                format!("sibling: {} @ {}", sibling.branch_name, short_sha(&sha)),
+            ))
+        }
+    }
+}
+
+fn resolve_ref_sha(repo_path: &Path, reference: &str) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--verify",
+            &format!("{reference}^{{commit}}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "base ref \"{reference}\" does not resolve to a commit in {}",
+            repo_path.display()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+pub(crate) fn run_delegation_integrate_job(
+    request_id: String,
+    delegation: Delegation,
+    child: AgentSession,
+    parent: AgentSession,
+    project: Project,
+    worker_tx: Sender<WorkerEvent>,
+) {
+    let result = (|| -> Result<DelegationIntegrationOutcome> {
+        let parent_path = PathBuf::from(&parent.worktree_path);
+        let child_path = PathBuf::from(&child.worktree_path);
+        if !worktree_is_clean(&parent_path)? {
+            bail!(
+                "Parent worktree {} has uncommitted changes. Commit or stash them before integrating.",
+                parent_path.display()
+            );
+        }
+        if !worktree_is_clean(&child_path)? {
+            bail!(
+                "Delegated worktree {} has uncommitted changes. Commit them before integrating.",
+                child_path.display()
+            );
+        }
+        if delegation.base_mode == BaseMode::ParentSnapshot {
+            let base = delegation
+                .base_ref
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("snapshot delegation has no base ref"))?;
+            let diff = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    child_path.to_string_lossy().as_ref(),
+                    "diff",
+                    "--binary",
+                    base,
+                    &child.branch_name,
+                ])
+                .output()?;
+            if !diff.status.success() {
+                bail!(
+                    "Could not compute the delegated patch: {}",
+                    String::from_utf8_lossy(&diff.stderr).trim()
+                );
+            }
+            let mut apply = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    parent_path.to_string_lossy().as_ref(),
+                    "apply",
+                    "--binary",
+                    "--3way",
+                    "-",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            if let Some(stdin) = apply.stdin.as_mut() {
+                use std::io::Write;
+                stdin.write_all(&diff.stdout)?;
+            }
+            let output = apply.wait_with_output()?;
+            if !output.status.success() {
+                let _ = std::process::Command::new("git")
+                    .args([
+                        "-C",
+                        parent_path.to_string_lossy().as_ref(),
+                        "apply",
+                        "--abort",
+                    ])
+                    .output();
+                bail!(
+                    "Patch integration failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            return Ok(DelegationIntegrationOutcome {
+                commit: None,
+                strategy: "patch".to_string(),
+                message: format!(
+                    "Applied delegated patch from \"{}\" into \"{}\". Review and commit the changes.",
+                    child.branch_name, parent.branch_name
+                ),
+            });
+        }
+        let output = std::process::Command::new("git")
+            .args([
+                "-C",
+                parent_path.to_string_lossy().as_ref(),
+                "merge",
+                "--no-ff",
+                &child.branch_name,
+            ])
+            .output()?;
+        if !output.status.success() {
+            let _ = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    parent_path.to_string_lossy().as_ref(),
+                    "merge",
+                    "--abort",
+                ])
+                .output();
+            bail!(
+                "Merge failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let commit = git::head_commit(&parent_path).ok();
+        Ok(DelegationIntegrationOutcome {
+            commit: commit.clone(),
+            strategy: "merge".to_string(),
+            message: format!(
+                "Merged delegated branch \"{}\" into \"{}\"{}.",
+                child.branch_name,
+                parent.branch_name,
+                commit
+                    .as_deref()
+                    .map(|sha| format!(" ({})", short_sha(sha)))
+                    .unwrap_or_default()
+            ),
+        })
+    })();
+    let _ = worker_tx.send(WorkerEvent::DelegationIntegrated {
+        request_id,
+        delegation_id: delegation.id,
+        result: result.map_err(|err| format!("{err:#}")),
+    });
+    let _ = project;
+}
+
+fn worktree_is_clean(path: &Path) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            path.to_string_lossy().as_ref(),
+            "status",
+            "--porcelain=v1",
+            "-z",
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "git status failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout.is_empty())
 }
 
 fn resolve_split_out_repo(raw: &str) -> Result<PathBuf> {
@@ -5197,12 +5558,18 @@ fn resolve_split_out_base(
         Some("main".to_string()),
     ];
     for candidate in candidates.into_iter().flatten() {
-        if !candidate.trim().is_empty() && git::local_branch_exists(repo_path, &candidate) {
+        if candidate.trim().is_empty() {
+            continue;
+        }
+        if git::local_branch_exists(repo_path, &candidate) {
             return Ok(candidate);
+        }
+        if let Some(remote) = git::remote_tracking_ref_for_branch(repo_path, &candidate) {
+            return Ok(remote);
         }
     }
     Err(anyhow::anyhow!(
-        "could not find a local base branch in {}. Pass --base <branch>.",
+        "could not find a local or origin base branch in {}. Pass --base <branch>.",
         repo_path.display()
     ))
 }
@@ -5257,20 +5624,27 @@ pub(crate) fn run_split_out_create_job(
 ) {
     let SplitOutCreateRequest {
         request_id,
+        delegation_id,
         source_session_id,
+        source_session,
         group_id,
         parent_session_id,
+        depth,
+        brief_path,
         project,
         name,
         base_branch,
+        base_ref,
+        base_label,
         provider,
         handoff_prompt,
         project_added,
     } = request;
     let _ = source_session_id;
     let repo_path = PathBuf::from(&project.path);
+    let start_point = base_ref.clone().unwrap_or(base_branch.clone());
     let progress = format!(
-        "Creating related worktree \"{name}\" in project \"{}\" from \"{base_branch}\"...",
+        "Creating delegated worktree \"{name}\" in project \"{}\" from \"{base_label}\"...",
         project.name
     );
     let _ = worker_tx.send(WorkerEvent::CreateAgentProgress(progress));
@@ -5292,7 +5666,7 @@ pub(crate) fn run_split_out_create_job(
         &repo_path,
         &paths.worktrees_root,
         &project.name,
-        Some(&base_branch),
+        Some(&start_point),
         Some(&name),
     ) {
         Ok(result) => result,
@@ -5352,7 +5726,7 @@ pub(crate) fn run_split_out_create_job(
         project_id: project.id.clone(),
         project_path: Some(project.path.clone()),
         provider: provider.clone(),
-        source_branch: base_branch.clone(),
+        source_branch: base_label.clone(),
         branch_name: branch_name.clone(),
         worktree_path: worktree_path.to_string_lossy().to_string(),
         title: None,
@@ -5361,12 +5735,21 @@ pub(crate) fn run_split_out_create_job(
         desired_running: true,
         auto_reopen_enabled: true,
         status: SessionStatus::Active,
-        group_id: Some(group_id),
-        parent_session_id: Some(parent_session_id),
+        group_id: Some(group_id.clone()),
+        parent_session_id: Some(parent_session_id.clone()),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
     env.extend(super::control::agent_control_env(&paths, &session));
+    env.extend(super::control::delegation_control_env(
+        &paths,
+        &delegation_id,
+        &group_id,
+        &parent_session_id,
+        depth,
+        &brief_path,
+        &source_session,
+    ));
 
     let startup_result = project
         .startup_command
@@ -5410,7 +5793,7 @@ pub(crate) fn run_split_out_create_job(
     )));
     let (cols, rows) = term_size;
     let status_message = format!(
-        "Created related agent \"{}\" in project \"{}\". Find it under Multi-repo work.",
+        "Created related agent \"{}\" in project \"{}\". Find it under Delegated work.",
         branch_name, project.name
     );
     let request = AgentLaunchRequest {
@@ -5432,6 +5815,7 @@ pub(crate) fn run_split_out_create_job(
             focus_on_ready: false,
             handoff_prompt,
             project_added,
+            delegation_id: Some(delegation_id),
         },
     };
     run_agent_launch_job(request, worker_tx);
@@ -5590,17 +5974,23 @@ mod tests {
         let source = test_session(&tmp.path().join("source"));
         let (tx, rx) = mpsc::channel();
         run_split_out_prepare_job(
-            "request-1".to_string(),
-            SplitOutParams {
-                source_session_id: Some(source.id.clone()),
-                repo: Some(repo.to_string_lossy().to_string()),
-                name: Some("cross-repo-work".to_string()),
-                ..Default::default()
+            SplitOutPrepareRequest {
+                request_id: "request-1".to_string(),
+                delegation_id: "delegation-1".to_string(),
+                depth: 1,
+                brief_path: String::new(),
+                params: SplitOutParams {
+                    source_session_id: Some(source.id.clone()),
+                    repo: Some(repo.to_string_lossy().to_string()),
+                    name: Some("cross-repo-work".to_string()),
+                    ..Default::default()
+                },
+                source_session: Some(source),
+                projects: Vec::new(),
+                sessions: Vec::new(),
+                config: Config::default(),
+                paths,
             },
-            Some(source),
-            Vec::new(),
-            Config::default(),
-            paths,
             tx,
         );
 
@@ -5613,6 +6003,169 @@ mod tests {
         assert_eq!(plan.base_branch.as_deref(), Some("main"));
         assert_eq!(plan.name.as_deref(), Some("cross-repo-work"));
         assert_eq!(plan.source_session_id, "session-1");
+    }
+
+    #[test]
+    fn delegation_integration_merges_a_clean_child_into_the_parent() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "dux@example.com"]);
+        run_git(&repo, &["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        let parent_worktree = repo.join("parent-worktree");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "parent-branch",
+                parent_worktree.to_string_lossy().as_ref(),
+            ],
+        );
+        let child_worktree = repo.join("child-worktree");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "child-branch",
+                child_worktree.to_string_lossy().as_ref(),
+                "parent-branch",
+            ],
+        );
+        std::fs::write(child_worktree.join("child.txt"), "child work\n").expect("write");
+        run_git(&child_worktree, &["add", "."]);
+        run_git(&child_worktree, &["commit", "-m", "child work"]);
+
+        let project = test_project(&repo);
+        let mut parent = test_session(&parent_worktree);
+        parent.project_id = project.id.clone();
+        parent.worktree_path = parent_worktree.to_string_lossy().to_string();
+        parent.branch_name = "parent-branch".to_string();
+        let mut child = test_session(&child_worktree);
+        child.project_id = project.id.clone();
+        child.worktree_path = child_worktree.to_string_lossy().to_string();
+        child.branch_name = "child-branch".to_string();
+        child.parent_session_id = Some(parent.id.clone());
+        let delegation = Delegation {
+            id: "delegation-integrate".to_string(),
+            group_id: "group-1".to_string(),
+            parent_session_id: parent.id.clone(),
+            child_session_id: Some(child.id.clone()),
+            depth: 1,
+            iteration: 1,
+            title: "Integrate child".to_string(),
+            request_key: None,
+            brief_path: String::new(),
+            project_id: Some(project.id.clone()),
+            repo_path: Some(repo.to_string_lossy().to_string()),
+            base_mode: BaseMode::ParentHead,
+            base_ref: Some(git::head_commit(&parent_worktree).unwrap()),
+            base_label: Some("parent".to_string()),
+            requested_name: Some("child-branch".to_string()),
+            provider: None,
+            state: DelegationState::Completed,
+            state_reason: None,
+            result_id: None,
+            result_status: None,
+            result_summary: None,
+            result_path: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: None,
+            finished_at: Some(Utc::now()),
+            integrated_at: None,
+            integration_commit: None,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        run_delegation_integrate_job(
+            "request-integrate".to_string(),
+            delegation,
+            child,
+            parent,
+            project,
+            tx,
+        );
+        let event = rx.recv_timeout(Duration::from_secs(5)).expect("event");
+        let WorkerEvent::DelegationIntegrated { result, .. } = event else {
+            panic!("expected DelegationIntegrated, got a different event");
+        };
+        let outcome = result.expect("integration should succeed");
+        assert_eq!(outcome.strategy, "merge");
+        assert!(parent_worktree.join("child.txt").exists());
+    }
+
+    #[test]
+    fn split_out_prepare_uses_parent_head_for_same_repo_delegation() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "dux@example.com"]);
+        run_git(&repo, &["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        let parent_worktree = repo.join("parent-worktree");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "parent-branch",
+                parent_worktree.to_string_lossy().as_ref(),
+            ],
+        );
+        let expected_head = git::head_commit(&parent_worktree).expect("parent head");
+
+        let paths = test_paths(&tmp.path().join("dux-home"));
+        let project = test_project(&repo);
+        let mut source = test_session(&parent_worktree);
+        source.project_id = project.id.clone();
+        source.project_path = Some(repo.to_string_lossy().to_string());
+        source.worktree_path = parent_worktree.to_string_lossy().to_string();
+        source.branch_name = "parent-branch".to_string();
+
+        let (tx, rx) = mpsc::channel();
+        run_split_out_prepare_job(
+            SplitOutPrepareRequest {
+                request_id: "request-same-repo".to_string(),
+                delegation_id: "delegation-same-repo".to_string(),
+                depth: 1,
+                brief_path: String::new(),
+                params: SplitOutParams {
+                    source_session_id: Some(source.id.clone()),
+                    name: Some("child-work".to_string()),
+                    base_mode: Some("parent-head".to_string()),
+                    ..Default::default()
+                },
+                source_session: Some(source.clone()),
+                projects: vec![project],
+                sessions: vec![source],
+                config: Config::default(),
+                paths,
+            },
+            tx,
+        );
+
+        let event = rx.recv_timeout(Duration::from_secs(2)).expect("event");
+        let WorkerEvent::SplitOutPrepared { plan } = event else {
+            panic!("expected SplitOutPrepared, got a different event");
+        };
+        assert_eq!(plan.base_ref.as_deref(), Some(expected_head.as_str()));
+        assert!(plan.base_label.starts_with("parent: parent-branch @"));
+        assert_eq!(plan.depth, 1);
     }
 
     #[test]
@@ -5633,17 +6186,23 @@ mod tests {
         let project = test_project(&repo);
         let (tx, rx) = mpsc::channel();
         run_split_out_prepare_job(
-            "request-2".to_string(),
-            SplitOutParams {
-                source_session_id: Some(source.id.clone()),
-                project: Some(project.id.clone()),
-                name: Some("taken".to_string()),
-                ..Default::default()
+            SplitOutPrepareRequest {
+                request_id: "request-2".to_string(),
+                delegation_id: "delegation-2".to_string(),
+                depth: 1,
+                brief_path: String::new(),
+                params: SplitOutParams {
+                    source_session_id: Some(source.id.clone()),
+                    project: Some(project.id.clone()),
+                    name: Some("taken".to_string()),
+                    ..Default::default()
+                },
+                source_session: Some(source),
+                projects: vec![project],
+                sessions: Vec::new(),
+                config: Config::default(),
+                paths,
             },
-            Some(source),
-            vec![project],
-            Config::default(),
-            paths,
             tx,
         );
 
@@ -5692,12 +6251,18 @@ mod tests {
         run_split_out_create_job(
             SplitOutCreateRequest {
                 request_id: "request-1".to_string(),
+                delegation_id: "delegation-1".to_string(),
                 source_session_id: source.id.clone(),
+                source_session: source.clone(),
                 group_id: "group-1".to_string(),
                 parent_session_id: source.id.clone(),
+                depth: 1,
+                brief_path: tmp.path().join("brief.md").to_string_lossy().to_string(),
                 project,
                 name: "linked-work".to_string(),
                 base_branch: "main".to_string(),
+                base_ref: Some("main".to_string()),
+                base_label: "main".to_string(),
                 provider: ProviderKind::from_str("fake"),
                 handoff_prompt: Some("do the work".to_string()),
                 project_added: true,

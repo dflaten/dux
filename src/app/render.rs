@@ -293,7 +293,7 @@ fn collapsed_project_icon(has_visible_sessions: bool, collapsed: bool) -> &'stat
 
 /// Whether two consecutive session rows belong to the same visual group.
 ///
-/// Sessions in the Multi-repo work section are grouped by their group id;
+/// Sessions in the Delegated work section are grouped by their group id;
 /// sessions in the project tree are grouped by their project id. Rows from
 /// different containers end the current connector run.
 fn session_rows_share_container(
@@ -329,7 +329,7 @@ fn session_row_is_last(
 
 /// The trailing `⇄ N` badge for a plain project-tree session row.
 ///
-/// Origins and split-out members are rendered inside the Multi-repo work
+/// Origins and split-out members are rendered inside the Delegated work
 /// section, so they never carry this badge; it only belongs on a session that
 /// is still shown under its project header.
 fn project_tree_related_badge_count(
@@ -355,6 +355,22 @@ fn pr_state_color(theme: &Theme, state: &crate::model::PrState) -> Color {
         crate::model::PrState::Open => theme.pr_open_label,
         crate::model::PrState::Merged => theme.pr_merged_label,
         crate::model::PrState::Closed => theme.pr_closed_label,
+    }
+}
+
+fn delegation_state_dot(theme: &Theme, state: crate::model::DelegationState) -> (String, Color) {
+    match state {
+        crate::model::DelegationState::Completed => ("✓".to_string(), theme.diff_add),
+        crate::model::DelegationState::Failed => ("✗".to_string(), theme.status_error_fg),
+        crate::model::DelegationState::Blocked => ("!".to_string(), theme.warning_fg),
+        crate::model::DelegationState::Cancelled => ("⊘".to_string(), theme.session_exited),
+        crate::model::DelegationState::Exited => ("○".to_string(), theme.session_exited),
+        crate::model::DelegationState::Interrupted => ("◐".to_string(), theme.session_detached),
+        crate::model::DelegationState::Running => ("●".to_string(), theme.session_active),
+        crate::model::DelegationState::Queued
+        | crate::model::DelegationState::Preparing
+        | crate::model::DelegationState::Starting
+        | crate::model::DelegationState::Resuming => ("◌".to_string(), theme.provider_label_fg),
     }
 }
 
@@ -405,7 +421,7 @@ fn left_section_separator_line(width: u16, theme: &Theme, label: &str) -> Line<'
     ])
 }
 
-/// The repository-name prefix on a Multi-repo work session row.
+/// The repository-name prefix on a Delegated work session row.
 ///
 /// Origins and split-out members both carry this prefix so the user can tell
 /// which repo each agent belongs to. It uses the same body-text color as the
@@ -865,7 +881,7 @@ impl App {
         };
         let projects_focused = focused && self.left_section == LeftSection::Projects;
         // Only split-out members count toward a project's related badge. Origins
-        // are the heading of their Multi-repo work group, so counting them here
+        // are the heading of their Delegated work group, so counting them here
         // would put a `⇄ 1` badge on a project that is listed as having no
         // agents.
         let related_counts: HashMap<String, usize> = self
@@ -951,20 +967,28 @@ impl App {
                 LeftItem::EmptyProjectsSpacer => ListItem::new(Line::from("")),
                 LeftItem::Session(index) => {
                     let session = &self.sessions[*index];
-                    let is_last = session_row_is_last(
-                        left_items,
-                        i,
-                        session,
-                        &self.sessions,
-                        &related_group_ids,
-                    );
+                    let is_related = self.session_is_related_member(session);
+                    let is_related_origin = self.session_is_related_origin(session);
+                    let is_last = if is_related {
+                        related_session_is_last_sibling(&self.sessions, session)
+                    } else {
+                        session_row_is_last(
+                            left_items,
+                            i,
+                            session,
+                            &self.sessions,
+                            &related_group_ids,
+                        )
+                    };
                     let connector = if is_last { "└ " } else { "├ " };
                     let label = session
                         .title
                         .clone()
                         .unwrap_or_else(|| session.branch_name.clone());
                     let (dot, dot_color) =
-                        if matches!(session.status, crate::model::SessionStatus::Active)
+                        if let Some(delegation) = self.delegation_for_session(&session.id) {
+                            delegation_state_dot(&self.theme, delegation.state)
+                        } else if matches!(session.status, crate::model::SessionStatus::Active)
                             && self.is_agent_streaming(&session.id)
                         {
                             let idx = self.spinner_frame_index();
@@ -1017,21 +1041,20 @@ impl App {
                         trailing_width += display_width(&format!(" ⇄ {count}"));
                     }
                     let dot_width = display_width(&format!("{dot} "));
-                    let is_related = self.session_is_related_member(session);
-                    let is_related_origin = self.session_is_related_origin(session);
                     let mut spans = if is_related_origin {
                         vec![Span::styled(
                             "⇄ ",
                             Style::default().fg(self.theme.related_link_fg),
                         )]
                     } else {
-                        let connector = if is_related {
-                            format!("  {connector}")
+                        let depth = related_session_depth(&self.sessions, session);
+                        let indent = if is_related {
+                            "  ".repeat(depth.max(1))
                         } else {
-                            connector.to_string()
+                            String::new()
                         };
                         vec![Span::styled(
-                            connector,
+                            format!("{indent}{connector}"),
                             Style::default().fg(self.theme.project_icon),
                         )]
                     };
@@ -1124,7 +1147,7 @@ impl App {
                 LeftItem::RelatedSeparator => ListItem::new(left_section_separator_line(
                     projects_inner_width,
                     &self.theme,
-                    "Multi-repo work",
+                    "Delegated work",
                 )),
                 LeftItem::RelatedGroupLabel(group_index) => {
                     let group = &self.groups[*group_index];
@@ -2073,6 +2096,25 @@ impl App {
 
         let focused = self.focus == FocusPane::Files;
 
+        let delegation_rows = self
+            .selected_session()
+            .map(|session| self.delegation_subtree(&session.id))
+            .unwrap_or_default();
+        if !delegation_rows.is_empty() {
+            let content_rows = delegation_rows.len().min(6);
+            let desired_height = (content_rows + 2) as u16;
+            let available = area.height.saturating_sub(3);
+            let delegation_height = desired_height.min(available);
+            if delegation_height >= 3 {
+                let [delegation_area, remaining] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(delegation_height), Constraint::Min(3)])
+                    .areas(area);
+                self.render_delegation_section(frame, delegation_area, &delegation_rows);
+                area = remaining;
+            }
+        }
+
         let pr_rows = self.selected_pr_section_rows();
         if !pr_rows.is_empty() {
             let max_rows = usize::from(self.config.ui.pr_section_max_rows.max(1));
@@ -2134,6 +2176,60 @@ impl App {
             self.mouse_layout.commit_area = None;
             self.mouse_layout.commit_text_area = None;
         }
+    }
+
+    fn render_delegation_section(&self, frame: &mut Frame, area: Rect, rows: &[Delegation]) {
+        let title = format!("Delegations ({})", rows.len());
+        let block = self.themed_block(&title, false);
+        let inner = block.inner(area);
+        block.render(area, frame.buffer_mut());
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let items = rows
+            .iter()
+            .map(|delegation| {
+                let indent = "  ".repeat(delegation.depth.saturating_sub(1) as usize);
+                let (glyph, color) = delegation_state_dot(&self.theme, delegation.state);
+                let project = delegation
+                    .project_id
+                    .as_deref()
+                    .and_then(|id| self.projects.iter().find(|project| project.id == id))
+                    .map(|project| project.name.as_str())
+                    .unwrap_or("-");
+                let branch = delegation
+                    .child_session_id
+                    .as_deref()
+                    .and_then(|id| self.sessions.iter().find(|session| session.id == id))
+                    .map(|session| session.branch_name.as_str())
+                    .or(delegation.base_label.as_deref())
+                    .unwrap_or("-");
+                let mut spans = vec![
+                    Span::styled(indent, Style::default().fg(self.theme.project_icon)),
+                    Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                    Span::styled(
+                        delegation.label().to_string(),
+                        Style::default().fg(self.theme.text_fg),
+                    ),
+                    Span::styled(
+                        format!(" · {project} · {} · {branch}", delegation.state.as_str()),
+                        Style::default().fg(self.theme.hint_dim_desc_fg),
+                    ),
+                ];
+                if let Some(summary) = delegation.result_summary.as_deref() {
+                    spans.push(Span::styled(
+                        format!(" · {summary}"),
+                        Style::default().fg(self.theme.hint_desc_fg),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect::<Vec<_>>();
+        Widget::render(
+            List::new(items).block(Block::default()),
+            inner,
+            frame.buffer_mut(),
+        );
     }
 
     fn render_pull_request_section(
@@ -9160,7 +9256,7 @@ mod tests {
 
         assert!(
             !has_visible_sessions,
-            "the origin moved into Multi-repo work, so its project has no visible sessions"
+            "the origin moved into Delegated work, so its project has no visible sessions"
         );
         assert_eq!(collapsed_project_icon(has_visible_sessions, false), "▸");
         assert_eq!(collapsed_project_icon(has_visible_sessions, true), "▸");
@@ -9258,7 +9354,7 @@ mod tests {
         assert_eq!(
             project_tree_related_badge_count(&sessions[1], &sessions, &related_group_ids),
             None,
-            "split-out members are already inside Multi-repo work"
+            "split-out members are already inside Delegated work"
         );
     }
 
@@ -9271,8 +9367,8 @@ mod tests {
             "────────── Scratch ───────────"
         );
         assert_eq!(
-            line_text(&left_section_separator_line(30, &theme, "Multi-repo work")),
-            "────── Multi-repo work ───────"
+            line_text(&left_section_separator_line(30, &theme, "Delegated work")),
+            "─────── Delegated work ───────"
         );
     }
 
@@ -9301,7 +9397,7 @@ mod tests {
         assert_ne!(
             span.style.fg,
             Some(theme.hint_dim_desc_fg),
-            "repo names in Multi-repo work must not be faded like hint text"
+            "repo names in Delegated work must not be faded like hint text"
         );
     }
 

@@ -20,6 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::model::DelegationResult;
+
 pub const CONTROL_PROTOCOL: u32 = 1;
 
 /// Maximum accepted request or response size. Prompts can be large, but not
@@ -30,7 +32,7 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum number of simultaneously connected control clients.
-const MAX_CONTROL_CONNECTIONS: usize = 8;
+const MAX_CONTROL_CONNECTIONS: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -44,6 +46,115 @@ impl ControlRequest {
         Self {
             protocol: CONTROL_PROTOCOL,
             command: ControlCommand::SplitOut(params),
+        }
+    }
+
+    pub fn delegate(params: SplitOutParams) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::Delegate(params),
+        }
+    }
+
+    pub fn delegation_status(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationStatus {
+                source_session_id,
+                session_id,
+                delegation_id,
+            },
+        }
+    }
+
+    pub fn delegation_result(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationResult {
+                source_session_id,
+                session_id,
+                delegation_id,
+            },
+        }
+    }
+
+    pub fn delegation_finish(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        result: DelegationResult,
+        result_path: Option<String>,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationFinish {
+                source_session_id,
+                session_id,
+                delegation_id,
+                result,
+                result_path,
+            },
+        }
+    }
+
+    pub fn delegation_followup(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        text: String,
+        submit: bool,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationFollowup {
+                source_session_id,
+                session_id,
+                delegation_id,
+                text,
+                submit,
+            },
+        }
+    }
+
+    pub fn delegation_cancel(
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        subtree: bool,
+    ) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationCancel {
+                source_session_id,
+                session_id,
+                delegation_id,
+                subtree,
+            },
+        }
+    }
+
+    pub fn delegation_retry(delegation_id: String) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationRetry { delegation_id },
+        }
+    }
+
+    pub fn delegation_integrate(source_session_id: Option<String>, session_id: String) -> Self {
+        Self {
+            protocol: CONTROL_PROTOCOL,
+            command: ControlCommand::DelegationIntegrate {
+                source_session_id,
+                session_id,
+            },
         }
     }
 
@@ -76,6 +187,44 @@ impl ControlRequest {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlCommand {
     SplitOut(SplitOutParams),
+    Delegate(SplitOutParams),
+    DelegationStatus {
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+    },
+    DelegationResult {
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+    },
+    DelegationFinish {
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        result: DelegationResult,
+        result_path: Option<String>,
+    },
+    DelegationFollowup {
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        text: String,
+        submit: bool,
+    },
+    DelegationCancel {
+        source_session_id: Option<String>,
+        session_id: Option<String>,
+        delegation_id: Option<String>,
+        subtree: bool,
+    },
+    DelegationRetry {
+        delegation_id: String,
+    },
+    DelegationIntegrate {
+        source_session_id: Option<String>,
+        session_id: String,
+    },
     Related {
         source_session_id: Option<String>,
     },
@@ -118,7 +267,7 @@ pub struct SplitOutParams {
     pub project: Option<String>,
     /// Branch and worktree name. Generated when omitted.
     pub name: Option<String>,
-    /// Base branch. Defaults to the target project's leading branch.
+    /// Base branch or ref. Defaults to the target project's leading branch.
     pub base: Option<String>,
     /// Provider override. Defaults to the target project's default provider.
     pub provider: Option<String>,
@@ -126,6 +275,29 @@ pub struct SplitOutParams {
     pub prompt: Option<String>,
     /// Client-side timeout in milliseconds. Informational for the server.
     pub timeout_ms: Option<u64>,
+    /// Human-readable delegation title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Base mode: leading, ref, parent-head, parent-snapshot, sibling-head.
+    #[serde(default)]
+    pub base_mode: Option<String>,
+    /// Sibling session for sibling-head.
+    #[serde(default)]
+    pub base_session: Option<String>,
+    /// Idempotency key. Defaults to the requested branch name.
+    #[serde(default)]
+    pub request_key: Option<String>,
+    /// Leave the child queued and return immediately when true.
+    #[serde(default)]
+    pub no_wait: bool,
+    /// Caller explicitly asked to wait for launch (legacy split-out behavior).
+    #[serde(default)]
+    pub wait_for_launch: bool,
+    /// Brief staged by the CLI under <config>/delegations/pending.
+    #[serde(default)]
+    pub brief_path: Option<String>,
+    #[serde(default)]
+    pub brief_sha256: Option<String>,
 }
 
 impl SplitOutParams {
@@ -139,10 +311,17 @@ impl SplitOutParams {
 impl ControlCommand {
     pub fn timeout(&self) -> Duration {
         match self {
-            Self::SplitOut(params) => params.timeout(),
-            Self::Related { .. } | Self::PullRequests { .. } | Self::LinkPullRequest { .. } => {
-                DEFAULT_CONTROL_TIMEOUT
-            }
+            Self::SplitOut(params) | Self::Delegate(params) => params.timeout(),
+            Self::Related { .. }
+            | Self::PullRequests { .. }
+            | Self::LinkPullRequest { .. }
+            | Self::DelegationStatus { .. }
+            | Self::DelegationResult { .. }
+            | Self::DelegationFinish { .. }
+            | Self::DelegationFollowup { .. }
+            | Self::DelegationCancel { .. }
+            | Self::DelegationRetry { .. }
+            | Self::DelegationIntegrate { .. } => DEFAULT_CONTROL_TIMEOUT,
         }
     }
 }
@@ -158,6 +337,37 @@ pub struct RelatedAgentInfo {
     pub provider: String,
     pub status: String,
     pub is_origin: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct DelegationInfo {
+    pub id: String,
+    pub parent_session_id: String,
+    pub child_session_id: Option<String>,
+    pub title: String,
+    pub state: String,
+    pub state_reason: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub base_mode: String,
+    pub base_ref: Option<String>,
+    pub base_label: Option<String>,
+    pub depth: u32,
+    pub iteration: u32,
+    pub provider: Option<String>,
+    pub result_status: Option<String>,
+    pub result_summary: Option<String>,
+    pub result_path: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub integrated_at: Option<String>,
+    pub integration_commit: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,6 +398,16 @@ pub struct ControlResponse {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<RelatedAgentInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -236,6 +456,11 @@ impl Default for ControlResponse {
             worktree: None,
             provider: None,
             status: None,
+            delegation_id: None,
+            delegation_state: None,
+            result_summary: None,
+            result_path: None,
+            delegations: Vec::new(),
             related: Vec::new(),
             pull_requests: Vec::new(),
         }
@@ -533,37 +758,6 @@ pub fn send_request(
         );
     }
     Ok(response)
-}
-
-/// Read a whole prompt from a file, or stdin when `path` is `-`.
-pub fn read_prompt_file(path: &str) -> Result<String> {
-    let mut text = String::new();
-    if path == "-" {
-        std::io::stdin()
-            .take(MAX_CONTROL_MESSAGE_BYTES as u64 + 1)
-            .read_to_string(&mut text)
-            .context("failed to read prompt from stdin")?;
-    } else {
-        if let Ok(metadata) = fs::metadata(path)
-            && metadata.len() > MAX_CONTROL_MESSAGE_BYTES as u64
-        {
-            bail!(
-                "prompt file {path} is too large ({} bytes, limit {})",
-                metadata.len(),
-                MAX_CONTROL_MESSAGE_BYTES
-            );
-        }
-        text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read prompt file {path}"))?;
-    }
-    if text.len() > MAX_CONTROL_MESSAGE_BYTES {
-        bail!(
-            "prompt is too large ({} bytes, limit {})",
-            text.len(),
-            MAX_CONTROL_MESSAGE_BYTES
-        );
-    }
-    Ok(text)
 }
 
 #[cfg(test)]

@@ -916,12 +916,18 @@ impl App {
         match request {
             CreateAgentRequest::SplitOut {
                 request_id,
+                delegation_id,
                 source_session_id,
+                source_session,
                 group_id,
                 parent_session_id,
+                depth,
+                brief_path,
                 project,
                 custom_name,
                 base_branch,
+                base_ref,
+                base_label,
                 provider,
                 handoff_prompt,
                 project_added,
@@ -933,12 +939,18 @@ impl App {
                 let provider = provider.unwrap_or_else(|| project.default_provider.clone());
                 let request = SplitOutCreateRequest {
                     request_id,
+                    delegation_id,
                     source_session_id,
+                    source_session: *source_session,
                     group_id,
                     parent_session_id,
+                    depth,
+                    brief_path,
                     project,
                     name,
                     base_branch,
+                    base_ref,
+                    base_label,
                     provider,
                     handoff_prompt,
                     project_added,
@@ -1362,7 +1374,14 @@ impl App {
         let projects = self.projects.clone();
         let worktrees_root = self.paths.worktrees_root.clone();
         let scratch_root = self.paths.scratch_root();
-        let active_session_ids = self.providers.keys().cloned().collect();
+        let mut active_session_ids: std::collections::HashSet<String> =
+            self.providers.keys().cloned().collect();
+        active_session_ids.extend(
+            self.delegations
+                .iter()
+                .filter(|delegation| delegation.state.is_active())
+                .filter_map(|delegation| delegation.child_session_id.clone()),
+        );
         let tx = self.worker_tx.clone();
         self.set_busy(
             "Scanning for inactive dux-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes.",
@@ -1409,7 +1428,14 @@ impl App {
         &self,
         now: chrono::DateTime<Utc>,
     ) -> Vec<WorktreeCleanupCandidate> {
-        let active_session_ids = self.providers.keys().cloned().collect();
+        let mut active_session_ids: std::collections::HashSet<String> =
+            self.providers.keys().cloned().collect();
+        active_session_ids.extend(
+            self.delegations
+                .iter()
+                .filter(|delegation| delegation.state.is_active())
+                .filter_map(|delegation| delegation.child_session_id.clone()),
+        );
         build_worktree_cleanup_candidates(
             &self.paths.worktrees_root,
             &self.paths.scratch_root(),
@@ -2862,6 +2888,15 @@ impl App {
             );
             return Ok(());
         }
+        if self.delegations.iter().any(|delegation| {
+            delegation.project_id.as_deref() == Some(project.id.as_str())
+                && delegation.state.is_active()
+        }) {
+            self.set_error(
+                "Cancel this project's active delegations before removing or deleting the project.",
+            );
+            return Ok(());
+        }
         let has_sessions = self.sessions.iter().any(|s| s.project_id == project.id);
         let has_pending_restore = self
             .pending_restorations
@@ -2893,6 +2928,15 @@ impl App {
         if project.is_scratch() {
             self.set_error(
                 "The scratch workspace is built in and cannot be deleted. Delete individual scratch agents instead.",
+            );
+            return Ok(());
+        }
+        if self.delegations.iter().any(|delegation| {
+            delegation.project_id.as_deref() == Some(project.id.as_str())
+                && delegation.state.is_active()
+        }) {
+            self.set_error(
+                "Cancel this project's active delegations before removing or deleting the project.",
             );
             return Ok(());
         }
@@ -3913,6 +3957,9 @@ mod tests {
             sessions,
             archived_sessions: Vec::new(),
             groups: Vec::new(),
+            delegations: Vec::new(),
+            delegation_queue: std::collections::VecDeque::new(),
+            delegation_request_ids: std::collections::HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -4118,13 +4165,17 @@ mod tests {
         app.split_out_in_flight = true;
         app.handle_split_out_prepared(SplitOutPlan {
             request_id: "request-1".to_string(),
+            delegation_id: "delegation-1".to_string(),
             source_session_id: source.id.clone(),
             project,
             project_is_new: false,
             base_branch: Some("main".to_string()),
+            base_ref: Some("main".to_string()),
+            base_label: "main".to_string(),
+            depth: 1,
+            brief_path: "/tmp/brief.md".to_string(),
             name: Some("linked-work".to_string()),
             provider: Some(ProviderKind::from_str("fake")),
-            prompt: Some("do the work".to_string()),
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4176,6 +4227,187 @@ mod tests {
             "the origin should be the first-level row with the child underneath it"
         );
         assert!(!app.split_out_in_flight);
+    }
+
+    #[test]
+    fn delegate_request_creates_a_same_repo_child_from_parent_head() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "dux@example.com"]);
+        run_git(&["config", "user.name", "dux"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
+        let parent_worktree = repo.join("parent-worktree");
+        run_git(&[
+            "worktree",
+            "add",
+            "-b",
+            "parent-branch",
+            parent_worktree.to_string_lossy().as_ref(),
+        ]);
+        let expected_head = crate::git::head_commit(&parent_worktree).expect("head");
+
+        let project = make_project_at("project-1", "fake", &repo.to_string_lossy());
+        let mut source = make_session("source", "fake", parent_worktree.to_string_lossy().as_ref());
+        source.project_id = project.id.clone();
+        source.project_path = Some(repo.to_string_lossy().to_string());
+        source.branch_name = "parent-branch".to_string();
+        let mut app = test_app_with_sessions(vec![source], vec![project]);
+        app.config.providers.commands.insert(
+            "fake".to_string(),
+            crate::config::ProviderCommandConfig {
+                command: "true".to_string(),
+                oneshot_output: crate::config::OneshotOutput::Stdout,
+                ..Default::default()
+            },
+        );
+
+        let (tx, rx) = mpsc::channel();
+        app.handle_split_out_request(
+            crate::ipc::SplitOutParams {
+                source_session_id: Some("source".to_string()),
+                name: Some("child-delegation".to_string()),
+                title: Some("Child delegation".to_string()),
+                base_mode: Some("parent-head".to_string()),
+                prompt: Some("Do the child work.".to_string()),
+                wait_for_launch: false,
+                ..Default::default()
+            },
+            tx,
+        );
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("queued response");
+        assert!(response.ok, "delegate failed: {response:?}");
+        let delegation_id = response.delegation_id.expect("delegation id");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.drain_events();
+            if let Some(delegation) = app
+                .delegations
+                .iter()
+                .find(|delegation| delegation.id == delegation_id)
+                && delegation.child_session_id.is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delegation did not launch in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let delegation = app
+            .delegations
+            .iter()
+            .find(|delegation| delegation.id == delegation_id)
+            .expect("delegation");
+        assert_eq!(delegation.base_ref.as_deref(), Some(expected_head.as_str()));
+        let child_id = delegation.child_session_id.clone().expect("child session");
+        let child = app
+            .sessions
+            .iter()
+            .find(|session| session.id == child_id)
+            .expect("child session");
+        assert_eq!(child.parent_session_id.as_deref(), Some("source"));
+        assert_eq!(child.source_branch, delegation.base_label.clone().unwrap());
+    }
+
+    #[test]
+    fn delegation_finish_updates_state_and_writes_result() {
+        let tmp = tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let project = make_project_at("project-1", "fake", &repo.to_string_lossy());
+        let mut source = make_session("source", "codex", "/tmp/source");
+        source.project_id = project.id.clone();
+        let mut child = make_session("child", "codex", "/tmp/child");
+        child.project_id = project.id.clone();
+        child.group_id = Some("group-1".to_string());
+        child.parent_session_id = Some("source".to_string());
+        let mut app = test_app_with_sessions(vec![source, child], vec![project]);
+        app.delegations.push(crate::model::Delegation {
+            id: "delegation-1".to_string(),
+            group_id: "group-1".to_string(),
+            parent_session_id: "source".to_string(),
+            child_session_id: Some("child".to_string()),
+            depth: 1,
+            iteration: 1,
+            title: "Add ledger entries".to_string(),
+            request_key: Some("ledger".to_string()),
+            brief_path: app
+                .paths
+                .root
+                .join("delegations/delegation-1/brief.md")
+                .to_string_lossy()
+                .to_string(),
+            project_id: Some("project-1".to_string()),
+            repo_path: Some(repo.to_string_lossy().to_string()),
+            base_mode: crate::model::BaseMode::ParentHead,
+            base_ref: Some("abc123".to_string()),
+            base_label: Some("parent @ abc123".to_string()),
+            requested_name: Some("ledger".to_string()),
+            provider: Some("fake".to_string()),
+            state: crate::model::DelegationState::Running,
+            state_reason: None,
+            result_id: None,
+            result_status: None,
+            result_summary: None,
+            result_path: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            integrated_at: None,
+            integration_commit: None,
+        });
+
+        let response = app.handle_delegation_finish(
+            None,
+            Some("child"),
+            None,
+            crate::model::DelegationResult {
+                result_id: "result-1".to_string(),
+                status: "success".to_string(),
+                summary: "Added ledger entries and tests.".to_string(),
+                details: String::new(),
+                tests: Vec::new(),
+                blockers: Vec::new(),
+                suggested_followups: Vec::new(),
+                artifacts: Vec::new(),
+                reported_at: Some(Utc::now()),
+            },
+            None,
+        );
+        assert!(response.ok, "finish failed: {response:?}");
+        let delegation = &app.delegations[0];
+        assert_eq!(delegation.state, crate::model::DelegationState::Completed);
+        assert_eq!(delegation.result_status.as_deref(), Some("success"));
+        let result_path = delegation.result_path.as_deref().expect("result path");
+        let result = std::fs::read_to_string(result_path).expect("result file");
+        assert!(result.contains("Added ledger entries and tests."));
+
+        let status = app.delegation_status_response(Some("source"), None, None);
+        assert_eq!(status.delegations.len(), 1);
+        assert_eq!(status.delegations[0].state, "completed");
     }
 
     #[test]

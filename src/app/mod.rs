@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::stdout;
@@ -44,8 +44,9 @@ use crate::keybindings::{
 use crate::lockfile::SingleInstanceLock;
 use crate::logger;
 use crate::model::{
-    AgentGroup, AgentSession, ChangedFile, CompanionTerminalStatus, Project, ProjectBranchStatus,
-    ProviderKind, SCRATCH_PROJECT_ID, SCRATCH_PROJECT_NAME, SessionStatus, SessionSurface,
+    AgentGroup, AgentSession, BaseMode, ChangedFile, CompanionTerminalStatus, Delegation,
+    DelegationResult, DelegationState, Project, ProjectBranchStatus, ProviderKind,
+    SCRATCH_PROJECT_ID, SCRATCH_PROJECT_NAME, SessionStatus, SessionSurface,
 };
 use crate::provider;
 use crate::pty::PtyClient;
@@ -87,6 +88,11 @@ pub struct App {
     /// associations so project and related-work history stays visible.
     pub(crate) archived_sessions: Vec<AgentSession>,
     pub(crate) groups: Vec<AgentGroup>,
+    pub(crate) delegations: Vec<Delegation>,
+    /// Delegations waiting for the single creation pipeline slot.
+    pub(crate) delegation_queue: VecDeque<QueuedDelegation>,
+    /// request id -> delegation id for in-flight control requests.
+    pub(crate) delegation_request_ids: HashMap<String, String>,
     pub(crate) staged_files: Vec<ChangedFile>,
     pub(crate) unstaged_files: Vec<ChangedFile>,
     pub(crate) selected_left: usize,
@@ -1704,11 +1710,38 @@ pub(crate) fn build_left_items(
                 Some(index) => items.push(LeftItem::Session(index)),
                 None => items.push(LeftItem::RelatedGroupLabel(group_index)),
             }
-            for (session_index, session) in sessions.iter().enumerate() {
-                if session.group_id.as_deref() == Some(group.id.as_str())
-                    && Some(session_index) != origin_index
-                {
-                    items.push(LeftItem::Session(session_index));
+            let mut visited = HashSet::new();
+            if let Some(origin_index) = origin_index {
+                let origin_id = sessions[origin_index].id.clone();
+                visited.insert(origin_id.clone());
+                push_related_children(
+                    &mut items,
+                    sessions,
+                    group.id.as_str(),
+                    &origin_id,
+                    &mut visited,
+                );
+            } else {
+                // The origin was deleted. Promote surviving members whose
+                // parent no longer exists to mission roots.
+                for (session_index, session) in sessions.iter().enumerate() {
+                    if session.group_id.as_deref() != Some(group.id.as_str()) {
+                        continue;
+                    }
+                    let parent_missing =
+                        session.parent_session_id.as_deref().is_none_or(|parent| {
+                            !sessions.iter().any(|candidate| candidate.id == parent)
+                        });
+                    if parent_missing && visited.insert(session.id.clone()) {
+                        items.push(LeftItem::Session(session_index));
+                        push_related_children(
+                            &mut items,
+                            sessions,
+                            group.id.as_str(),
+                            &session.id,
+                            &mut visited,
+                        );
+                    }
                 }
             }
         }
@@ -1753,6 +1786,62 @@ pub(crate) fn build_left_items(
     items
 }
 
+fn push_related_children(
+    items: &mut Vec<LeftItem>,
+    sessions: &[AgentSession],
+    group_id: &str,
+    parent_session_id: &str,
+    visited: &mut HashSet<String>,
+) {
+    for (session_index, session) in sessions.iter().enumerate() {
+        if session.group_id.as_deref() != Some(group_id)
+            || session.parent_session_id.as_deref() != Some(parent_session_id)
+            || !visited.insert(session.id.clone())
+        {
+            continue;
+        }
+        items.push(LeftItem::Session(session_index));
+        push_related_children(items, sessions, group_id, &session.id, visited);
+    }
+}
+
+/// Depth of a session inside its related-work tree. Project sessions and
+/// mission origins are depth 0.
+pub(crate) fn related_session_depth(sessions: &[AgentSession], session: &AgentSession) -> usize {
+    let mut depth = 0;
+    let mut current = session;
+    let mut guard = 0;
+    while let Some(parent_id) = current.parent_session_id.as_deref() {
+        guard += 1;
+        if guard > 32 {
+            break;
+        }
+        let Some(parent) = sessions.iter().find(|candidate| candidate.id == parent_id) else {
+            break;
+        };
+        depth += 1;
+        current = parent;
+    }
+    depth
+}
+
+/// Whether this session is the last child of its parent in sidebar order.
+pub(crate) fn related_session_is_last_sibling(
+    sessions: &[AgentSession],
+    session: &AgentSession,
+) -> bool {
+    let Some(parent_id) = session.parent_session_id.as_deref() else {
+        return true;
+    };
+    sessions
+        .iter()
+        .rfind(|candidate| {
+            candidate.group_id == session.group_id
+                && candidate.parent_session_id.as_deref() == Some(parent_id)
+        })
+        .is_none_or(|candidate| candidate.id == session.id)
+}
+
 pub(crate) fn related_group_index(groups: &[AgentGroup], session: &AgentSession) -> Option<usize> {
     session.parent_session_id.as_ref()?;
     let group_id = session.group_id.as_deref()?;
@@ -1775,7 +1864,7 @@ pub(crate) fn related_group_indices(
 }
 
 /// The ids of groups that currently have at least one split-out child and
-/// therefore render under the Multi-repo work section.
+/// therefore render under the Delegated work section.
 pub(crate) fn related_section_group_ids<'a>(
     groups: &'a [AgentGroup],
     related_groups: &[usize],
@@ -1786,7 +1875,7 @@ pub(crate) fn related_section_group_ids<'a>(
         .collect()
 }
 
-/// Whether a session is displayed under Multi-repo work instead of its
+/// Whether a session is displayed under Delegated work instead of its
 /// project tree.
 pub(crate) fn session_in_related_section(
     session: &AgentSession,
@@ -1799,7 +1888,7 @@ pub(crate) fn session_in_related_section(
 }
 
 /// Whether a project still has at least one session rendered under its own
-/// project header. Multi-repo work origins and split-out members live in their
+/// project header. Delegated work origins and split-out members live in their
 /// own section, so they do not count as visible project sessions.
 pub(crate) fn project_has_visible_sessions(
     sessions: &[AgentSession],
@@ -1840,7 +1929,7 @@ pub(crate) fn related_group_label_for(sessions: &[AgentSession], group: &AgentGr
             .unwrap_or_else(|| origin.branch_name.clone());
     }
     if group.label.trim().is_empty() {
-        "Multi-repo work".to_string()
+        "Delegated work".to_string()
     } else {
         group.label.clone()
     }
@@ -1890,6 +1979,8 @@ pub(crate) enum AgentLaunchKind {
         handoff_prompt: Option<String>,
         /// Whether split-out registered the target project for this request.
         project_added: bool,
+        /// Delegation row to update when the child launches.
+        delegation_id: Option<String>,
     },
     Reconnect {
         status_message: String,
@@ -1977,16 +2068,44 @@ pub(crate) enum CreateAgentRequest {
     },
     SplitOut {
         request_id: String,
+        delegation_id: String,
         source_session_id: String,
+        source_session: Box<AgentSession>,
         group_id: String,
         parent_session_id: String,
+        depth: u32,
+        brief_path: String,
         project: Project,
         custom_name: Option<String>,
         base_branch: Option<String>,
+        base_ref: Option<String>,
+        base_label: String,
         provider: Option<ProviderKind>,
         handoff_prompt: Option<String>,
         project_added: bool,
     },
+}
+
+/// A delegation request waiting for the single creation pipeline slot.
+pub(crate) struct QueuedDelegation {
+    pub(crate) request_id: String,
+    pub(crate) delegation_id: String,
+    pub(crate) params: SplitOutParams,
+    pub(crate) source_session: Option<AgentSession>,
+}
+
+/// Inputs for the background delegation preparation step.
+pub(crate) struct SplitOutPrepareRequest {
+    pub(crate) request_id: String,
+    pub(crate) delegation_id: String,
+    pub(crate) depth: u32,
+    pub(crate) brief_path: String,
+    pub(crate) params: SplitOutParams,
+    pub(crate) source_session: Option<AgentSession>,
+    pub(crate) projects: Vec<Project>,
+    pub(crate) sessions: Vec<AgentSession>,
+    pub(crate) config: Config,
+    pub(crate) paths: DuxPaths,
 }
 
 /// A resolved split-out request. It becomes executable immediately when the
@@ -1995,27 +2114,44 @@ pub(crate) enum CreateAgentRequest {
 #[derive(Clone, Debug)]
 pub(crate) struct SplitOutPlan {
     pub(crate) request_id: String,
+    pub(crate) delegation_id: String,
     pub(crate) source_session_id: String,
     pub(crate) project: Project,
     pub(crate) project_is_new: bool,
     pub(crate) base_branch: Option<String>,
+    pub(crate) base_ref: Option<String>,
+    pub(crate) base_label: String,
+    pub(crate) depth: u32,
+    pub(crate) brief_path: String,
     pub(crate) name: Option<String>,
     pub(crate) provider: Option<ProviderKind>,
-    pub(crate) prompt: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SplitOutCreateRequest {
     pub(crate) request_id: String,
+    pub(crate) delegation_id: String,
     pub(crate) source_session_id: String,
+    pub(crate) source_session: AgentSession,
     pub(crate) group_id: String,
     pub(crate) parent_session_id: String,
+    pub(crate) depth: u32,
+    pub(crate) brief_path: String,
     pub(crate) project: Project,
     pub(crate) name: String,
     pub(crate) base_branch: String,
+    pub(crate) base_ref: Option<String>,
+    pub(crate) base_label: String,
     pub(crate) provider: ProviderKind,
     pub(crate) handoff_prompt: Option<String>,
     pub(crate) project_added: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DelegationIntegrationOutcome {
+    pub(crate) commit: Option<String>,
+    pub(crate) strategy: String,
+    pub(crate) message: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2061,6 +2197,11 @@ pub(crate) enum WorkerEvent {
         request_id: String,
         code: String,
         message: String,
+    },
+    DelegationIntegrated {
+        request_id: String,
+        delegation_id: String,
+        result: std::result::Result<DelegationIntegrationOutcome, String>,
     },
     ScratchConversionCompleted {
         result: Box<std::result::Result<ScratchConversionOutcome, String>>,
@@ -2314,6 +2455,7 @@ impl App {
             .collect::<Vec<_>>();
         session_store.purge_empty_groups()?;
         let groups = session_store.load_groups()?;
+        let delegations = session_store.load_delegations()?;
         let (worker_tx, worker_rx) = mpsc::channel();
         let watched_worktree: Arc<Mutex<Option<WatchedWorktree>>> = Arc::new(Mutex::new(None));
         let initial_status = format!(
@@ -2345,6 +2487,9 @@ impl App {
             sessions,
             archived_sessions,
             groups,
+            delegations,
+            delegation_queue: VecDeque::new(),
+            delegation_request_ids: HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -2475,6 +2620,7 @@ impl App {
             _single_instance_lock: single_instance_lock,
         };
         app.restore_sessions();
+        app.reconcile_delegations_after_restore();
         app.reload_pull_request_state();
         app.select_current_pr_row();
         app.rebuild_left_items();
@@ -2867,6 +3013,14 @@ impl App {
                         .count()
                         > 1
                 }),
+            Action::CancelSelectedDelegation => self
+                .selected_session()
+                .and_then(|session| self.delegation_for_session(&session.id))
+                .is_some_and(|delegation| delegation.state.is_active()),
+            Action::IntegrateSelectedDelegation => self
+                .selected_session()
+                .and_then(|session| self.delegation_for_session(&session.id))
+                .is_some_and(|delegation| delegation.state == DelegationState::Completed),
             _ => true,
         }
     }
@@ -2984,6 +3138,8 @@ impl App {
             "delete-agent" => self.confirm_delete_selected_session(),
             "recover-deleted-agent" => self.open_recover_deleted_agent_prompt(),
             "next-related-agent" => self.select_next_related_agent(),
+            "cancel-delegation" => self.cancel_selected_delegation(),
+            "integrate-delegation" => self.integrate_selected_delegation(),
             "rename-agent" => self.open_rename_session(),
             "kill-running" => self.open_kill_running(),
             "reconnect-agent" => self.reconnect_selected_session(),
@@ -3508,6 +3664,11 @@ impl App {
     }
 
     pub(crate) fn configured_base_ref_for_session(&self, session: &AgentSession) -> String {
+        if let Some(delegation) = self.delegation_for_session(&session.id)
+            && let Some(base_ref) = delegation.base_ref.as_deref()
+        {
+            return base_ref.to_string();
+        }
         self.projects
             .iter()
             .find(|p| p.id == session.project_id)
@@ -3517,6 +3678,12 @@ impl App {
 
     pub(crate) fn diff_base_ref_for_session(&self, session: &AgentSession) -> String {
         let configured_base = self.configured_base_ref_for_session(session);
+        if configured_base.len() >= 7
+            && configured_base.len() <= 64
+            && configured_base.chars().all(|ch| ch.is_ascii_hexdigit())
+        {
+            return configured_base;
+        }
         git::preferred_rebase_base_ref(Path::new(&session.worktree_path), &configured_base)
     }
 
@@ -3554,11 +3721,18 @@ impl App {
         }
         let selected = self.selected_session().map(|s| {
             let configured_base_ref = self.configured_base_ref_for_session(s);
+            let fetch_branch = if self.delegation_for_session(&s.id).is_some() {
+                // Delegated bases are frozen commits. Fetching `origin/<sha>`
+                // is meaningless and noisy, so leave branch refresh off.
+                String::new()
+            } else {
+                configured_base_ref.clone()
+            };
             (
                 s.id.clone(),
                 PathBuf::from(&s.worktree_path),
                 self.diff_base_ref_for_session(s),
-                configured_base_ref,
+                fetch_branch,
             )
         });
         let selected_id = selected
@@ -4695,6 +4869,36 @@ mod tests {
                 LeftItem::Project(0),
             ]
         );
+    }
+
+    #[test]
+    fn build_left_items_renders_nested_delegation_sessions_depth_first() {
+        let projects = vec![test_project("project-1")];
+        let mut sessions = vec![
+            test_session("origin", "project-1", 0),
+            test_session("child", "project-1", -1),
+            test_session("grandchild", "project-1", -2),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[1].group_id = Some(group.id.clone());
+        sessions[1].parent_session_id = Some("origin".to_string());
+        sessions[2].group_id = Some(group.id.clone());
+        sessions[2].parent_session_id = Some("child".to_string());
+
+        let items = build_left_items(&projects, &sessions, &[group], &HashSet::new(), 0);
+        let session_order = items
+            .iter()
+            .filter_map(|item| match item {
+                LeftItem::Session(index) => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(session_order, vec![0, 1, 2]);
+        assert_eq!(related_session_depth(&sessions, &sessions[0]), 0);
+        assert_eq!(related_session_depth(&sessions, &sessions[1]), 1);
+        assert_eq!(related_session_depth(&sessions, &sessions[2]), 2);
     }
 
     #[test]

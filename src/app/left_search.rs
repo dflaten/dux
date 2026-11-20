@@ -207,7 +207,7 @@ pub(crate) fn build_filtered_left_items(
         items.extend(matched.into_iter().map(LeftItem::Session));
     }
 
-    // Multi-repo work is matched in its own section so a project header never
+    // Delegated work is matched in its own section so a project header never
     // appears with a hidden related member as its only child.
     let mut related_items = Vec::new();
     for group_index in related_groups {

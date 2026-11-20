@@ -29,7 +29,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 
 - [Overview](#overview)
 - [Status](#status)
-- [Multi-Repo Worktrees](#multi-repo-worktrees)
+- [Delegated Worktrees](#delegated-worktrees)
 - [Documentation](#documentation)
 - [Install](#install)
 - [Prerequisites](#prerequisites)
@@ -41,7 +41,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 | --- | --- | --- |
 | 🖥 | Interface | Terminal UI with projects and agents, live agent output, changed files, and diffs |
 | 🌿 | Worktrees | One isolated git worktree per project agent, with fork and existing-worktree workflows |
-| ⇄ | Multi-repo work | Agents can split work into linked worktrees in other projects; the origin agent moves into this section with them |
+| ⇄ | Delegated work | Agents can delegate work into linked worktrees in the same repo or another project; the origin agent moves into this section with its delegation tree |
 | ✦ | Scratch | Always-visible ad-hoc agents that run in their own folders with the diff pane hidden, and can be converted into projects later |
 | 🤖 | Providers | Any CLI through a PTY; Claude, Codex, and OpenCode by default |
 | 🧰 | Workflow | Companion terminals, macros, queued diff comments, AI commit messages, and worktree PR tracking with stacked-PR detection |
@@ -63,35 +63,64 @@ Recent fork additions include:
 - Queued comments on selected diff lines that can be sent back to an agent.
 - OpenCode session resume and discovery.
 - Cross-pane macros with short descriptions, auto-created targets, optional Enter submission, background delivery badges, and configurable focus.
-- Multi-repo worktrees: an agent can split cross-repository work into a linked dux project and manage it as an independent agent session.
+- Delegated worktrees: an agent can delegate work into a linked worktree in the
+  same repository or another project, wait for a structured result, and collect
+  the child's changes.
 
-## Multi-Repo Worktrees
+## Delegated Worktrees
 
-An agent running inside dux can ask dux to create work in another repository:
+An agent running inside dux can delegate work to a child agent:
 
 ```bash
-"$DUX_BIN" agent split-out \
+"$DUX_BIN" agent delegate \
   --repo /path/to/other-repo \
   --name fix-api-contract \
-  --prompt-file - \
+  --title "Fix the API contract" \
+  --brief-file - \
   --json
 ```
 
-Dux creates a fresh worktree from the target project's leading branch, creates
-an independent agent session, optionally launches the child agent with a handoff
-prompt, and links the new session to the current agent. The origin agent moves
-into the **Multi-repo work** section of the sidebar along with its split-out
-children; selecting the origin heading jumps back to the original agent, and
-members can be cycled with the `next-related-agent` command.
+Use `--same-repo` instead of `--repo`/`--project` to branch from the parent
+agent's own repository. The default same-repo base is the parent's HEAD; use
+`--base-mode leading` for the project leading branch or
+`--base-mode parent-snapshot` to include the parent's uncommitted files.
+
+Dux creates the worktree, launches the child agent with a brief that points at a
+durable task file, and links the child to the parent. The child reports back
+with:
+
+```bash
+"$DUX_BIN" agent finish --status success --summary-file - <<'DUX'
+What changed, how it was verified, and anything the parent must know.
+DUX
+```
+
+The parent can then inspect the tree and result, wait for completion, or ask for
+another iteration:
+
+```bash
+"$DUX_BIN" agent status --json
+"$DUX_BIN" agent wait --all --timeout 100 --json
+"$DUX_BIN" agent result --delegation <id> --json
+"$DUX_BIN" agent followup --delegation <id> --text-file -
+```
+
+A `wait` timeout exits with code 2 and is not a failure; call it again to keep
+polling. `blocked` children exit 4 and need a follow-up answer. `cancel` keeps
+the worktree; `retry` is for failed launches; `integrate` merges a completed
+same-repo child into its parent. The command palette also exposes
+`cancel-delegation` and `integrate-delegation` for the selected child.
 
 The target repo can already be a dux project, or dux can register it
 automatically. Set `[agent_control] allow_unregistered_repos = false` in
 `config.toml` if agents should only target projects you have added manually.
+Delegation limits live under `[orchestration]`; set
+`[agent_control] enabled = false` or `[orchestration] enabled = false` to
+disable agent-initiated changes.
 
-Agent control uses a user-only local socket at `<config_dir>/dux.sock`. Set
-`[agent_control] enabled = false` to disable it. The socket is not an agent
-protocol; it only lets the `dux` CLI request workspace changes from the running
-TUI.
+Agent control uses a user-only local socket at `<config_dir>/dux.sock`. The
+socket is not an agent protocol; it only lets the `dux` CLI request workspace
+changes from the running TUI.
 
 The screenshot at the top of this README is generated by the reproducible
 [multi-repo demo](demo/multi-repo/README.md). Run `make screenshots` after UI
@@ -99,20 +128,23 @@ changes to refresh it.
 
 ### Agent Skill
 
-Dux ships an optional skill that teaches agents how and when to use split-out:
+Dux ships optional skills that teach agents how and when to delegate work:
 
 ```text
-skills/dux-split-out/SKILL.md
+skills/dux-split-out/SKILL.md    # one cross-repo child
+skills/dux-orchestrate/SKILL.md  # fan out, wait, follow up, integrate
 ```
 
-Copy it into the global skill directory of the agent you use. For example:
+Copy them into the global skill directory of the agent you use. For example:
 
 ```bash
 mkdir -p ~/.config/opencode/skills/dux-split-out
 cp skills/dux-split-out/SKILL.md ~/.config/opencode/skills/dux-split-out/SKILL.md
+mkdir -p ~/.config/opencode/skills/dux-orchestrate
+cp skills/dux-orchestrate/SKILL.md ~/.config/opencode/skills/dux-orchestrate/SKILL.md
 ```
 
-OpenCode also discovers `~/.claude/skills` and `~/.agents/skills`. The skill is
+OpenCode also discovers `~/.claude/skills` and `~/.agents/skills`. The skills are
 not installed automatically. Run `dux agent --help` for the authoritative
 command reference.
 

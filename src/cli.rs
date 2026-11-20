@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
+use uuid::Uuid;
 
 use crate::config::{self, Config, DuxPaths};
 use crate::git;
@@ -181,6 +183,92 @@ fn run_diff_summary(current: &Config) -> Result<()> {
         "agent_control.allow_unregistered_repos",
         defaults.agent_control.allow_unregistered_repos,
         current.agent_control.allow_unregistered_repos,
+    );
+
+    // [orchestration]
+    diff_bool(
+        &mut changes,
+        "orchestration.enabled",
+        defaults.orchestration.enabled,
+        current.orchestration.enabled,
+    );
+    diff_bool(
+        &mut changes,
+        "orchestration.allow_same_repo",
+        defaults.orchestration.allow_same_repo,
+        current.orchestration.allow_same_repo,
+    );
+    diff_bool(
+        &mut changes,
+        "orchestration.allow_nested",
+        defaults.orchestration.allow_nested,
+        current.orchestration.allow_nested,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.max_depth",
+        defaults.orchestration.max_depth,
+        current.orchestration.max_depth,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.max_children_per_agent",
+        defaults.orchestration.max_children_per_agent,
+        current.orchestration.max_children_per_agent,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.max_active_descendants_per_mission",
+        defaults.orchestration.max_active_descendants_per_mission,
+        current.orchestration.max_active_descendants_per_mission,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.max_total_descendants_per_mission",
+        defaults.orchestration.max_total_descendants_per_mission,
+        current.orchestration.max_total_descendants_per_mission,
+    );
+    diff_str(
+        &mut changes,
+        "orchestration.same_repo_default_base",
+        &defaults.orchestration.same_repo_default_base,
+        &current.orchestration.same_repo_default_base,
+    );
+    diff_str(
+        &mut changes,
+        "orchestration.cross_repo_default_base",
+        &defaults.orchestration.cross_repo_default_base,
+        &current.orchestration.cross_repo_default_base,
+    );
+    diff_bool(
+        &mut changes,
+        "orchestration.allow_parent_snapshot",
+        defaults.orchestration.allow_parent_snapshot,
+        current.orchestration.allow_parent_snapshot,
+    );
+    diff_bool(
+        &mut changes,
+        "orchestration.allow_agent_integration",
+        defaults.orchestration.allow_agent_integration,
+        current.orchestration.allow_agent_integration,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.wait_default_timeout_secs",
+        defaults.orchestration.wait_default_timeout_secs,
+        current.orchestration.wait_default_timeout_secs,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.brief_max_bytes",
+        defaults.orchestration.brief_max_bytes,
+        current.orchestration.brief_max_bytes,
+    );
+    diff_usize(
+        &mut changes,
+        "orchestration.result_max_bytes",
+        defaults.orchestration.result_max_bytes,
+        current.orchestration.result_max_bytes,
     );
 
     // [logging]
@@ -621,7 +709,18 @@ pub fn run_agent(args: &[String], paths: &DuxPaths) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     let wants_json = args.iter().any(|arg| arg == "--json");
     let result = match sub {
-        "split-out" => run_agent_split_out(&args[1..], paths),
+        "delegate" => run_agent_delegate(&args[1..], paths, false),
+        "split-out" => run_agent_delegate(&args[1..], paths, true),
+        "status" => run_agent_status(&args[1..], paths),
+        "tree" => run_agent_tree(&args[1..], paths),
+        "result" => run_agent_result(&args[1..], paths),
+        "wait" => run_agent_wait(&args[1..], paths),
+        "finish" => run_agent_finish(&args[1..], paths),
+        "followup" => run_agent_followup(&args[1..], paths),
+        "message" => run_agent_message(&args[1..], paths),
+        "cancel" => run_agent_cancel(&args[1..], paths),
+        "retry" => run_agent_retry(&args[1..], paths),
+        "integrate" => run_agent_integrate(&args[1..], paths),
         "related" => run_agent_related(&args[1..], paths),
         "" | "--help" | "-h" => {
             print_agent_help();
@@ -648,23 +747,67 @@ fn print_agent_help() {
 dux agent — work with agents from the command line
 
 Subcommands:
-  dux agent split-out     Create a related worktree/agent in another project
+  dux agent delegate      Create a delegated worktree/agent in this or another repo
+  dux agent split-out     Legacy alias for delegate (waits for launch by default)
+  dux agent status        Show the delegation tree for an agent
+  dux agent tree          Human-readable delegation tree
+  dux agent result        Read a delegation result
+  dux agent wait          Wait for delegations to reach a terminal state
+  dux agent finish        Report a delegated child's result
+  dux agent followup      Send another iteration to a completed/blocked child
+  dux agent message       Best-effort message to a running child
+  dux agent cancel        Cancel a delegation or subtree (worktrees are kept)
+  dux agent retry         Retry a failed delegation launch
+  dux agent integrate     Merge a completed same-repo child into its parent
   dux agent related       List agents related to the current or selected agent
 
-split-out options:
+delegate options:
   --repo <path>           Target git checkout (may be auto-registered as a project)
   --project <id|name>     Target project already registered in dux
+  --same-repo             Target the source session's project
   --name <branch>         Branch and worktree name (generated when omitted)
-  --base <branch>         Base branch (defaults to the target project's leading branch)
+  --title <text>          Human-readable delegation title
+  --base-mode <mode>      leading | ref | parent-head | parent-snapshot | sibling-head
+  --base <ref>            Explicit base branch/tag/commit
+  --base-session <id>     Sibling session for sibling-head
   --provider <name>       Provider override (defaults to the target project's provider)
-  --prompt <text>         Initial handoff prompt for the child agent
-  --prompt-file <path|->  Read the handoff prompt from a file or stdin
+  --brief <text>          Initial task brief for the child agent
+  --brief-file <path|->   Read the task brief from a file or stdin
+  --prompt <text>         Alias for --brief
+  --prompt-file <path|->  Alias for --brief-file
+  --request-key <key>     Idempotency key (defaults to the branch name)
   --source <session-id>   Source session (defaults to DUX_SESSION_ID)
+  --wait-for-launch       Block until the child PTY is running or has failed
+  --no-wait               Return after queueing (default for delegate)
   --timeout <seconds>     How long to wait for dux (default 120)
   --json                  Print the machine-readable JSON response
 
-related options:
-  --session <session-id>  Session to inspect (defaults to DUX_SESSION_ID)
+wait options:
+  --session <id>          Session to inspect (defaults to DUX_SESSION_ID)
+  --delegation <id>       Delegation to inspect
+  --all | --any           Wait for all / any current descendants
+  --until started         Return when children are running or terminal
+  --timeout <seconds>     Wall-clock wait budget (default from config, 100)
+  --allow-empty           Succeed instead of erroring when nothing matches
+  --json                  Print the machine-readable JSON response
+
+result options:
+  --session <id> | --delegation <id>
+  --full                  Read the full result file from disk
+  --json                  Print the machine-readable JSON response
+
+finish options:
+  --session <id>          Delegated session (defaults to DUX_SESSION_ID)
+  --status success|failed|blocked
+  --summary <text> | --summary-file <path|->
+  --result-id <id>        Override the generated result id
+  --blocker <text>        Record a blocker (repeatable)
+  --suggest-followup <text> Record a suggested follow-up (repeatable)
+  --json                  Print the machine-readable JSON response
+
+cancel options:
+  --session <id> | --delegation <id>
+  --subtree               Cancel non-terminal descendants too
   --json                  Print the machine-readable JSON response
 
 Environment:
@@ -674,7 +817,7 @@ Environment:
     );
 }
 
-fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_delegate(args: &[String], paths: &DuxPaths, legacy_split_out: bool) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -682,13 +825,20 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
 
     let mut repo = None;
     let mut project = None;
+    let mut same_repo = false;
     let mut name = None;
+    let mut title = None;
     let mut base = None;
+    let mut base_mode = None;
+    let mut base_session = None;
     let mut provider = None;
     let mut prompt = None;
     let mut prompt_file = None;
+    let mut request_key = None;
     let mut source_session_id = None;
     let mut timeout_secs = None;
+    let mut no_wait = false;
+    let mut wait_for_launch = legacy_split_out;
     let mut json = false;
 
     let mut index = 0;
@@ -703,12 +853,22 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
         match arg {
             "--repo" => repo = Some(take_value("--repo")?),
             "--project" => project = Some(take_value("--project")?),
+            "--same-repo" => same_repo = true,
             "--name" => name = Some(take_value("--name")?),
+            "--title" => title = Some(take_value("--title")?),
             "--base" => base = Some(take_value("--base")?),
+            "--base-mode" => base_mode = Some(take_value("--base-mode")?),
+            "--base-session" => base_session = Some(take_value("--base-session")?),
             "--provider" => provider = Some(take_value("--provider")?),
-            "--prompt" => prompt = Some(take_value("--prompt")?),
-            "--prompt-file" => prompt_file = Some(take_value("--prompt-file")?),
+            "--brief" | "--prompt" => prompt = Some(take_value("--brief")?),
+            "--brief-file" | "--prompt-file" => prompt_file = Some(take_value("--brief-file")?),
+            "--request-key" => request_key = Some(take_value("--request-key")?),
             "--source" => source_session_id = Some(take_value("--source")?),
+            "--wait-for-launch" => wait_for_launch = true,
+            "--no-wait" => {
+                no_wait = true;
+                wait_for_launch = false;
+            }
             "--timeout" => {
                 let value = take_value("--timeout")?;
                 timeout_secs = Some(
@@ -724,11 +884,14 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
         index += 1;
     }
 
-    if repo.is_none() && project.is_none() {
-        bail!("split-out requires --repo <path> or --project <id|name>.");
+    if repo.is_none() && project.is_none() && !same_repo {
+        bail!("delegate requires --repo <path>, --project <id|name>, or --same-repo.");
+    }
+    if same_repo && (repo.is_some() || project.is_some()) {
+        bail!("use --same-repo by itself, not with --repo or --project.");
     }
     if prompt.is_some() && prompt_file.is_some() {
-        bail!("use either --prompt or --prompt-file, not both.");
+        bail!("use either --brief or --brief-file, not both.");
     }
     if let Some(name) = name.as_deref()
         && !git::is_valid_agent_name(name)
@@ -738,7 +901,10 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
         );
     }
     if let Some(file) = prompt_file {
-        prompt = Some(crate::ipc::read_prompt_file(&file)?);
+        prompt = Some(read_brief_file(&file, 8 * 1024 * 1024)?);
+    }
+    if !legacy_split_out && prompt.as_deref().is_none_or(|text| text.trim().is_empty()) {
+        bail!("delegate requires a non-empty --brief or --brief-file.");
     }
     if source_session_id.is_none() {
         source_session_id = std::env::var("DUX_SESSION_ID")
@@ -746,9 +912,7 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
             .filter(|value| !value.trim().is_empty());
     }
     if source_session_id.is_none() {
-        bail!(
-            "split-out must run inside an agent started by dux, or be given --source <session-id>."
-        );
+        bail!("delegate must run inside a dux agent, or be given --source <session-id>.");
     }
     let repo = repo.map(|raw| {
         if let Some(expanded) = crate::config::expand_path(&raw) {
@@ -765,17 +929,88 @@ fn run_agent_split_out(args: &[String], paths: &DuxPaths) -> Result<()> {
         }
     });
 
-    let request = crate::ipc::ControlRequest::split_out(crate::ipc::SplitOutParams {
+    // Stage large briefs outside the control socket. The TUI validates that the
+    // path lives under the pending directory before adopting it.
+    let (prompt, brief_path) = match prompt {
+        Some(text) if text.len() > 64 * 1024 => {
+            let path = stage_brief(paths, &text)?;
+            (None, Some(path))
+        }
+        other => (other, None),
+    };
+
+    let mut params = crate::ipc::SplitOutParams {
         source_session_id,
         repo,
         project,
-        name,
+        name: name.clone(),
         base,
         provider,
         prompt,
         timeout_ms: timeout_secs.map(|seconds| seconds.saturating_mul(1000)),
-    });
+        title,
+        base_mode,
+        base_session,
+        request_key: request_key.or(name),
+        no_wait,
+        wait_for_launch,
+        brief_path,
+        brief_sha256: None,
+    };
+    // The server cannot see --same-repo; it infers the source project from the
+    // source session when no target is provided.
+    if same_repo {
+        params.repo = None;
+        params.project = None;
+    }
+
+    let request = if legacy_split_out {
+        crate::ipc::ControlRequest::split_out(params)
+    } else {
+        crate::ipc::ControlRequest::delegate(params)
+    };
     send_and_print_request(paths, request, json)
+}
+
+fn read_brief_file(path: &str, limit: usize) -> Result<String> {
+    let text = if path == "-" {
+        let mut text = String::new();
+        use std::io::Read;
+        std::io::stdin()
+            .take(limit as u64 + 1)
+            .read_to_string(&mut text)
+            .context("failed to read delegation brief from stdin")?;
+        text
+    } else {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("failed to inspect delegation brief {path}"))?;
+        if metadata.len() > limit as u64 {
+            bail!(
+                "delegation brief {path} is too large ({} bytes, limit {limit})",
+                metadata.len()
+            );
+        }
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read delegation brief {path}"))?
+    };
+    if text.len() > limit {
+        bail!(
+            "delegation brief is too large ({} bytes, limit {limit})",
+            text.len()
+        );
+    }
+    Ok(text)
+}
+
+fn stage_brief(paths: &DuxPaths, text: &str) -> Result<String> {
+    let dir = paths.root.join("delegations").join("pending");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let path = dir.join(format!("{}.md", Uuid::new_v4()));
+    fs::write(&path, text)
+        .with_context(|| format!("failed to stage delegation brief {}", path.display()))?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    Ok(path.to_string_lossy().to_string())
 }
 
 fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
@@ -813,6 +1048,648 @@ fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
     }
     let request = crate::ipc::ControlRequest::related(source_session_id);
     send_and_print_request(paths, request, json)
+}
+
+#[derive(Default)]
+struct DelegationTargetArgs {
+    source_session_id: Option<String>,
+    session_id: Option<String>,
+    delegation_id: Option<String>,
+    json: bool,
+}
+
+fn parse_delegation_target_args(args: &[String]) -> Result<DelegationTargetArgs> {
+    let mut parsed = DelegationTargetArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => parsed.session_id = Some(take_value("--session")?),
+            "--delegation" => parsed.delegation_id = Some(take_value("--delegation")?),
+            "--source" => parsed.source_session_id = Some(take_value("--source")?),
+            "--json" => parsed.json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    if parsed.source_session_id.is_none() {
+        parsed.source_session_id = std::env::var("DUX_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+    }
+    Ok(parsed)
+}
+
+fn run_agent_status(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let parsed = parse_delegation_target_args(args)?;
+    let request = crate::ipc::ControlRequest::delegation_status(
+        parsed.source_session_id,
+        parsed.session_id,
+        parsed.delegation_id,
+    );
+    send_and_print_request(paths, request, parsed.json)
+}
+
+fn run_agent_tree(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let parsed = parse_delegation_target_args(args)?;
+    let request = crate::ipc::ControlRequest::delegation_status(
+        parsed.source_session_id,
+        parsed.session_id,
+        parsed.delegation_id,
+    );
+    let response = send_request_or_print(paths, &request)?;
+    if !response.ok {
+        print_control_response(&response, false);
+        std::process::exit(1);
+    }
+    if parsed.json {
+        print_control_response(&response, true);
+        return Ok(());
+    }
+    print_delegation_tree(&response);
+    Ok(())
+}
+
+fn run_agent_result(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut full = false;
+    let mut filtered = Vec::new();
+    for arg in args {
+        if arg == "--full" {
+            full = true;
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+    let parsed = parse_delegation_target_args(&filtered)?;
+    let request = crate::ipc::ControlRequest::delegation_result(
+        parsed.source_session_id,
+        parsed.session_id,
+        parsed.delegation_id,
+    );
+    let response = send_request_or_print(paths, &request)?;
+    if !response.ok {
+        print_control_response(&response, parsed.json);
+        std::process::exit(1);
+    }
+    if parsed.json {
+        print_control_response(&response, true);
+        return Ok(());
+    }
+    if let Some(summary) = response.result_summary.as_deref() {
+        println!("{summary}");
+    }
+    if let Some(path) = response.result_path.as_deref() {
+        if full {
+            match std::fs::read_to_string(path) {
+                Ok(content) => println!("{content}"),
+                Err(err) => bail!("could not read result file {path}: {err}"),
+            }
+        } else {
+            println!("\nresult file: {path}");
+        }
+    } else if response.result_summary.is_none() {
+        bail!("this delegation has no result yet.");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitMode {
+    All,
+    Any,
+    UntilStarted,
+}
+
+fn run_agent_wait(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut parsed = DelegationTargetArgs::default();
+    let mut all = false;
+    let mut any = false;
+    let mut until_started = false;
+    let mut allow_empty = false;
+    let mut quiet = false;
+    let mut timeout_secs: Option<u64> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => parsed.session_id = Some(take_value("--session")?),
+            "--delegation" => parsed.delegation_id = Some(take_value("--delegation")?),
+            "--source" => parsed.source_session_id = Some(take_value("--source")?),
+            "--all" => all = true,
+            "--any" => any = true,
+            "--until" => {
+                let value = take_value("--until")?;
+                if value != "started" {
+                    bail!("--until only supports \"started\".");
+                }
+                until_started = true;
+            }
+            "--allow-empty" => allow_empty = true,
+            "--quiet" => quiet = true,
+            "--json" => parsed.json = true,
+            "--timeout" => {
+                let value = take_value("--timeout")?;
+                timeout_secs = Some(
+                    value
+                        .parse::<u64>()
+                        .with_context(|| format!("invalid --timeout value: {value}"))?,
+                );
+            }
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    if all && any {
+        bail!("use either --all or --any, not both.");
+    }
+    if parsed.source_session_id.is_none() {
+        parsed.source_session_id = std::env::var("DUX_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+    }
+    if parsed.source_session_id.is_none()
+        && parsed.session_id.is_none()
+        && parsed.delegation_id.is_none()
+    {
+        bail!("wait needs --session, --delegation, or a dux agent environment.");
+    }
+    let mode = if until_started {
+        WaitMode::UntilStarted
+    } else if any {
+        WaitMode::Any
+    } else {
+        WaitMode::All
+    };
+    let timeout = timeout_secs.unwrap_or_else(|| {
+        fs::read_to_string(&paths.config_path)
+            .ok()
+            .and_then(|raw| toml::from_str::<Config>(&raw).ok())
+            .map(|config| config.orchestration.wait_default_timeout_secs as u64)
+            .unwrap_or(100)
+    });
+    let deadline =
+        (timeout > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout));
+    let mut delay = std::time::Duration::from_millis(250);
+    loop {
+        let request = crate::ipc::ControlRequest::delegation_status(
+            parsed.source_session_id.clone(),
+            parsed.session_id.clone(),
+            parsed.delegation_id.clone(),
+        );
+        let response = match crate::ipc::send_request(
+            &paths.control_socket_path,
+            &request,
+            crate::ipc::DEFAULT_CONTROL_TIMEOUT,
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                let response =
+                    crate::ipc::ControlResponse::error("connection_failed", err.to_string());
+                print_control_response(&response, parsed.json);
+                std::process::exit(3);
+            }
+        };
+        if !response.ok {
+            print_control_response(&response, parsed.json);
+            std::process::exit(1);
+        }
+        let mut response = response;
+        if parsed.delegation_id.is_none()
+            && let Some(root) = parsed
+                .session_id
+                .as_deref()
+                .or(parsed.source_session_id.as_deref())
+        {
+            // A delegated child that is itself an orchestrator must not wait on
+            // its own task row; otherwise `wait --all` deadlocks.
+            response
+                .delegations
+                .retain(|delegation| delegation.child_session_id.as_deref() != Some(root));
+        }
+        if response.delegations.is_empty() && !allow_empty {
+            print_control_response(
+                &crate::ipc::ControlResponse::error(
+                    "no_delegations",
+                    "No matching delegations exist. Pass --allow-empty to treat that as success.",
+                ),
+                parsed.json,
+            );
+            std::process::exit(1);
+        }
+        if response.delegations.is_empty() && allow_empty {
+            print_control_response(&response, parsed.json);
+            std::process::exit(0);
+        }
+        let finished = match mode {
+            WaitMode::All => response
+                .delegations
+                .iter()
+                .all(|delegation| is_wait_terminal_state(&delegation.state)),
+            WaitMode::Any => response
+                .delegations
+                .iter()
+                .any(|delegation| is_wait_terminal_state(&delegation.state)),
+            WaitMode::UntilStarted => response.delegations.iter().all(|delegation| {
+                !matches!(
+                    delegation.state.as_str(),
+                    "queued" | "preparing" | "starting"
+                )
+            }),
+        };
+        if finished {
+            if !quiet && !parsed.json {
+                eprintln!("delegation wait finished.");
+            }
+            print_control_response(&response, parsed.json);
+            std::process::exit(wait_exit_code(&response, mode));
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            if !quiet && !parsed.json {
+                eprintln!("delegation wait timed out; call wait again to continue.");
+            }
+            print_control_response(&response, parsed.json);
+            std::process::exit(2);
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(std::time::Duration::from_secs(2));
+    }
+}
+
+fn is_wait_terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        "completed" | "failed" | "blocked" | "cancelled" | "exited" | "interrupted"
+    )
+}
+
+fn wait_exit_code(response: &crate::ipc::ControlResponse, mode: WaitMode) -> i32 {
+    if mode == WaitMode::UntilStarted {
+        if response.delegations.iter().any(|delegation| {
+            matches!(
+                delegation.state.as_str(),
+                "failed" | "cancelled" | "exited" | "interrupted"
+            )
+        }) {
+            return 1;
+        }
+        return 0;
+    }
+    if response.delegations.iter().any(|delegation| {
+        matches!(
+            delegation.state.as_str(),
+            "failed" | "cancelled" | "exited" | "interrupted"
+        )
+    }) {
+        return 1;
+    }
+    if response
+        .delegations
+        .iter()
+        .any(|delegation| delegation.state == "blocked")
+    {
+        return 4;
+    }
+    0
+}
+
+fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut session_id = None;
+    let mut delegation_id = std::env::var("DUX_DELEGATION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut status = None;
+    let mut summary = None;
+    let mut summary_file = None;
+    let mut result_id = None;
+    let mut blockers = Vec::new();
+    let mut suggested_followups = Vec::new();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => session_id = Some(take_value("--session")?),
+            "--delegation" => delegation_id = Some(take_value("--delegation")?),
+            "--status" => status = Some(take_value("--status")?),
+            "--summary" => summary = Some(take_value("--summary")?),
+            "--summary-file" => summary_file = Some(take_value("--summary-file")?),
+            "--result-id" => result_id = Some(take_value("--result-id")?),
+            "--blocker" => blockers.push(take_value("--blocker")?),
+            "--suggest-followup" => suggested_followups.push(take_value("--suggest-followup")?),
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    if summary.is_some() && summary_file.is_some() {
+        bail!("use either --summary or --summary-file, not both.");
+    }
+    if let Some(path) = summary_file {
+        summary = Some(read_brief_file(&path, 1024 * 1024)?);
+    }
+    let status = status.unwrap_or_else(|| "success".to_string());
+    if !matches!(status.as_str(), "success" | "failed" | "blocked") {
+        bail!("--status must be success, failed, or blocked.");
+    }
+    let summary = summary.unwrap_or_else(|| format!("Delegation finished with status {status}."));
+    let source_session_id = std::env::var("DUX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let result = crate::model::DelegationResult {
+        result_id: result_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        status,
+        summary,
+        details: String::new(),
+        tests: Vec::new(),
+        blockers,
+        suggested_followups,
+        artifacts: Vec::new(),
+        reported_at: Some(Utc::now()),
+    };
+    let result_path = std::env::var("DUX_RESULT_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(path) = result_path.as_deref() {
+        if let Some(parent) = Path::new(path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(encoded) = serde_json::to_string_pretty(&result) {
+            if let Err(err) = fs::write(path, encoded) {
+                eprintln!("warning: could not write delegation result to {path}: {err}");
+            } else {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    let mut wire_result = result;
+    if serde_json::to_vec(&wire_result)
+        .map(|encoded| encoded.len() > 128 * 1024)
+        .unwrap_or(false)
+    {
+        // The full payload is already durable on disk. Keep the control
+        // message small; the TUI reads the file back for the full result.
+        wire_result.details.clear();
+        wire_result.tests.clear();
+        wire_result.summary = wire_result.summary.chars().take(8192).collect();
+    }
+    let request = crate::ipc::ControlRequest::delegation_finish(
+        source_session_id,
+        session_id,
+        delegation_id,
+        wire_result,
+        result_path,
+    );
+    send_and_print_request(paths, request, json)
+}
+
+fn run_agent_followup(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut source_session_id = std::env::var("DUX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut session_id = None;
+    let mut delegation_id = None;
+    let mut text = None;
+    let mut text_file = None;
+    let mut submit = true;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--source" => source_session_id = Some(take_value("--source")?),
+            "--session" => session_id = Some(take_value("--session")?),
+            "--delegation" => delegation_id = Some(take_value("--delegation")?),
+            "--text" => text = Some(take_value("--text")?),
+            "--text-file" => text_file = Some(take_value("--text-file")?),
+            "--no-submit" => submit = false,
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    if text.is_some() && text_file.is_some() {
+        bail!("use either --text or --text-file, not both.");
+    }
+    if let Some(path) = text_file {
+        text = Some(read_brief_file(&path, 256 * 1024)?);
+    }
+    let text = text.ok_or_else(|| anyhow!("followup requires --text or --text-file."))?;
+    let request = crate::ipc::ControlRequest::delegation_followup(
+        source_session_id,
+        session_id,
+        delegation_id,
+        text,
+        submit,
+    );
+    send_and_print_request(paths, request, json)
+}
+
+fn run_agent_message(args: &[String], paths: &DuxPaths) -> Result<()> {
+    // `message` and `followup` share the same control path today; followup is
+    // the task-level iteration command and message is the best-effort variant.
+    run_agent_followup(args, paths)
+}
+
+fn run_agent_cancel(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut source_session_id = std::env::var("DUX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut session_id = None;
+    let mut delegation_id = None;
+    let mut subtree = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--source" => source_session_id = Some(take_value("--source")?),
+            "--session" => session_id = Some(take_value("--session")?),
+            "--delegation" => delegation_id = Some(take_value("--delegation")?),
+            "--subtree" => subtree = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    let request = crate::ipc::ControlRequest::delegation_cancel(
+        source_session_id,
+        session_id,
+        delegation_id,
+        subtree,
+    );
+    send_and_print_request(paths, request, json)
+}
+
+fn run_agent_retry(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut delegation_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--delegation" => delegation_id = Some(take_value("--delegation")?),
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    let delegation_id =
+        delegation_id.ok_or_else(|| anyhow!("retry requires --delegation <id>."))?;
+    send_and_print_request(
+        paths,
+        crate::ipc::ControlRequest::delegation_retry(delegation_id),
+        json,
+    )
+}
+
+fn run_agent_integrate(args: &[String], paths: &DuxPaths) -> Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_agent_help();
+        return Ok(());
+    }
+    let mut session_id = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut take_value = |flag: &str| -> Result<String> {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("{flag} requires a value"))
+        };
+        match arg {
+            "--session" => session_id = Some(take_value("--session")?),
+            "--json" => json = true,
+            other if other.starts_with('-') => bail!("unknown flag: {other}"),
+            other => bail!("unexpected argument: {other}"),
+        }
+        index += 1;
+    }
+    let session_id = session_id
+        .or_else(|| {
+            std::env::var("DUX_SESSION_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| anyhow!("integrate requires --session <id>."))?;
+    let source_session_id = std::env::var("DUX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    send_and_print_request(
+        paths,
+        crate::ipc::ControlRequest::delegation_integrate(source_session_id, session_id),
+        json,
+    )
+}
+
+fn print_delegation_tree(response: &crate::ipc::ControlResponse) {
+    if response.delegations.is_empty() {
+        if let Some(message) = response.message.as_deref() {
+            println!("{message}");
+        } else {
+            println!("No delegations.");
+        }
+        return;
+    }
+    let mut ordered = response.delegations.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|delegation| (delegation.depth, delegation.created_at.clone()));
+    for delegation in ordered {
+        let indent = "  ".repeat(delegation.depth.saturating_sub(1) as usize);
+        let project = delegation
+            .project_name
+            .as_deref()
+            .or(delegation.project_id.as_deref())
+            .unwrap_or("unknown");
+        let branch = delegation
+            .branch
+            .as_deref()
+            .or(delegation.base_label.as_deref())
+            .unwrap_or("-");
+        println!(
+            "{indent}- [{}] {} · {} · {} · {}",
+            delegation.state, delegation.title, project, branch, delegation.id
+        );
+        if let Some(summary) = delegation.result_summary.as_deref() {
+            println!("{indent}  {summary}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -956,25 +1833,28 @@ fn send_and_print_request(
     request: crate::ipc::ControlRequest,
     json: bool,
 ) -> Result<()> {
-    let timeout = match &request.command {
-        crate::ipc::ControlCommand::SplitOut(params) => params.timeout(),
-        crate::ipc::ControlCommand::Related { .. }
-        | crate::ipc::ControlCommand::PullRequests { .. }
-        | crate::ipc::ControlCommand::LinkPullRequest { .. } => crate::ipc::DEFAULT_CONTROL_TIMEOUT,
-    };
-    let response = match crate::ipc::send_request(&paths.control_socket_path, &request, timeout) {
-        Ok(response) => response,
-        Err(err) => {
-            let response = crate::ipc::ControlResponse::error("connection_failed", err.to_string());
-            print_control_response(&response, json);
-            std::process::exit(1);
-        }
-    };
+    let response = send_request_or_print(paths, &request)?;
     print_control_response(&response, json);
     if !response.ok {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn send_request_or_print(
+    paths: &DuxPaths,
+    request: &crate::ipc::ControlRequest,
+) -> Result<crate::ipc::ControlResponse> {
+    let timeout = request.command.timeout();
+    match crate::ipc::send_request(&paths.control_socket_path, request, timeout) {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            let response = crate::ipc::ControlResponse::error("connection_failed", err.to_string());
+            let json = false;
+            print_control_response(&response, json);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
@@ -1014,6 +1894,22 @@ fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
     }
     if let Some(group_id) = response.group_id.as_deref() {
         println!("group:    {group_id}");
+    }
+    if let Some(delegation_id) = response.delegation_id.as_deref() {
+        println!("delegation: {delegation_id}");
+    }
+    if let Some(state) = response.delegation_state.as_deref() {
+        println!("state:      {state}");
+    }
+    if let Some(summary) = response.result_summary.as_deref() {
+        println!("result:     {summary}");
+    }
+    if let Some(path) = response.result_path.as_deref() {
+        println!("result file: {path}");
+    }
+    if !response.delegations.is_empty() {
+        println!();
+        print_delegation_tree(response);
     }
     if !response.pull_requests.is_empty() {
         println!();

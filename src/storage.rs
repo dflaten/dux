@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use crate::config::ProjectConfig;
-use crate::model::{AgentSession, SessionStatus};
+use crate::model::{AgentSession, BaseMode, Delegation, DelegationState, SessionStatus};
 
 /// An agent session retained after deletion so it can be recovered later.
 #[derive(Clone, Debug)]
@@ -178,6 +178,48 @@ impl SessionStore {
                 created_at text not null,
                 updated_at text not null
             );
+            "#,
+        )?;
+        self.conn.execute_batch(
+            r#"
+            create table if not exists agent_delegations (
+                id text primary key,
+                group_id text not null,
+                parent_session_id text not null,
+                child_session_id text unique,
+                depth integer not null default 1,
+                iteration integer not null default 1,
+                title text not null default '',
+                request_key text,
+                brief_path text not null default '',
+                project_id text,
+                repo_path text,
+                base_mode text not null default 'leading',
+                base_ref text,
+                base_label text,
+                requested_name text,
+                provider text,
+                state text not null default 'queued',
+                state_reason text,
+                result_id text,
+                result_status text,
+                result_summary text,
+                result_path text,
+                error text,
+                created_at text not null,
+                updated_at text not null,
+                started_at text,
+                finished_at text,
+                integrated_at text,
+                integration_commit text
+            );
+            create unique index if not exists idx_agent_delegations_request
+                on agent_delegations(parent_session_id, request_key)
+                where request_key is not null;
+            create index if not exists idx_agent_delegations_group
+                on agent_delegations(group_id);
+            create index if not exists idx_agent_delegations_child
+                on agent_delegations(child_session_id);
             "#,
         )?;
         self.conn.execute_batch(
@@ -490,6 +532,104 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn upsert_delegation(&self, delegation: &Delegation) -> Result<()> {
+        self.conn.execute(
+            r#"
+            insert into agent_delegations
+                (id, group_id, parent_session_id, child_session_id, depth, iteration,
+                 title, request_key, brief_path, project_id, repo_path, base_mode,
+                 base_ref, base_label, requested_name, provider, state, state_reason,
+                 result_id, result_status, result_summary, result_path, error,
+                 created_at, updated_at, started_at, finished_at, integrated_at,
+                 integration_commit)
+            values
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+            on conflict(id) do update set
+                group_id=excluded.group_id,
+                parent_session_id=excluded.parent_session_id,
+                child_session_id=excluded.child_session_id,
+                depth=excluded.depth,
+                iteration=excluded.iteration,
+                title=excluded.title,
+                request_key=excluded.request_key,
+                brief_path=excluded.brief_path,
+                project_id=excluded.project_id,
+                repo_path=excluded.repo_path,
+                base_mode=excluded.base_mode,
+                base_ref=excluded.base_ref,
+                base_label=excluded.base_label,
+                requested_name=excluded.requested_name,
+                provider=excluded.provider,
+                state=excluded.state,
+                state_reason=excluded.state_reason,
+                result_id=excluded.result_id,
+                result_status=excluded.result_status,
+                result_summary=excluded.result_summary,
+                result_path=excluded.result_path,
+                error=excluded.error,
+                updated_at=excluded.updated_at,
+                started_at=excluded.started_at,
+                finished_at=excluded.finished_at,
+                integrated_at=excluded.integrated_at,
+                integration_commit=excluded.integration_commit
+            "#,
+            params![
+                delegation.id,
+                delegation.group_id,
+                delegation.parent_session_id,
+                delegation.child_session_id,
+                i64::from(delegation.depth),
+                i64::from(delegation.iteration),
+                delegation.title,
+                delegation.request_key,
+                delegation.brief_path,
+                delegation.project_id,
+                delegation.repo_path,
+                delegation.base_mode.as_str(),
+                delegation.base_ref,
+                delegation.base_label,
+                delegation.requested_name,
+                delegation.provider,
+                delegation.state.as_str(),
+                delegation.state_reason,
+                delegation.result_id,
+                delegation.result_status,
+                delegation.result_summary,
+                delegation.result_path,
+                delegation.error,
+                delegation.created_at.to_rfc3339(),
+                delegation.updated_at.to_rfc3339(),
+                delegation.started_at.map(|time| time.to_rfc3339()),
+                delegation.finished_at.map(|time| time.to_rfc3339()),
+                delegation.integrated_at.map(|time| time.to_rfc3339()),
+                delegation.integration_commit,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_delegations(&self) -> Result<Vec<Delegation>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            select id, group_id, parent_session_id, child_session_id, depth, iteration,
+                   title, request_key, brief_path, project_id, repo_path, base_mode,
+                   base_ref, base_label, requested_name, provider, state, state_reason,
+                   result_id, result_status, result_summary, result_path, error,
+                   created_at, updated_at, started_at, finished_at, integrated_at,
+                   integration_commit
+            from agent_delegations
+            order by created_at asc
+            "#,
+        )?;
+        let rows = stmt.query_map([], delegation_from_row)?;
+        let mut delegations = Vec::new();
+        for row in rows {
+            delegations.push(row?);
+        }
+        Ok(delegations)
+    }
+
     /// Remove groups that no longer have any active or archived sessions.
     pub fn purge_empty_groups(&self) -> Result<()> {
         self.conn.execute(
@@ -497,6 +637,7 @@ impl SessionStore {
             delete from agent_groups
             where id not in (select group_id from agent_sessions where group_id is not null)
               and id not in (select group_id from deleted_agent_sessions where group_id is not null)
+              and id not in (select group_id from agent_delegations where group_id is not null)
             "#,
             [],
         )?;
@@ -1068,6 +1209,48 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+fn parse_optional_time(value: Option<String>) -> Option<DateTime<Utc>> {
+    value.as_deref().and_then(parse_time)
+}
+
+fn delegation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Delegation> {
+    let base_mode: String = row.get(11)?;
+    let state: String = row.get(16)?;
+    let created_at: String = row.get(23)?;
+    let updated_at: String = row.get(24)?;
+    Ok(Delegation {
+        id: row.get(0)?,
+        group_id: row.get(1)?,
+        parent_session_id: row.get(2)?,
+        child_session_id: row.get(3)?,
+        depth: row.get::<_, i64>(4)?.max(1) as u32,
+        iteration: row.get::<_, i64>(5)?.max(1) as u32,
+        title: row.get(6)?,
+        request_key: row.get(7)?,
+        brief_path: row.get(8)?,
+        project_id: row.get(9)?,
+        repo_path: row.get(10)?,
+        base_mode: BaseMode::from_str(&base_mode).unwrap_or(BaseMode::Leading),
+        base_ref: row.get(12)?,
+        base_label: row.get(13)?,
+        requested_name: row.get(14)?,
+        provider: row.get(15)?,
+        state: DelegationState::from_str(&state).unwrap_or(DelegationState::Queued),
+        state_reason: row.get(17)?,
+        result_id: row.get(18)?,
+        result_status: row.get(19)?,
+        result_summary: row.get(20)?,
+        result_path: row.get(21)?,
+        error: row.get(22)?,
+        created_at: parse_time(&created_at).unwrap_or_else(Utc::now),
+        updated_at: parse_time(&updated_at).unwrap_or_else(Utc::now),
+        started_at: parse_optional_time(row.get(25)?),
+        finished_at: parse_optional_time(row.get(26)?),
+        integrated_at: parse_optional_time(row.get(27)?),
+        integration_commit: row.get(28)?,
+    })
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     let started_providers: String = row.get(8)?;
     let provider_session_ids: String = row.get(9)?;
@@ -1379,6 +1562,75 @@ mod tests {
         store.permanently_delete_session("child").unwrap();
         store.purge_empty_groups().unwrap();
         assert!(store.load_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delegations_round_trip_and_keep_their_group() {
+        let store = test_store();
+        let now = Utc::now();
+        let delegation = Delegation {
+            id: "delegation-1".to_string(),
+            group_id: "group-1".to_string(),
+            parent_session_id: "parent".to_string(),
+            child_session_id: Some("child".to_string()),
+            depth: 1,
+            iteration: 2,
+            title: "Add ledger entries".to_string(),
+            request_key: Some("ledger".to_string()),
+            brief_path: "/tmp/brief.md".to_string(),
+            project_id: Some("project-1".to_string()),
+            repo_path: Some("/tmp/repo".to_string()),
+            base_mode: BaseMode::ParentHead,
+            base_ref: Some("abc123".to_string()),
+            base_label: Some("parent: main @ abc123".to_string()),
+            requested_name: Some("ledger".to_string()),
+            provider: Some("codex".to_string()),
+            state: DelegationState::Completed,
+            state_reason: None,
+            result_id: Some("result-1".to_string()),
+            result_status: Some("success".to_string()),
+            result_summary: Some("Done.".to_string()),
+            result_path: Some("/tmp/result.json".to_string()),
+            error: None,
+            created_at: now,
+            updated_at: now,
+            started_at: Some(now),
+            finished_at: Some(now),
+            integrated_at: None,
+            integration_commit: None,
+        };
+
+        store.upsert_delegation(&delegation).unwrap();
+        let loaded = store.load_delegations().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let loaded = &loaded[0];
+        assert_eq!(loaded.id, "delegation-1");
+        assert_eq!(loaded.base_mode, BaseMode::ParentHead);
+        assert_eq!(loaded.base_ref.as_deref(), Some("abc123"));
+        assert_eq!(loaded.state, DelegationState::Completed);
+        assert_eq!(loaded.child_session_id.as_deref(), Some("child"));
+        assert_eq!(loaded.iteration, 2);
+
+        let count_groups = |store: &SessionStore| -> i64 {
+            store
+                .conn
+                .query_row("select count(*) from agent_groups", [], |row| row.get(0))
+                .unwrap()
+        };
+        store
+            .conn
+            .execute(
+                "insert into agent_groups (id, label, origin_session_id, created_at, updated_at) values (?1, ?2, ?3, ?4, ?5)",
+                params!["group-1", "mission", "parent", now.to_rfc3339(), now.to_rfc3339()],
+            )
+            .unwrap();
+        assert_eq!(count_groups(&store), 1);
+        store.purge_empty_groups().unwrap();
+        assert_eq!(
+            count_groups(&store),
+            1,
+            "a group with a delegation must survive"
+        );
     }
 
     #[test]

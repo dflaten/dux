@@ -6,6 +6,7 @@
 
 - [Configuration File](#configuration-file)
 - [Agent Control](#agent-control)
+- [Orchestration](#orchestration)
 - [Themes](#themes)
 - [Keybindings](#keybindings)
 
@@ -41,8 +42,43 @@ allow_unregistered_repos = true
   checkout as a project before creating the related worktree. Set it to `false`
   if agents should only target projects you added manually.
 
-The bundled `skills/dux-split-out/SKILL.md` teaches supported agents how to use
-the command. Dux does not install skills automatically; copy the file into your
+## Orchestration
+
+Dux can create delegation trees where a parent agent dispatches work to child
+agents in the same repository or another project. Policy lives in
+`[orchestration]`:
+
+```toml
+[orchestration]
+enabled = true
+allow_same_repo = true
+allow_nested = true
+max_depth = 3
+max_children_per_agent = 6
+max_active_descendants_per_mission = 8
+max_total_descendants_per_mission = 24
+same_repo_default_base = "parent-head"
+cross_repo_default_base = "leading"
+allow_parent_snapshot = true
+allow_agent_integration = false
+wait_default_timeout_secs = 100
+brief_max_bytes = 8388608
+result_max_bytes = 262144
+```
+
+- `max_depth` is measured below a mission root; direct children are depth 1.
+- `same_repo_default_base` controls whether same-repo children start from the
+  parent's HEAD, the project leading branch, or a working-tree snapshot.
+- `allow_parent_snapshot` permits `--base-mode parent-snapshot`, which captures
+  tracked and untracked, non-ignored files in a synthetic baseline commit.
+- `allow_agent_integration` is off by default; a human can still run
+  `dux agent integrate` from a terminal or the UI.
+- `wait_default_timeout_secs` should stay below your agent CLI's tool-call
+  timeout. A `dux agent wait` timeout exits 2 and means "poll again".
+
+The bundled `skills/dux-split-out/SKILL.md` and
+`skills/dux-orchestrate/SKILL.md` teach supported agents when and how to use
+delegation. Dux does not install skills automatically; copy the files into your
 agent's global skill directory.
 
 ## Themes
