@@ -8264,6 +8264,10 @@ mod tests {
             sessions: vec![session],
             archived_sessions: Vec::new(),
             groups: Vec::new(),
+            delegations: Vec::new(),
+            delegation_queue: std::collections::VecDeque::new(),
+            pending_delegation_plans: std::collections::VecDeque::new(),
+            delegation_request_ids: std::collections::HashMap::new(),
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             selected_left: 0,
@@ -10125,6 +10129,7 @@ not_a_real_action = ["x"]
                 focus_on_ready: true,
                 handoff_prompt: None,
                 project_added: false,
+                delegation_id: None,
             },
         );
         app.worker_tx
@@ -19571,6 +19576,7 @@ cyan = "#00ffff"
                 focus_on_ready: true,
                 handoff_prompt: None,
                 project_added: false,
+                delegation_id: None,
             },
         );
         app.worker_tx

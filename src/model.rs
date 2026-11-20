@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// GitHub CLI availability status, checked once at startup.
@@ -343,6 +344,204 @@ impl AgentSession {
         }
         self.provider_session_ids.insert(key, session_id);
         true
+    }
+}
+
+/// How a delegated child worktree chooses its starting point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseMode {
+    Leading,
+    Ref,
+    ParentHead,
+    ParentSnapshot,
+    SiblingHead,
+}
+
+impl BaseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leading => "leading",
+            Self::Ref => "ref",
+            Self::ParentHead => "parent-head",
+            Self::ParentSnapshot => "parent-snapshot",
+            Self::SiblingHead => "sibling-head",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "leading" | "project" => Some(Self::Leading),
+            "ref" | "branch" | "commit" => Some(Self::Ref),
+            "parent-head" | "parent" => Some(Self::ParentHead),
+            "parent-snapshot" | "snapshot" => Some(Self::ParentSnapshot),
+            "sibling-head" | "sibling" => Some(Self::SiblingHead),
+            _ => None,
+        }
+    }
+
+    pub fn requires_same_repo(self) -> bool {
+        matches!(
+            self,
+            Self::ParentHead | Self::ParentSnapshot | Self::SiblingHead
+        )
+    }
+}
+
+/// Lifecycle of one parent-to-child delegation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelegationState {
+    Queued,
+    Preparing,
+    Starting,
+    Resuming,
+    Running,
+    Completed,
+    Failed,
+    Blocked,
+    Cancelled,
+    Exited,
+    Interrupted,
+}
+
+impl DelegationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Preparing => "preparing",
+            Self::Starting => "starting",
+            Self::Resuming => "resuming",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Exited => "exited",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "preparing" => Some(Self::Preparing),
+            "starting" => Some(Self::Starting),
+            "resuming" => Some(Self::Resuming),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
+            "exited" => Some(Self::Exited),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+
+    /// States a `wait` call returns on. `blocked` is terminal for a wait but
+    /// resumable with a follow-up.
+    pub fn is_wait_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Failed
+                | Self::Blocked
+                | Self::Cancelled
+                | Self::Exited
+                | Self::Interrupted
+        )
+    }
+
+    pub fn is_resumable(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Blocked)
+    }
+
+    pub fn is_active(self) -> bool {
+        !self.is_wait_terminal()
+    }
+}
+
+/// One task edge from a parent agent to a delegated child agent.
+#[derive(Clone, Debug)]
+pub struct Delegation {
+    pub id: String,
+    pub group_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: Option<String>,
+    pub depth: u32,
+    pub iteration: u32,
+    pub title: String,
+    pub request_key: Option<String>,
+    pub brief_path: String,
+    pub project_id: Option<String>,
+    pub repo_path: Option<String>,
+    pub base_mode: BaseMode,
+    pub base_ref: Option<String>,
+    pub base_label: Option<String>,
+    pub requested_name: Option<String>,
+    pub provider: Option<String>,
+    pub state: DelegationState,
+    pub state_reason: Option<String>,
+    pub result_id: Option<String>,
+    pub result_status: Option<String>,
+    pub result_summary: Option<String>,
+    pub result_path: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub integrated_at: Option<DateTime<Utc>>,
+    pub integration_commit: Option<String>,
+}
+
+impl Delegation {
+    pub fn label(&self) -> &str {
+        if self.title.trim().is_empty() {
+            self.requested_name.as_deref().unwrap_or(&self.id)
+        } else {
+            &self.title
+        }
+    }
+
+    pub fn is_for_session(&self, session_id: &str) -> bool {
+        self.child_session_id.as_deref() == Some(session_id)
+    }
+}
+
+/// The durable result a delegated child reports through `dux agent finish`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DelegationResult {
+    #[serde(default)]
+    pub result_id: String,
+    pub status: String,
+    pub summary: String,
+    #[serde(default)]
+    pub details: String,
+    #[serde(default)]
+    pub tests: Vec<DelegationTestResult>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub suggested_followups: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub reported_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DelegationTestResult {
+    pub command: String,
+    pub status: String,
+}
+
+impl DelegationResult {
+    pub fn state(&self) -> DelegationState {
+        match self.status.as_str() {
+            "success" | "completed" => DelegationState::Completed,
+            "blocked" => DelegationState::Blocked,
+            _ => DelegationState::Failed,
+        }
     }
 }
 

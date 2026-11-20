@@ -30,6 +30,7 @@ Rules:
 pub struct Config {
     pub defaults: Defaults,
     pub agent_control: AgentControlConfig,
+    pub orchestration: OrchestrationConfig,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub providers: ProvidersConfig,
@@ -140,6 +141,46 @@ impl Default for AgentControlConfig {
         Self {
             enabled: true,
             allow_unregistered_repos: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OrchestrationConfig {
+    pub enabled: bool,
+    pub allow_same_repo: bool,
+    pub allow_nested: bool,
+    pub max_depth: usize,
+    pub max_children_per_agent: usize,
+    pub max_active_descendants_per_mission: usize,
+    pub max_total_descendants_per_mission: usize,
+    pub same_repo_default_base: String,
+    pub cross_repo_default_base: String,
+    pub allow_parent_snapshot: bool,
+    pub allow_agent_integration: bool,
+    pub wait_default_timeout_secs: usize,
+    pub brief_max_bytes: usize,
+    pub result_max_bytes: usize,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_same_repo: true,
+            allow_nested: true,
+            max_depth: 3,
+            max_children_per_agent: 6,
+            max_active_descendants_per_mission: 8,
+            max_total_descendants_per_mission: 24,
+            same_repo_default_base: "parent-head".to_string(),
+            cross_repo_default_base: "leading".to_string(),
+            allow_parent_snapshot: true,
+            allow_agent_integration: false,
+            wait_default_timeout_secs: 100,
+            brief_max_bytes: 8 * 1024 * 1024,
+            result_max_bytes: 256 * 1024,
         }
     }
 }
@@ -316,6 +357,7 @@ impl Default for Config {
         Self {
             defaults: Defaults::default(),
             agent_control: AgentControlConfig::default(),
+            orchestration: OrchestrationConfig::default(),
             env: BTreeMap::new(),
             providers: ProvidersConfig::default(),
             terminal: TerminalConfig::default(),
@@ -1036,6 +1078,112 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             value_fn: |c| FieldValue::Bool(c.agent_control.allow_unregistered_repos),
         },
         ConfigEntry::Blank,
+        ConfigEntry::Section("orchestration"),
+        ConfigEntry::Field {
+            key: "enabled",
+            comment: Some(CommentSource::Static(
+                "# Allow agents to delegate work to child agents (`dux agent delegate`).\n\
+                 # The control socket must also be enabled in [agent_control].",
+            )),
+            value_fn: |c| FieldValue::Bool(c.orchestration.enabled),
+        },
+        ConfigEntry::Field {
+            key: "allow_same_repo",
+            comment: Some(CommentSource::Static(
+                "# Allow a child delegation to target the parent agent's own repository.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.orchestration.allow_same_repo),
+        },
+        ConfigEntry::Field {
+            key: "allow_nested",
+            comment: Some(CommentSource::Static(
+                "# Allow delegated children to create further delegations.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.orchestration.allow_nested),
+        },
+        ConfigEntry::Field {
+            key: "max_depth",
+            comment: Some(CommentSource::Static(
+                "# Maximum depth below a mission root. Direct children are depth 1.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.max_depth),
+        },
+        ConfigEntry::Field {
+            key: "max_children_per_agent",
+            comment: Some(CommentSource::Static(
+                "# Maximum non-terminal direct children of one agent.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.max_children_per_agent),
+        },
+        ConfigEntry::Field {
+            key: "max_active_descendants_per_mission",
+            comment: Some(CommentSource::Static(
+                "# Maximum non-terminal descendants in one mission.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.max_active_descendants_per_mission),
+        },
+        ConfigEntry::Field {
+            key: "max_total_descendants_per_mission",
+            comment: Some(CommentSource::Static(
+                "# Maximum non-archived descendants in one mission. Archived history does\n\
+                 # not consume this budget.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.max_total_descendants_per_mission),
+        },
+        ConfigEntry::Field {
+            key: "same_repo_default_base",
+            comment: Some(CommentSource::Static(
+                "# Base mode for same-repo delegations: leading, parent-head, or parent-snapshot.",
+            )),
+            value_fn: |c| FieldValue::Str(c.orchestration.same_repo_default_base.clone()),
+        },
+        ConfigEntry::Field {
+            key: "cross_repo_default_base",
+            comment: Some(CommentSource::Static(
+                "# Base mode for cross-repo delegations: leading or ref.",
+            )),
+            value_fn: |c| FieldValue::Str(c.orchestration.cross_repo_default_base.clone()),
+        },
+        ConfigEntry::Field {
+            key: "allow_parent_snapshot",
+            comment: Some(CommentSource::Static(
+                "# Allow --base-mode parent-snapshot. Snapshotting captures the parent's\n\
+                 # tracked and untracked, non-ignored files in a synthetic baseline commit.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.orchestration.allow_parent_snapshot),
+        },
+        ConfigEntry::Field {
+            key: "allow_agent_integration",
+            comment: Some(CommentSource::Static(
+                "# Allow a parent agent to merge a completed child into its own worktree.\n\
+                 # Off by default; humans can still integrate from the CLI or UI.",
+            )),
+            value_fn: |c| FieldValue::Bool(c.orchestration.allow_agent_integration),
+        },
+        ConfigEntry::Field {
+            key: "wait_default_timeout_secs",
+            comment: Some(CommentSource::Static(
+                "# Default timeout for `dux agent wait`. Keep this below your agent CLI's\n\
+                 # tool-call timeout; a timeout exits 2 and the caller polls again.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.wait_default_timeout_secs),
+        },
+        ConfigEntry::Field {
+            key: "brief_max_bytes",
+            comment: Some(CommentSource::Static(
+                "# Maximum delegation brief size accepted by the CLI and TUI.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.brief_max_bytes),
+        },
+        ConfigEntry::Field {
+            key: "result_max_bytes",
+            comment: Some(CommentSource::Static(
+                "# Maximum result payload stored on disk. Status and wait only return\n\
+                 # summaries; `dux agent result --full` reads the file directly.",
+            )),
+            value_fn: |c| FieldValue::Usize(c.orchestration.result_max_bytes),
+        },
+        ConfigEntry::Blank,
         ConfigEntry::Env,
         ConfigEntry::Blank,
         ConfigEntry::Projects,
@@ -1200,7 +1348,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "pr_section_show_related",
             comment: Some(CommentSource::Static(
-                "# Include PRs from other agents in the same Multi-repo work group\n# in the right-pane Pull Requests section.",
+                "# Include PRs from other agents in the same Delegated work group\n# in the right-pane Pull Requests section.",
             )),
             value_fn: |c| FieldValue::Bool(c.ui.pr_section_show_related),
         },
@@ -1386,6 +1534,92 @@ pub fn save_config(
         "agent_control",
         "allow_unregistered_repos",
         config.agent_control.allow_unregistered_repos,
+    );
+
+    // --- [orchestration] ---
+    patch_table_bool(
+        &mut doc,
+        "orchestration",
+        "enabled",
+        config.orchestration.enabled,
+    );
+    patch_table_bool(
+        &mut doc,
+        "orchestration",
+        "allow_same_repo",
+        config.orchestration.allow_same_repo,
+    );
+    patch_table_bool(
+        &mut doc,
+        "orchestration",
+        "allow_nested",
+        config.orchestration.allow_nested,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "max_depth",
+        config.orchestration.max_depth,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "max_children_per_agent",
+        config.orchestration.max_children_per_agent,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "max_active_descendants_per_mission",
+        config.orchestration.max_active_descendants_per_mission,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "max_total_descendants_per_mission",
+        config.orchestration.max_total_descendants_per_mission,
+    );
+    patch_table_str(
+        &mut doc,
+        "orchestration",
+        "same_repo_default_base",
+        &config.orchestration.same_repo_default_base,
+    );
+    patch_table_str(
+        &mut doc,
+        "orchestration",
+        "cross_repo_default_base",
+        &config.orchestration.cross_repo_default_base,
+    );
+    patch_table_bool(
+        &mut doc,
+        "orchestration",
+        "allow_parent_snapshot",
+        config.orchestration.allow_parent_snapshot,
+    );
+    patch_table_bool(
+        &mut doc,
+        "orchestration",
+        "allow_agent_integration",
+        config.orchestration.allow_agent_integration,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "wait_default_timeout_secs",
+        config.orchestration.wait_default_timeout_secs,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "brief_max_bytes",
+        config.orchestration.brief_max_bytes,
+    );
+    patch_table_usize(
+        &mut doc,
+        "orchestration",
+        "result_max_bytes",
+        config.orchestration.result_max_bytes,
     );
 
     // --- [env] ---

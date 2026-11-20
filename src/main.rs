@@ -106,13 +106,15 @@ fn print_help() {
          Usage:\n\
           dux              Launch the TUI\n\
           dux --version    Print the version\n\
-          dux agent        Create or inspect related agent worktrees\n\
+          dux agent        Create, inspect, and coordinate delegated agents\n\
           dux pr           List or link pull requests for an agent\n\
           dux config       Manage the configuration file\n\n\
          Agent subcommands:\n\
-          dux agent split-out     Create a related worktree in another project\n\
-          dux agent related       List agents related to the current agent\n\
-          dux agent --help        Full split-out and related options\n\n\
+          dux agent delegate      Create a delegated worktree in this or another repo\n\
+          dux agent status        Show the delegation tree for an agent\n\
+          dux agent wait          Wait for delegations to finish\n\
+          dux agent finish        Report a delegated child's result\n\
+          dux agent --help        Full delegation commands and options\n\n\
          PR subcommands:\n\
           dux pr list             List pull requests associated with an agent\n\
           dux pr link <pr>        Associate a PR with an agent worktree\n\

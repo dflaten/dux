@@ -729,6 +729,90 @@ pub fn head_commit(repo_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Build a synthetic commit from a worktree's tracked and untracked,
+/// non-ignored files without touching its index, HEAD, or working files.
+///
+/// The commit becomes the starting point for `parent-snapshot` delegations.
+/// Returning a real commit keeps the child's diff base stable and makes the
+/// baseline reachable from the child branch.
+pub fn snapshot_worktree_commit(worktree: &Path) -> Result<String> {
+    let head = head_commit(worktree)?;
+    let index_path = std::env::temp_dir().join(format!(
+        "dux-snapshot-index-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    let run = |args: &[&str]| -> Result<std::process::Output> {
+        let output = Command::new("git")
+            .env("GIT_INDEX_FILE", &index_path)
+            .args(["-C", worktree.to_string_lossy().as_ref()])
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git {} failed while snapshotting {}: {}",
+                args.join(" "),
+                worktree.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(output)
+    };
+    let result = (|| -> Result<String> {
+        run(&["read-tree", &head])?;
+        run(&["add", "-A"])?;
+        let tree = String::from_utf8_lossy(&run(&["write-tree"])?.stdout)
+            .trim()
+            .to_string();
+        let head_tree = String::from_utf8_lossy(
+            &Command::new("git")
+                .args([
+                    "-C",
+                    worktree.to_string_lossy().as_ref(),
+                    "rev-parse",
+                    &format!("{head}^{{tree}}"),
+                ])
+                .output()?
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        if tree == head_tree {
+            return Ok(head);
+        }
+        let output = Command::new("git")
+            .env("GIT_INDEX_FILE", &index_path)
+            .args([
+                "-c",
+                "user.name=dux",
+                "-c",
+                "user.email=dux@localhost",
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                "dux parent snapshot",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git commit-tree failed while snapshotting {}: {}",
+                worktree.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })();
+    let _ = fs::remove_file(&index_path);
+    result
+}
+
 pub fn head_commit_time(repo_path: &Path) -> Result<chrono::DateTime<chrono::Utc>> {
     let output = Command::new("git")
         .args([
@@ -1747,6 +1831,84 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         wt
+    }
+
+    #[test]
+    fn snapshot_worktree_commit_captures_tracked_and_untracked_files() {
+        let repo = init_test_repo();
+        let worktree = add_worktree(repo.path(), "snapshot");
+        std::fs::write(worktree.join("tracked.txt"), "original\n").unwrap();
+        let add = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "add",
+                "tracked.txt",
+            ])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let commit = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "commit",
+                "-m",
+                "tracked",
+            ])
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+        std::fs::write(worktree.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(worktree.join("new.txt"), "untracked\n").unwrap();
+
+        let head = head_commit(&worktree).unwrap();
+        let snapshot = snapshot_worktree_commit(&worktree).unwrap();
+        assert_ne!(snapshot, head);
+
+        let tracked = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "show",
+                &format!("{snapshot}:tracked.txt"),
+            ])
+            .output()
+            .unwrap();
+        assert!(tracked.status.success());
+        assert_eq!(String::from_utf8_lossy(&tracked.stdout), "changed\n");
+
+        let untracked = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "show",
+                &format!("{snapshot}:new.txt"),
+            ])
+            .output()
+            .unwrap();
+        assert!(untracked.status.success());
+        assert_eq!(String::from_utf8_lossy(&untracked.stdout), "untracked\n");
+
+        // The worktree remains dirty; snapshotting must not mutate it.
+        let status = Command::new("git")
+            .args([
+                "-C",
+                worktree.to_string_lossy().as_ref(),
+                "status",
+                "--porcelain=v1",
+            ])
+            .output()
+            .unwrap();
+        assert!(!status.stdout.is_empty());
+    }
+
+    #[test]
+    fn snapshot_worktree_commit_returns_head_when_clean() {
+        let repo = init_test_repo();
+        let worktree = add_worktree(repo.path(), "clean-snapshot");
+        let head = head_commit(&worktree).unwrap();
+        assert_eq!(snapshot_worktree_commit(&worktree).unwrap(), head);
     }
 
     #[test]

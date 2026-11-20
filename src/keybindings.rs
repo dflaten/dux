@@ -121,6 +121,8 @@ pub enum Action {
     ReloadConfig,
     RecoverDeletedAgent,
     NextRelatedAgent,
+    CancelSelectedDelegation,
+    IntegrateSelectedDelegation,
 }
 
 /// Where a binding's key combo is matched.
@@ -326,6 +328,8 @@ impl Action {
             Action::ReloadConfig => "reload_config",
             Action::RecoverDeletedAgent => "recover_deleted_agent",
             Action::NextRelatedAgent => "next_related_agent",
+            Action::CancelSelectedDelegation => "cancel_selected_delegation",
+            Action::IntegrateSelectedDelegation => "integrate_selected_delegation",
         }
     }
 
@@ -500,6 +504,12 @@ impl Action {
             Action::NextRelatedAgent => {
                 "Jump to the next agent in the selected agent's related-work group."
             }
+            Action::CancelSelectedDelegation => {
+                "Cancel the selected delegated child. Its worktree is kept."
+            }
+            Action::IntegrateSelectedDelegation => {
+                "Merge the selected completed same-repo delegation into its parent."
+            }
         }
     }
 
@@ -610,7 +620,9 @@ impl Action {
             | Action::ChangeTheme
             | Action::ReloadConfig
             | Action::RecoverDeletedAgent
-            | Action::NextRelatedAgent => None,
+            | Action::NextRelatedAgent
+            | Action::CancelSelectedDelegation
+            | Action::IntegrateSelectedDelegation => None,
         }
     }
 }
@@ -1860,6 +1872,28 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "next-related-agent",
             description: "Jump to the next agent in the selected agent's related-work group",
+        }),
+    },
+    BindingDef {
+        action: Action::CancelSelectedDelegation,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "cancel-delegation",
+            description: "Cancel the selected delegated child, keeping its worktree",
+        }),
+    },
+    BindingDef {
+        action: Action::IntegrateSelectedDelegation,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "integrate-delegation",
+            description: "Merge the selected completed same-repo delegation into its parent",
         }),
     },
     BindingDef {
