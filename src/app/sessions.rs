@@ -3254,6 +3254,7 @@ impl App {
                 .map(|p| p.path.clone()),
             Some(LeftItem::EmptyProjectsSpacer) => None,
             Some(LeftItem::EmptyProjectsSeparator) => None,
+            Some(LeftItem::Delegation(_)) => None,
             Some(LeftItem::RelatedSeparator) => None,
             Some(LeftItem::RelatedGroupLabel(_)) => None,
             Some(LeftItem::ScratchSeparator) => None,

@@ -6873,6 +6873,7 @@ impl App {
             }
             Some(LeftItem::EmptyProjectsSpacer) => {}
             Some(LeftItem::EmptyProjectsSeparator) => {}
+            Some(LeftItem::Delegation(_)) => {}
             Some(LeftItem::RelatedSeparator) => {}
             Some(LeftItem::RelatedGroupLabel(_)) => {}
             Some(LeftItem::ScratchSeparator) => {}

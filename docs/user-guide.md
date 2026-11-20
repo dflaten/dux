@@ -173,8 +173,10 @@ returns 2 and means "poll again". Cancellation keeps the worktree, and
 
 Delegated children are still independent sessions. Selecting an agent in
 **Delegated work**, or using the `next-related-agent` command, switches between
-members of the same tree. The right pane shows the selected mission's
-delegations and their states. Install the bundled
+members of the same tree. Queued delegations that have not launched yet appear
+as dimmed, non-selectable rows in the same tree. When a delegated worker is
+selected, the agent pane shows a one-line banner with its parent, state, and
+result summary. Install the bundled
 `skills/dux-orchestrate/SKILL.md` skill so supported agents know when and how to
 delegate work.
 

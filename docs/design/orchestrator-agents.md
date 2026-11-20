@@ -13,8 +13,8 @@ The core delegation pipeline is implemented:
   `parent-head`, `parent-snapshot`, and `sibling-head` bases;
 - `delegate`, `status`, `tree`, `wait`, `result`, `finish`, `followup`,
   `message`, `cancel`, `retry`, and `integrate`;
-- recursive sidebar rendering, a Delegations right-pane section, and palette
-  actions for cancel and integrate;
+- recursive sidebar rendering (including pending rows) and a selected-worker
+  banner, plus palette actions for cancel and integrate;
 - `[orchestration]` policy and generated config documentation;
 - unit coverage for storage, snapshots, base resolution, tree building, and
   finish/result updates.
@@ -1070,43 +1070,33 @@ Deferred:
   Tree building already guards against duplicate/cyclic parent ids and caps
   indentation.
 
-### 10.2 Right pane: Delegations section
+### 10.2 Sidebar pending rows and worker banner
 
-The implemented **Delegations** section sits above Changes and appears when the
-selected session has children, or when it is itself a delegated worker. It is
-currently read-only; focusable rows and row actions are deferred.
+The earlier read-only **Delegations** right-pane section was removed because it
+repeated the **Delegated work** tree. The sidebar is now the single source of
+truth for mission structure:
 
-For an orchestrator:
-
-```text
-Delegations (3)
-  ✓ gift-card-ledger    billing-service   completed   2m ago
-  ● ledger-tests        billing-service   running     40s ago
-  ! storefront-button   storefront        blocked     "Need API shape"
-```
-
-For a worker:
+- Queued and preparing delegations that do not have a child session yet appear
+  as non-selectable rows inside their group, with the state glyph and reason.
+- Delegated sessions keep their state glyph and status in the existing tree.
+- The selected worker gets a one-line banner above the agent pane:
 
 ```text
-Delegated by checkout-orchestrator
-  base: parent: gift-cards @ 91be002
-  result: completed · "Added ledger entries and tests."
-  result file: ~/.config/dux/delegations/<id>/result.json
+⇄ Delegated by checkout-orchestrator · ✓ completed · Added ledger entries and tests.
 ```
 
-Queued and preparing delegations appear here too, before they have a session id.
-The section is currently read-only; queued rows can be cancelled by delegation
-id through the CLI, and the selected child can be cancelled or integrated from
-the palette.
+The banner shows the parent, lifecycle state, and either the result summary or
+the state reason. It is contextual to the selected session, so it does not
+repeat the whole tree.
 
-Implemented actions:
+Selection-based palette actions remain available:
 
 - `cancel-delegation` for the selected active child;
 - `integrate-delegation` for the selected completed same-repo child.
 
 Deferred actions:
 
-- open child agent from the section;
+- row actions directly on pending delegation rows;
 - open/copy the result;
 - follow up from the UI;
 - retry/recreate;
@@ -1165,10 +1155,9 @@ only visible through `dux agent status` would be a poor day-to-day experience.
 
 Implemented minimum:
 
-1. **Recursive sidebar tree** with depth connectors, state glyphs, and
-   cross-repo project names.
-2. **Read-only Delegations section** in the right pane, including queued rows
-   and summary previews.
+1. **Recursive sidebar tree** with depth connectors, state glyphs, cross-repo
+   project names, and non-selectable pending delegations.
+2. **Selected-worker banner** with parent, state, and result summary.
 3. **Status-line lifecycle messages** for creation, completion, blocked/failed,
    cancellation, and integration.
 4. **Palette cancel/integrate actions** for the selected child.
@@ -1177,8 +1166,8 @@ Still needed for the full minimum UI:
 
 1. Make `next-related-agent` traverse the tree depth-first.
 2. Add `focus-parent-agent`.
-3. Add cancel/follow-up/integrate/open-result/retry actions directly on the
-   Delegations section.
+3. Add cancel/follow-up/integrate/open-result/retry actions directly on pending
+   or completed delegation rows.
 4. Add the interactive `delegate-agent` modal, editable mission text,
    collapse/expand, role badges, result viewer, and search by delegation state.
 
@@ -1186,7 +1175,7 @@ The diff pane, PR pane, macros, companion terminals, and existing theme
 structure need no new UI beyond consuming the frozen delegation base.
 
 The UI must remain a pure reader for delegation status. `dux agent wait` polling
-and the right-pane refresh read cached SQLite state; they do not run git on the
+and the sidebar refresh read cached SQLite state; they do not run git on the
 UI thread.
 
 ---
@@ -1481,10 +1470,9 @@ remain the target plan, including deferred polish.
 
 **3a, minimum shippable UI**
 
-- Render the recursive sidebar tree, depth indentation, state glyphs, and
-  cross-repo project names.
-- Add the Delegations right-pane section, including queued rows and summary
-  previews.
+- Render the recursive sidebar tree, depth indentation, state glyphs,
+  cross-repo project names, and pending delegation rows.
+- Add the selected-worker banner with parent, state, and result summary.
 - Add cancel, follow-up, integrate, open-result, and retry actions.
 - Add tree-aware `next-related-agent` and `focus-parent-agent`.
 - Add status-line lifecycle messages and help-overlay entries.
