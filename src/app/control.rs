@@ -1832,6 +1832,15 @@ impl App {
         }
         self.delegation_queue
             .retain(|item| !cancelled.contains(&item.delegation_id));
+        let pending_before = self.pending_delegation_plans.len();
+        self.pending_delegation_plans
+            .retain(|plan| !cancelled.contains(&plan.delegation_id));
+        if self.pending_delegation_plans.len() < pending_before {
+            // The prepared plan was waiting for an unrelated create. Release
+            // the delegation pipeline slot so queued work can proceed.
+            self.split_out_in_flight = false;
+            self.pump_delegation_queue();
+        }
         self.rebuild_left_items();
         let message = format!(
             "Cancelled {} delegated agent(s). Their worktrees were kept.",
