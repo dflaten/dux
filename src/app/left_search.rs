@@ -136,6 +136,9 @@ fn pending_delegation_fields(delegation: &Delegation, projects: &[Project]) -> S
     if let Some(base) = delegation.base_label.as_deref() {
         fuzzy.push(base.to_lowercase());
     }
+    if let Some(reason) = delegation.state_reason.as_deref() {
+        fuzzy.push(reason.to_lowercase());
+    }
     SearchFields {
         fuzzy,
         literal: Vec::new(),
@@ -227,7 +230,8 @@ pub(crate) fn build_filtered_left_items_with_delegations(
         }
     }
 
-    let related_groups = crate::app::related_group_indices(groups, sessions);
+    let related_groups =
+        crate::app::related_group_indices_with_pending(groups, sessions, delegations);
     let related_group_ids = crate::app::related_section_group_ids(groups, &related_groups);
 
     let mut items = Vec::new();
@@ -262,8 +266,6 @@ pub(crate) fn build_filtered_left_items_with_delegations(
 
     // Delegated work is matched in its own section so a project header never
     // appears with a hidden related member as its only child.
-    let related_groups =
-        crate::app::related_group_indices_with_pending(groups, sessions, delegations);
     let mut related_items = Vec::new();
     for group_index in related_groups {
         let group = &groups[group_index];
@@ -1006,6 +1008,33 @@ mod tests {
         );
         assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Session(2)]);
         assert!(!items.contains(&LeftItem::Project(1)));
+    }
+
+    #[test]
+    fn pending_delegations_do_not_duplicate_the_origin_in_the_project_tree() {
+        let projects = projects();
+        let mut sessions = sessions();
+        let mut group = AgentGroup::new("first".to_string(), Some("s1".to_string()));
+        group.id = "g1".to_string();
+        sessions[0].group_id = Some("g1".to_string());
+        let delegations = vec![pending_delegation(
+            "g1",
+            "s1",
+            "p1",
+            "Wait for the ledger API",
+        )];
+
+        let items = build_filtered_left_items_with_delegations(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &delegations,
+            &HashSet::new(),
+            5,
+            "first",
+        );
+
+        assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Delegation(0)]);
     }
 
     #[test]

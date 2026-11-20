@@ -1076,8 +1076,10 @@ The earlier read-only **Delegations** right-pane section was removed because it
 repeated the **Delegated work** tree. The sidebar is now the single source of
 truth for mission structure:
 
-- Queued and preparing delegations that do not have a child session yet appear
-  as non-selectable rows inside their group, with the state glyph and reason.
+- Active or interrupted delegations that do not have a child session yet
+  appear as non-selectable rows inside their group, with the state glyph and
+  reason. Terminal entries that never launched are only shown when their group
+  is already in the section for another reason.
 - Delegated sessions keep their state glyph and status in the existing tree.
 - The selected worker gets a one-line banner above the agent pane:
 

@@ -409,6 +409,9 @@ impl App {
             return;
         }
         self.delegations.push(delegation.clone());
+        // The sidebar owns pending delegation rows now, so surface the queued
+        // work immediately instead of waiting for the child launch to rebuild.
+        self.rebuild_left_items_preserving_selection();
 
         let request_id = Uuid::new_v4().to_string();
         self.delegation_request_ids
@@ -683,6 +686,9 @@ impl App {
             delegation.started_at = Some(Utc::now());
         }
         let _ = self.session_store.upsert_delegation(delegation);
+        // Pending rows render their state and reason from the cached sidebar
+        // items, so refresh them when a lifecycle step advances.
+        self.rebuild_left_items_preserving_selection();
     }
 
     pub(crate) fn handle_split_out_prepared(&mut self, plan: SplitOutPlan) {
@@ -713,6 +719,9 @@ impl App {
             delegation.updated_at = Utc::now();
             let _ = self.session_store.upsert_delegation(delegation);
         }
+        // The join target is known now, so the pending row can show its
+        // project and base while the worktree is being created.
+        self.rebuild_left_items_preserving_selection();
         if plan.project_is_new {
             self.set_busy(format!(
                 "Registering \"{}\" as a project for the related worktree...",
@@ -1134,7 +1143,7 @@ impl App {
             imported = true;
         }
         if imported {
-            self.rebuild_left_items();
+            self.rebuild_left_items_preserving_selection();
         }
     }
 
@@ -1155,7 +1164,7 @@ impl App {
             changed = true;
         }
         if changed {
-            self.rebuild_left_items();
+            self.rebuild_left_items_preserving_selection();
             self.set_error(format!(
                 "A delegated agent finished, but its result could not be stored: {message}"
             ));
@@ -1266,14 +1275,12 @@ impl App {
     }
 
     /// Whether the session is the origin agent of a group that has split-out
-    /// children and therefore renders under Delegated work.
+    /// children or active pending work and therefore renders under Delegated
+    /// work.
     pub(crate) fn session_is_related_origin(&self, session: &AgentSession) -> bool {
         session.parent_session_id.is_none()
             && self.group_for_session(session).is_some_and(|group| {
-                self.sessions.iter().any(|candidate| {
-                    candidate.group_id.as_deref() == Some(group.id.as_str())
-                        && candidate.parent_session_id.is_some()
-                })
+                group_has_delegated_work(&group.id, &self.sessions, &self.delegations)
             })
     }
 
@@ -1583,7 +1590,7 @@ impl App {
         let summary = delegation.result_summary.clone();
         let title = delegation.title.clone();
         let _ = self.session_store.upsert_delegation(delegation);
-        self.rebuild_left_items();
+        self.rebuild_left_items_preserving_selection();
         let status_message = format!(
             "Delegated agent \"{title}\" reported {}. Open its result for details.",
             result.status
@@ -1729,6 +1736,7 @@ impl App {
             row.updated_at = Utc::now();
             let _ = self.session_store.upsert_delegation(row);
         }
+        self.rebuild_left_items_preserving_selection();
         let mut response = ControlResponse::success().with_message(format!(
             "Sent a follow-up to delegated agent \"{}\".",
             delegation.title
@@ -1841,7 +1849,7 @@ impl App {
             self.split_out_in_flight = false;
             self.pump_delegation_queue();
         }
-        self.rebuild_left_items();
+        self.rebuild_left_items_preserving_selection();
         let message = format!(
             "Cancelled {} delegated agent(s). Their worktrees were kept.",
             cancelled.len()

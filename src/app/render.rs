@@ -351,9 +351,47 @@ fn session_row_is_last_with_delegations(
             if current.group_id.as_deref() != Some(delegation.group_id.as_str()) {
                 return true;
             }
-            let is_sibling =
-                current.parent_session_id.as_deref() == Some(delegation.parent_session_id.as_str());
-            !is_sibling && current.id != delegation.parent_session_id
+            current.parent_session_id.as_deref() != Some(delegation.parent_session_id.as_str())
+        }
+        _ => true,
+    }
+}
+
+/// Whether a delegated session is the last row of its connector run.
+///
+/// Session siblings are ordered before pending delegation rows at the same
+/// depth. A row only gets the last connector when neither another session
+/// sibling nor a queued sibling follows it; a child row below it does not make
+/// it a sibling terminus.
+fn related_session_row_is_last(
+    items: &[LeftItem],
+    item_index: usize,
+    current: &AgentSession,
+    sessions: &[AgentSession],
+    delegations: &[Delegation],
+) -> bool {
+    let shares_parent = |group_id: &str, parent_session_id: &str| {
+        current.group_id.as_deref() == Some(group_id)
+            && current.parent_session_id.as_deref() == Some(parent_session_id)
+    };
+    match items.get(item_index + 1) {
+        Some(LeftItem::Session(next_index)) => {
+            let Some(next) = sessions.get(*next_index) else {
+                return true;
+            };
+            let Some(next_group) = next.group_id.as_deref() else {
+                return true;
+            };
+            let Some(next_parent) = next.parent_session_id.as_deref() else {
+                return true;
+            };
+            !shares_parent(next_group, next_parent)
+        }
+        Some(LeftItem::Delegation(delegation_index)) => {
+            let Some(delegation) = delegations.get(*delegation_index) else {
+                return true;
+            };
+            !shares_parent(&delegation.group_id, &delegation.parent_session_id)
         }
         _ => true,
     }
@@ -410,22 +448,29 @@ fn delegation_banner_line(
     theme: &Theme,
     delegation: &Delegation,
     parent_label: &str,
+    width: usize,
 ) -> Line<'static> {
     let (glyph, state_color) = delegation_state_dot(theme, delegation.state);
+    let state = format!("{glyph} {}", delegation.state.as_str());
+    let fixed_width = display_width("⇄ ")
+        + display_width("Delegated by ")
+        + display_width(" · ")
+        + display_width(&state);
+    let parent_budget = width.saturating_sub(fixed_width + 8).max(4);
+    let parent_label = truncate_to_width(parent_label, parent_budget);
     let mut spans = vec![
         Span::styled("⇄ ", Style::default().fg(theme.related_link_fg)),
         Span::styled("Delegated by ", Style::default().fg(theme.hint_dim_desc_fg)),
-        Span::styled(parent_label.to_string(), Style::default().fg(theme.text_fg)),
-        Span::styled(
-            format!(" · {glyph} {}", delegation.state.as_str()),
-            Style::default().fg(state_color),
-        ),
+        Span::styled(parent_label, Style::default().fg(theme.text_fg)),
+        Span::styled(format!(" · {state}"), Style::default().fg(state_color)),
     ];
     let detail = delegation
         .result_summary
         .as_deref()
         .map(|summary| summary.replace(['\n', '\r'], " "))
+        .filter(|summary| !summary.trim().is_empty())
         .or_else(|| delegation.state_reason.clone())
+        .or_else(|| delegation.error.clone())
         .map(|detail| detail.trim().to_string())
         .filter(|detail| !detail.is_empty());
     if let Some(detail) = detail {
@@ -785,7 +830,8 @@ impl App {
 
     fn render_left(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == FocusPane::Left;
-        let related_groups = related_group_indices(&self.groups, &self.sessions);
+        let related_groups =
+            related_group_indices_with_pending(&self.groups, &self.sessions, &self.delegations);
         let related_group_ids = related_section_group_ids(&self.groups, &related_groups);
 
         if self.left_collapsed {
@@ -838,14 +884,24 @@ impl App {
                             return ListItem::new(Line::from(spans));
                         }
                         let (dot, dot_color) = self.theme.session_dot(&session.status);
-                        let is_last = session_row_is_last_with_delegations(
-                            collapsed_left_items,
-                            i,
-                            session,
-                            &self.sessions,
-                            &self.delegations,
-                            &related_group_ids,
-                        );
+                        let is_last = if self.session_is_related_member(session) {
+                            related_session_row_is_last(
+                                collapsed_left_items,
+                                i,
+                                session,
+                                &self.sessions,
+                                &self.delegations,
+                            )
+                        } else {
+                            session_row_is_last_with_delegations(
+                                collapsed_left_items,
+                                i,
+                                session,
+                                &self.sessions,
+                                &self.delegations,
+                                &related_group_ids,
+                            )
+                        };
                         let connector = if is_last { "└" } else { "├" };
                         let mut spans = vec![
                             Span::styled(connector, Style::default().fg(self.theme.project_icon)),
@@ -1042,7 +1098,13 @@ impl App {
                     let is_related = self.session_is_related_member(session);
                     let is_related_origin = self.session_is_related_origin(session);
                     let is_last = if is_related {
-                        related_session_is_last_sibling(&self.sessions, session)
+                        related_session_row_is_last(
+                            left_items,
+                            i,
+                            session,
+                            &self.sessions,
+                            &self.delegations,
+                        )
                     } else {
                         session_row_is_last_with_delegations(
                             left_items,
@@ -1222,7 +1284,13 @@ impl App {
                         return ListItem::new(Line::from(""));
                     };
                     let (glyph, color) = delegation_state_dot(&self.theme, delegation.state);
-                    let indent = "  ".repeat(delegation.depth.max(1) as usize);
+                    let depth = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == delegation.parent_session_id)
+                        .map(|parent| related_session_depth(&self.sessions, parent) + 1)
+                        .unwrap_or(1);
+                    let indent = "  ".repeat(depth);
                     let is_last = !matches!(
                         left_items.get(i + 1),
                         Some(LeftItem::Delegation(next_index))
@@ -1238,7 +1306,7 @@ impl App {
                         .and_then(|id| self.projects.iter().find(|project| project.id == id))
                         .map(|project| project.name.as_str())
                         .unwrap_or("-");
-                    let mut detail = format!(" · {project} · {}", delegation.state.as_str());
+                    let mut detail = format!(" · {} · {project}", delegation.state.as_str());
                     if let Some(reason) = delegation.state_reason.as_deref() {
                         let reason = reason.replace(['\n', '\r'], " ");
                         if !reason.trim().is_empty() {
@@ -1250,10 +1318,15 @@ impl App {
                         + display_width(connector)
                         + display_width(&glyph)
                         + 1;
-                    let detail_width = display_width(&detail);
-                    let label_budget = usize::from(projects_inner_width)
-                        .saturating_sub(prefix_width + detail_width);
+                    let total_width = usize::from(projects_inner_width);
+                    // Let the label keep enough room to stay identifiable;
+                    // the state reason is the least important part of the row.
+                    let label_budget = total_width.saturating_sub(prefix_width + 12);
                     let label = truncate_to_width(delegation.label(), label_budget);
+                    let detail = truncate_to_width(
+                        &detail,
+                        total_width.saturating_sub(prefix_width + display_width(&label)),
+                    );
                     ListItem::new(Line::from(vec![
                         Span::styled(indent, Style::default().fg(self.theme.project_icon)),
                         Span::styled(connector, Style::default().fg(self.theme.project_icon)),
@@ -1520,7 +1593,9 @@ impl App {
             self.render_pr_banner(frame, pr_area, pr);
             banner_y = banner_y.saturating_add(1);
         }
-        if let Some((delegation, parent_label)) = delegation_banner.as_ref() {
+        if let Some((delegation, parent_label)) = delegation_banner.as_ref()
+            && banner_y < area.y.saturating_add(area.height)
+        {
             let delegation_area = Rect {
                 x: top_banner_area.x,
                 y: banner_y,
@@ -8955,6 +9030,7 @@ impl App {
             &self.theme,
             delegation,
             parent_label,
+            usize::from(area.width),
         ))
         .style(Style::default().bg(self.theme.app_bg))
         .render(area, frame.buffer_mut());
@@ -9408,6 +9484,31 @@ mod tests {
             &delegations,
             &related_group_ids
         ));
+        assert!(
+            !related_session_row_is_last(&items, 1, &sessions[1], &sessions, &delegations),
+            "a pending sibling follows the last session sibling"
+        );
+    }
+
+    #[test]
+    fn pending_child_does_not_change_its_parent_session_connector() {
+        let mut origin = test_session("origin", "p1");
+        origin.group_id = Some("g1".to_string());
+        let mut child = test_session("child", "p1");
+        child.group_id = Some("g1".to_string());
+        child.parent_session_id = Some("origin".to_string());
+        let sessions = vec![origin, child];
+        let delegations = vec![test_pending_delegation("pending-1", "child", "Ledger API")];
+        let items = vec![
+            LeftItem::Session(0),
+            LeftItem::Session(1),
+            LeftItem::Delegation(0),
+        ];
+
+        assert!(
+            related_session_row_is_last(&items, 1, &sessions[1], &sessions, &delegations),
+            "the child is still the last sibling even though its queued child renders below it"
+        );
     }
 
     #[test]
@@ -9417,11 +9518,30 @@ mod tests {
         delegation.state = DelegationState::Completed;
         delegation.result_summary = Some("Added ledger entries.\nTests pass.".to_string());
 
-        let line = delegation_banner_line(&theme, &delegation, "checkout-orchestrator");
+        let line = delegation_banner_line(&theme, &delegation, "checkout-orchestrator", 120);
 
         assert_eq!(
             line_text(&line),
             "⇄ Delegated by checkout-orchestrator · ✓ completed · Added ledger entries. Tests pass."
+        );
+    }
+
+    #[test]
+    fn delegation_banner_truncates_a_long_parent_without_hiding_state() {
+        let theme = Theme::default_dark();
+        let delegation = test_pending_delegation("delegation-1", "origin", "Ledger API");
+        let parent = "p".repeat(200);
+
+        let line = delegation_banner_line(&theme, &delegation, &parent, 40);
+        let text = line_text(&line);
+
+        assert!(
+            text.contains("queued"),
+            "state must survive truncation: {text}"
+        );
+        assert!(
+            !text.contains(&parent),
+            "a long parent label must not push the state off screen"
         );
     }
 
