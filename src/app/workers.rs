@@ -1190,6 +1190,9 @@ impl App {
                     self.spawn_pr_check_for_session(session_id);
                 }
             }
+            // Delegation glyphs live in the sidebar, so refresh them after a
+            // child PTY exit changes the delegation state.
+            self.rebuild_left_items_preserving_selection();
         }
 
         let mut exited_terminal_ids = Vec::new();
@@ -1812,6 +1815,7 @@ impl App {
             delegation.state_reason = None;
             delegation.updated_at = Utc::now();
             let _ = self.session_store.upsert_delegation(delegation);
+            self.rebuild_left_items_preserving_selection();
         }
 
         match request.kind {

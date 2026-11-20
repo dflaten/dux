@@ -1631,6 +1631,11 @@ pub(crate) enum LeftSection {
 pub(crate) enum LeftItem {
     Project(usize),
     Session(usize),
+    /// A delegation that does not have a child session yet. Active entries
+    /// keep their group visible so queued work can be seen without a separate
+    /// right-pane section. The row is not selectable until the child session
+    /// exists.
+    Delegation(usize),
     EmptyProjectsSpacer,
     EmptyProjectsSeparator,
     RelatedSeparator,
@@ -1664,10 +1669,29 @@ pub(crate) enum LeftSelectionTarget {
     Scratch,
 }
 
+#[cfg(test)]
 pub(crate) fn build_left_items(
     projects: &[Project],
     sessions: &[AgentSession],
     groups: &[AgentGroup],
+    collapsed_projects: &HashSet<String>,
+    empty_project_separator_min_projects: u16,
+) -> Vec<LeftItem> {
+    build_left_items_with_delegations(
+        projects,
+        sessions,
+        groups,
+        &[],
+        collapsed_projects,
+        empty_project_separator_min_projects,
+    )
+}
+
+pub(crate) fn build_left_items_with_delegations(
+    projects: &[Project],
+    sessions: &[AgentSession],
+    groups: &[AgentGroup],
+    delegations: &[Delegation],
     collapsed_projects: &HashSet<String>,
     empty_project_separator_min_projects: u16,
 ) -> Vec<LeftItem> {
@@ -1677,7 +1701,7 @@ pub(crate) fn build_left_items(
         .count();
     let split_empty_projects = empty_project_separator_min_projects > 0
         && project_count >= usize::from(empty_project_separator_min_projects);
-    let related_groups = related_group_indices(groups, sessions);
+    let related_groups = related_group_indices_with_pending(groups, sessions, delegations);
     let related_group_ids = related_section_group_ids(groups, &related_groups);
     let mut items = Vec::new();
     let mut empty_projects = Vec::new();
@@ -1719,6 +1743,7 @@ pub(crate) fn build_left_items(
                 push_related_children(
                     &mut items,
                     sessions,
+                    delegations,
                     group.id.as_str(),
                     &origin_id,
                     &mut visited,
@@ -1739,11 +1764,22 @@ pub(crate) fn build_left_items(
                         push_related_children(
                             &mut items,
                             sessions,
+                            delegations,
                             group.id.as_str(),
                             &session.id,
                             &mut visited,
                         );
                     }
+                }
+            }
+            // A pending delegation whose parent session was deleted still
+            // belongs to this group. Surface it rather than dropping the
+            // queued work from the sidebar.
+            for (delegation_index, delegation) in delegations.iter().enumerate() {
+                if pending_delegation_parent_is_missing(sessions, delegation, group.id.as_str())
+                    && !items.contains(&LeftItem::Delegation(delegation_index))
+                {
+                    items.push(LeftItem::Delegation(delegation_index));
                 }
             }
         }
@@ -1791,6 +1827,7 @@ pub(crate) fn build_left_items(
 fn push_related_children(
     items: &mut Vec<LeftItem>,
     sessions: &[AgentSession],
+    delegations: &[Delegation],
     group_id: &str,
     parent_session_id: &str,
     visited: &mut HashSet<String>,
@@ -1803,8 +1840,33 @@ fn push_related_children(
             continue;
         }
         items.push(LeftItem::Session(session_index));
-        push_related_children(items, sessions, group_id, &session.id, visited);
+        push_related_children(items, sessions, delegations, group_id, &session.id, visited);
     }
+    // Pending delegations are siblings of the sessions above. They stay
+    // non-selectable rows until the child session exists.
+    for (delegation_index, delegation) in delegations.iter().enumerate() {
+        if delegation.group_id == group_id
+            && delegation.child_session_id.is_none()
+            && delegation.parent_session_id == parent_session_id
+        {
+            items.push(LeftItem::Delegation(delegation_index));
+        }
+    }
+}
+
+/// Whether a pending delegation belongs to `group_id` but its parent session
+/// no longer exists, so the recursive child walk cannot reach it.
+fn pending_delegation_parent_is_missing(
+    sessions: &[AgentSession],
+    delegation: &Delegation,
+    group_id: &str,
+) -> bool {
+    delegation.group_id == group_id
+        && delegation.child_session_id.is_none()
+        && !sessions.iter().any(|session| {
+            session.group_id.as_deref() == Some(group_id)
+                && session.id == delegation.parent_session_id
+        })
 }
 
 /// Depth of a session inside its related-work tree. Project sessions and
@@ -1827,23 +1889,6 @@ pub(crate) fn related_session_depth(sessions: &[AgentSession], session: &AgentSe
     depth
 }
 
-/// Whether this session is the last child of its parent in sidebar order.
-pub(crate) fn related_session_is_last_sibling(
-    sessions: &[AgentSession],
-    session: &AgentSession,
-) -> bool {
-    let Some(parent_id) = session.parent_session_id.as_deref() else {
-        return true;
-    };
-    sessions
-        .iter()
-        .rfind(|candidate| {
-            candidate.group_id == session.group_id
-                && candidate.parent_session_id.as_deref() == Some(parent_id)
-        })
-        .is_none_or(|candidate| candidate.id == session.id)
-}
-
 pub(crate) fn related_group_index(groups: &[AgentGroup], session: &AgentSession) -> Option<usize> {
     session.parent_session_id.as_ref()?;
     let group_id = session.group_id.as_deref()?;
@@ -1859,6 +1904,44 @@ pub(crate) fn related_group_indices(
         if let Some(index) = related_group_index(groups, session)
             && !indices.contains(&index)
         {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
+/// Whether a group currently has work that belongs in Delegated work: a
+/// split-out child session, or an active/interrupted delegation that has not
+/// produced a session yet.
+pub(crate) fn group_has_delegated_work(
+    group_id: &str,
+    sessions: &[AgentSession],
+    delegations: &[Delegation],
+) -> bool {
+    sessions.iter().any(|session| {
+        session.group_id.as_deref() == Some(group_id) && session.parent_session_id.is_some()
+    }) || delegations.iter().any(|delegation| {
+        delegation.group_id == group_id
+            && delegation.child_session_id.is_none()
+            && (delegation.state.is_active() || delegation.state == DelegationState::Interrupted)
+    })
+}
+
+/// Like [`related_group_indices`], but also includes groups that only have
+/// active or interrupted delegations waiting for a child session. Such a
+/// delegation would otherwise be hidden from the sidebar because there is no
+/// session row yet.
+pub(crate) fn related_group_indices_with_pending(
+    groups: &[AgentGroup],
+    sessions: &[AgentSession],
+    delegations: &[Delegation],
+) -> Vec<usize> {
+    let mut indices = related_group_indices(groups, sessions);
+    for (index, group) in groups.iter().enumerate() {
+        if indices.contains(&index) {
+            continue;
+        }
+        if group_has_delegated_work(&group.id, sessions, delegations) {
             indices.push(index);
         }
     }
@@ -3447,6 +3530,22 @@ impl App {
         &self.left_items_cache
     }
 
+    /// Rebuild the sidebar while keeping the selected row stable by identity.
+    ///
+    /// Delegation lifecycle changes can move an origin between the project
+    /// tree and Delegated work, or add/remove pending rows, which shifts every
+    /// index below the change. Index-only selection would silently jump to a
+    /// different agent.
+    pub(crate) fn rebuild_left_items_preserving_selection(&mut self) {
+        let target = self.selected_left_target();
+        self.rebuild_left_items();
+        if let Some(target) = target
+            && !self.select_left_target(&target)
+        {
+            self.ensure_selectable_left_item();
+        }
+    }
+
     pub(crate) fn rebuild_left_items(&mut self) {
         // While a search filter is applied the rendered list is a subset of
         // the real tree, so the selected index can silently drift to a
@@ -3457,10 +3556,11 @@ impl App {
         } else {
             None
         };
-        self.left_items_cache = left_search::build_filtered_left_items(
+        self.left_items_cache = left_search::build_filtered_left_items_with_delegations(
             &self.projects,
             &self.sessions,
             &self.groups,
+            &self.delegations,
             &self.collapsed_projects,
             self.config.ui.empty_project_separator_min_projects,
             self.left_search_query(),
@@ -3563,7 +3663,8 @@ impl App {
         let Some(project_id) = self.selected_project().map(|project| project.id.clone()) else {
             return;
         };
-        let related_groups = related_group_indices(&self.groups, &self.sessions);
+        let related_groups =
+            related_group_indices_with_pending(&self.groups, &self.sessions, &self.delegations);
         let related_group_ids = related_section_group_ids(&self.groups, &related_groups);
         let has_visible_sessions =
             project_has_visible_sessions(&self.sessions, &project_id, &related_group_ids);
@@ -3601,6 +3702,7 @@ impl App {
             }
             Some(LeftItem::EmptyProjectsSpacer)
             | Some(LeftItem::EmptyProjectsSeparator)
+            | Some(LeftItem::Delegation(_))
             | Some(LeftItem::RelatedSeparator)
             | Some(LeftItem::RelatedGroupLabel(_))
             | Some(LeftItem::ScratchSeparator) => None,
@@ -4783,6 +4885,47 @@ mod tests {
         }
     }
 
+    fn test_pending_delegation(
+        id: &str,
+        group_id: &str,
+        parent_session_id: &str,
+        project_id: &str,
+        title: &str,
+    ) -> Delegation {
+        let now = Utc::now();
+        Delegation {
+            id: id.to_string(),
+            group_id: group_id.to_string(),
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id: None,
+            depth: 1,
+            iteration: 1,
+            title: title.to_string(),
+            request_key: None,
+            brief_path: format!("/tmp/delegations/{id}/brief.md"),
+            project_id: Some(project_id.to_string()),
+            repo_path: Some(format!("/tmp/{project_id}")),
+            base_mode: BaseMode::ParentHead,
+            base_ref: Some("abc123".to_string()),
+            base_label: Some("parent @ abc123".to_string()),
+            requested_name: Some(id.to_string()),
+            provider: Some("codex".to_string()),
+            state: DelegationState::Queued,
+            state_reason: Some("waiting for a worker slot".to_string()),
+            result_id: None,
+            result_status: None,
+            result_summary: None,
+            result_path: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            integrated_at: None,
+            integration_commit: None,
+        }
+    }
+
     #[test]
     fn deleted_agent_filter_matches_title_branch_provider_and_path() {
         let mut session = test_session("recover-branch", "project-1", 0);
@@ -4904,6 +5047,175 @@ mod tests {
         assert_eq!(related_session_depth(&sessions, &sessions[0]), 0);
         assert_eq!(related_session_depth(&sessions, &sessions[1]), 1);
         assert_eq!(related_session_depth(&sessions, &sessions[2]), 2);
+    }
+
+    #[test]
+    fn build_left_items_renders_pending_delegations_as_non_selectable_rows() {
+        let projects = vec![test_project("project-1")];
+        let mut sessions = vec![
+            test_session("origin", "project-1", 0),
+            test_session("child", "project-1", -1),
+        ];
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        sessions[0].group_id = Some(group.id.clone());
+        sessions[1].group_id = Some(group.id.clone());
+        sessions[1].parent_session_id = Some("origin".to_string());
+        let delegations = vec![test_pending_delegation(
+            "pending-1",
+            "group-1",
+            "origin",
+            "project-1",
+            "Wait for the ledger API",
+        )];
+
+        let items = build_left_items_with_delegations(
+            &projects,
+            &sessions,
+            &[group],
+            &delegations,
+            &HashSet::new(),
+            0,
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::RelatedSeparator,
+                LeftItem::Session(0),
+                LeftItem::Session(1),
+                LeftItem::Delegation(0),
+            ]
+        );
+        assert!(
+            !LeftItem::Delegation(0).is_selectable(),
+            "a queued delegation has no session to act on yet"
+        );
+    }
+
+    #[test]
+    fn build_left_items_keeps_pending_delegations_from_groups_without_sessions() {
+        let projects = vec![test_project("project-1")];
+        let mut group = AgentGroup::new(
+            "deleted-origin".to_string(),
+            Some("deleted-origin".to_string()),
+        );
+        group.id = "group-1".to_string();
+        let delegations = vec![test_pending_delegation(
+            "pending-1",
+            "group-1",
+            "deleted-origin",
+            "project-1",
+            "Recover the queued work",
+        )];
+
+        let items = build_left_items_with_delegations(
+            &projects,
+            &[],
+            &[group],
+            &delegations,
+            &HashSet::new(),
+            0,
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::RelatedSeparator,
+                LeftItem::RelatedGroupLabel(0),
+                LeftItem::Delegation(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_left_items_moves_the_origin_for_an_active_pending_delegation() {
+        let projects = vec![test_project("project-1")];
+        let mut origin = test_session("origin", "project-1", 0);
+        origin.group_id = Some("group-1".to_string());
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        let delegations = vec![test_pending_delegation(
+            "pending-1",
+            "group-1",
+            "origin",
+            "project-1",
+            "Wait for the ledger API",
+        )];
+
+        let items = build_left_items_with_delegations(
+            &projects,
+            &[origin],
+            &[group],
+            &delegations,
+            &HashSet::new(),
+            0,
+        );
+
+        assert_eq!(
+            items,
+            vec![
+                LeftItem::Project(0),
+                LeftItem::RelatedSeparator,
+                LeftItem::Session(0),
+                LeftItem::Delegation(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_left_items_leaves_the_origin_in_place_for_a_failed_childless_delegation() {
+        let projects = vec![test_project("project-1")];
+        let mut origin = test_session("origin", "project-1", 0);
+        origin.group_id = Some("group-1".to_string());
+        let mut group = AgentGroup::new("origin".to_string(), Some("origin".to_string()));
+        group.id = "group-1".to_string();
+        let mut delegation = test_pending_delegation(
+            "pending-1",
+            "group-1",
+            "origin",
+            "project-1",
+            "Failed before launch",
+        );
+        delegation.state = DelegationState::Failed;
+
+        let items = build_left_items_with_delegations(
+            &projects,
+            &[origin],
+            &[group],
+            &[delegation],
+            &HashSet::new(),
+            0,
+        );
+
+        assert_eq!(items, vec![LeftItem::Project(0), LeftItem::Session(0)]);
+    }
+
+    #[test]
+    fn group_has_delegated_work_tracks_pending_delegations() {
+        let mut origin = test_session("origin", "project-1", 0);
+        origin.group_id = Some("group-1".to_string());
+        let pending = test_pending_delegation(
+            "pending-1",
+            "group-1",
+            "origin",
+            "project-1",
+            "Wait for the ledger API",
+        );
+        let mut failed = pending.clone();
+        failed.state = DelegationState::Failed;
+
+        assert!(group_has_delegated_work(
+            "group-1",
+            &[origin.clone()],
+            &[pending]
+        ));
+        assert!(
+            !group_has_delegated_work("group-1", &[origin], &[failed]),
+            "a delegation that failed before launch should not move the origin out of its project"
+        );
     }
 
     #[test]

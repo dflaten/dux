@@ -120,6 +120,40 @@ fn project_matches(project: &Project, terms: &[String]) -> bool {
     fields_match(&project_fields(project), terms)
 }
 
+/// The fields of a pending delegation that participate in matching.
+fn pending_delegation_fields(delegation: &Delegation, projects: &[Project]) -> SearchFields {
+    let mut fuzzy = vec![
+        delegation.label().to_lowercase(),
+        delegation.state.as_str().to_lowercase(),
+    ];
+    if let Some(project) = delegation
+        .project_id
+        .as_deref()
+        .and_then(|id| projects.iter().find(|project| project.id == id))
+    {
+        fuzzy.push(project.name.to_lowercase());
+    }
+    if let Some(base) = delegation.base_label.as_deref() {
+        fuzzy.push(base.to_lowercase());
+    }
+    if let Some(reason) = delegation.state_reason.as_deref() {
+        fuzzy.push(reason.to_lowercase());
+    }
+    SearchFields {
+        fuzzy,
+        literal: Vec::new(),
+    }
+}
+
+/// Whether a pending delegation row should survive the sidebar filter.
+fn pending_delegation_matches(
+    delegation: &Delegation,
+    projects: &[Project],
+    terms: &[String],
+) -> bool {
+    fields_match(&pending_delegation_fields(delegation, projects), terms)
+}
+
 /// Whether the whole query matches the session.
 fn session_matches(
     session: &AgentSession,
@@ -138,6 +172,7 @@ fn session_matches(
 /// those agents. Collapsed projects are always expanded while filtering so
 /// matching agents stay reachable, and the empty-project grouping is skipped
 /// because the result set is already narrowed.
+#[cfg(test)]
 pub(crate) fn build_filtered_left_items(
     projects: &[Project],
     sessions: &[AgentSession],
@@ -146,12 +181,33 @@ pub(crate) fn build_filtered_left_items(
     empty_project_separator_min_projects: u16,
     query: &str,
 ) -> Vec<LeftItem> {
+    build_filtered_left_items_with_delegations(
+        projects,
+        sessions,
+        groups,
+        &[],
+        collapsed_projects,
+        empty_project_separator_min_projects,
+        query,
+    )
+}
+
+pub(crate) fn build_filtered_left_items_with_delegations(
+    projects: &[Project],
+    sessions: &[AgentSession],
+    groups: &[AgentGroup],
+    delegations: &[Delegation],
+    collapsed_projects: &HashSet<String>,
+    empty_project_separator_min_projects: u16,
+    query: &str,
+) -> Vec<LeftItem> {
     let terms = query_terms(query);
     if terms.is_empty() {
-        return build_left_items(
+        return build_left_items_with_delegations(
             projects,
             sessions,
             groups,
+            delegations,
             collapsed_projects,
             empty_project_separator_min_projects,
         );
@@ -174,7 +230,8 @@ pub(crate) fn build_filtered_left_items(
         }
     }
 
-    let related_groups = crate::app::related_group_indices(groups, sessions);
+    let related_groups =
+        crate::app::related_group_indices_with_pending(groups, sessions, delegations);
     let related_group_ids = crate::app::related_section_group_ids(groups, &related_groups);
 
     let mut items = Vec::new();
@@ -227,6 +284,23 @@ pub(crate) fn build_filtered_left_items(
                 })
         });
         let show_all_members = group_hit || origin_hit;
+        let pending = delegations
+            .iter()
+            .enumerate()
+            .filter(|(_, delegation)| {
+                delegation.group_id == group.id && delegation.child_session_id.is_none()
+            })
+            .collect::<Vec<_>>();
+        let pending_hits = pending
+            .iter()
+            .filter(|(_, delegation)| pending_delegation_matches(delegation, projects, &terms))
+            .map(|(index, _)| *index)
+            .collect::<HashSet<_>>();
+        let selected_pending = pending
+            .iter()
+            .filter(|(index, _)| show_all_members || pending_hits.contains(index))
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
         let mut members = Vec::new();
         for (index, session) in sessions.iter().enumerate() {
             if session.group_id.as_deref() != Some(group.id.as_str()) || Some(index) == origin_index
@@ -245,7 +319,7 @@ pub(crate) fn build_filtered_left_items(
                 members.push(index);
             }
         }
-        if show_all_members || !members.is_empty() {
+        if show_all_members || !members.is_empty() || !selected_pending.is_empty() {
             match origin_index {
                 Some(index) => related_items.push(LeftItem::Session(index)),
                 None => related_items.push(LeftItem::RelatedGroupLabel(group_index)),
@@ -264,6 +338,7 @@ pub(crate) fn build_filtered_left_items(
             } else {
                 related_items.extend(members.into_iter().map(LeftItem::Session));
             }
+            related_items.extend(selected_pending.into_iter().map(LeftItem::Delegation));
         }
     }
     if !related_items.is_empty() {
@@ -589,11 +664,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::build_filtered_left_items;
+    use super::{build_filtered_left_items, build_filtered_left_items_with_delegations};
     use crate::app::LeftItem;
     use crate::model::{
-        AgentGroup, AgentSession, Project, ProjectBranchStatus, ProviderKind, SCRATCH_PROJECT_ID,
-        SessionStatus,
+        AgentGroup, AgentSession, BaseMode, Delegation, DelegationState, Project,
+        ProjectBranchStatus, ProviderKind, SCRATCH_PROJECT_ID, SessionStatus,
     };
     use std::collections::HashSet;
 
@@ -657,6 +732,46 @@ mod tests {
 
     fn filtered(projects: &[Project], sessions: &[AgentSession], query: &str) -> Vec<LeftItem> {
         build_filtered_left_items(projects, sessions, &[], &HashSet::new(), 5, query)
+    }
+
+    fn pending_delegation(
+        group_id: &str,
+        parent_session_id: &str,
+        project_id: &str,
+        title: &str,
+    ) -> Delegation {
+        let now = chrono::Utc::now();
+        Delegation {
+            id: "pending-1".to_string(),
+            group_id: group_id.to_string(),
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id: None,
+            depth: 1,
+            iteration: 1,
+            title: title.to_string(),
+            request_key: None,
+            brief_path: "/tmp/delegations/pending-1/brief.md".to_string(),
+            project_id: Some(project_id.to_string()),
+            repo_path: Some(format!("/tmp/{project_id}")),
+            base_mode: BaseMode::ParentHead,
+            base_ref: Some("abc123".to_string()),
+            base_label: Some("parent @ abc123".to_string()),
+            requested_name: None,
+            provider: Some("codex".to_string()),
+            state: DelegationState::Queued,
+            state_reason: None,
+            result_id: None,
+            result_status: None,
+            result_summary: None,
+            result_path: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            integrated_at: None,
+            integration_commit: None,
+        }
     }
 
     #[test]
@@ -893,6 +1008,72 @@ mod tests {
         );
         assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Session(2)]);
         assert!(!items.contains(&LeftItem::Project(1)));
+    }
+
+    #[test]
+    fn pending_delegations_do_not_duplicate_the_origin_in_the_project_tree() {
+        let projects = projects();
+        let mut sessions = sessions();
+        let mut group = AgentGroup::new("first".to_string(), Some("s1".to_string()));
+        group.id = "g1".to_string();
+        sessions[0].group_id = Some("g1".to_string());
+        let delegations = vec![pending_delegation(
+            "g1",
+            "s1",
+            "p1",
+            "Wait for the ledger API",
+        )];
+
+        let items = build_filtered_left_items_with_delegations(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &delegations,
+            &HashSet::new(),
+            5,
+            "first",
+        );
+
+        assert_eq!(items, vec![LeftItem::Session(0), LeftItem::Delegation(0)]);
+    }
+
+    #[test]
+    fn pending_delegations_are_searchable_in_the_related_section() {
+        let projects = projects();
+        let sessions = sessions();
+        let mut group = AgentGroup::new("g1".to_string(), Some("deleted-origin".to_string()));
+        group.id = "g1".to_string();
+        let delegations = vec![pending_delegation(
+            "g1",
+            "deleted-origin",
+            "p1",
+            "Wait for the ledger API",
+        )];
+
+        let items = build_filtered_left_items_with_delegations(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &delegations,
+            &HashSet::new(),
+            5,
+            "ledger",
+        );
+        assert_eq!(
+            items,
+            vec![LeftItem::RelatedGroupLabel(0), LeftItem::Delegation(0)]
+        );
+
+        let items = build_filtered_left_items_with_delegations(
+            &projects,
+            &sessions,
+            std::slice::from_ref(&group),
+            &delegations,
+            &HashSet::new(),
+            5,
+            "nothing-matches-this",
+        );
+        assert!(items.is_empty());
     }
 
     #[test]
