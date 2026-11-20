@@ -19,23 +19,56 @@ The core delegation pipeline is implemented:
 - unit coverage for storage, snapshots, base resolution, tree building, and
   finish/result updates.
 
-Still deferred from the full proposal:
+Defects found during the post-implementation review and fixed:
 
-- quiet-period follow-up delivery (follow-ups currently type immediately when
-  the child PTY is alive);
-- the interactive delegate-agent modal, editable mission text, result viewer,
-  role badges, and search by delegation state;
+- preserved legacy `split-out` wait semantics when an older CLI omits
+  `wait_for_launch`;
+- prepared delegations now wait for an unrelated user-created agent instead of
+  failing with `busy`;
+- missed `finish` callbacks are imported on status/result/wait/followup/
+  integrate, not only at startup;
+- retry no longer duplicates a still-live child session;
+- reconnecting an interrupted child returns its delegation to `running`;
+- `message` no longer advances the task iteration like `followup`;
+- `wait --all` no longer deadlocks a nested orchestrator on its own task row;
+- `cancel --delegation <id> --subtree` now cancels descendants;
+- double integration is reported instead of merged twice, and follow-up clears
+  integration metadata;
+- oversized or unwritable results mark the delegation failed instead of leaving
+  it stuck;
+- result paths are validated, large results are compacted over the socket, and
+  brief/result files are written with user-only permissions;
+- cancelled prepared plans release the single creation slot.
+
+Still deferred or incomplete from the full proposal:
+
+- quiet-period follow-up delivery; follow-ups currently type immediately when
+  the child PTY is alive;
+- moving delegation file I/O (`brief.md`, `result.json`, result import) off the
+  TUI thread and into workers;
+- moving PTY cancellation off the TUI thread;
+- lazy synthesis of delegation rows for split-out sessions created before this
+  migration (`dux agent related` and the sidebar tree still show them);
+- git-derived result facts (commits, changed files, diff stat, PR links);
+- dirty-parent warnings for `parent-head` and `sibling-head`;
+- richer integration options (`--allow-dirty`, strategy choice, overlap
+  warnings, temporary integration worktree);
+- the interactive delegate-agent modal, follow-up UI action, result viewer,
+  editable mission text, role badges, collapse/expand, and search by delegation
+  state;
 - `allowed_repo_roots` and narrower agent-control repository policy;
 - snapshot support for explicitly included ignored files;
 - parent PTY notifications and a persistent follow-up delivery queue;
-- lazy synthesis of delegation rows for split-out sessions created before this
-  migration (`dux agent related` and the sidebar tree still show them).
+- periodic result-file scanning when nobody polls status;
+- atomic CLI result-file writes;
+- reducing mission-budget consumption by failed/cancelled attempts;
+- wait-poll jitter and configurable result-preview sizes.
 
 ## TL;DR
 
 Dux already has the seed of this feature: `dux agent split-out` lets an agent ask
 the running TUI to create a related worktree in another project, launch a child
-agent in it, and group both agents under **Multi-repo work**.
+agent in it, and group both agents under the related-work section.
 
 This design generalizes that primitive into a **delegation tree**:
 
@@ -101,8 +134,8 @@ forks.
 
 `AgentSession` has `group_id` and `parent_session_id`. `AgentGroup` stores the
 group label and origin session. SQLite already persists both, including archived
-sessions. The sidebar renders one origin plus a flat list of children under
-**Multi-repo work**.
+sessions. Before this change the sidebar rendered one origin plus a flat child
+list; it now renders a recursive **Delegated work** tree.
 
 ### 1.4 Diff base
 
@@ -180,9 +213,8 @@ child's diff. A delegation-aware diff base is required.
 | **Fork point** | The frozen commit SHA the child branch starts from. Used as the child's diff base. |
 | **Integration** | Applying a same-repo child's work to its parent. Explicit, never automatic. |
 
-The UI can keep calling the section **Multi-repo work** temporarily, but this
-design recommends renaming it to **Delegated work** because same-repo trees are
-now first-class.
+The UI uses the section name **Delegated work** because same-repo trees are now
+first-class.
 
 ---
 
@@ -208,7 +240,7 @@ now first-class.
 │ dux TUI                      │        │ SQLite                    │
 │  control.rs: validate/policy │◄──────►│  agent_groups             │
 │  queue + workers             │        │  agent_delegations        │
-│  UI tree + task pane         │        │  agent_sessions.base_ref  │
+│  UI tree + task pane         │        │  delegation base_ref      │
 └──────┬───────────────┬───────┘        └───────────────────────────┘
        │               │
        │ git worktree  │ PTY spawn
@@ -346,48 +378,52 @@ queued ──► preparing ──► starting ──► running
    │           └──► failed
    └──► cancelled
 
-blocked | completed | failed ──followup──► resuming ──delivered──► running
-                                                    └──failure──► previous state
+blocked | completed | failed ──followup──► running   (currently immediate)
 interrupted ──reattach──► running
 ```
+
+`resuming` is reserved for the planned quiet-period delivery queue. The current
+implementation writes a follow-up to the child PTY as soon as the PTY is alive,
+so it moves directly from a resumable terminal state to `running`.
 
 | State | Meaning | `wait` returns? |
 | --- | --- | --- |
 | `queued` | Accepted, waiting for a launch slot. | No |
 | `preparing` | Resolving project/refs, creating the worktree. | No |
 | `starting` | Worktree exists, startup command or PTY spawn in progress. | No |
-| `resuming` | Follow-up queued, waiting for a quiet child PTY to deliver it. | No |
+| `resuming` | Reserved for quiet-period follow-up delivery; not emitted by the current immediate-delivery implementation. | No |
 | `running` | Child PTY is alive and the child has not finished. | No |
 | `completed` | Child reported success. | Yes |
-| `failed` | Child reported failure, or launch/startup failed. | Yes |
+| `failed` | Child reported failure, or the worktree/PTY launch failed. | Yes |
 | `blocked` | Child needs a decision. Resumable with `followup`. | Yes |
 | `cancelled` | Parent or user cancelled. Worktree is kept. | Yes |
 | `exited` | PTY ended without a `finish` call. Outcome unknown. | Yes |
 | `interrupted` | Dux restarted or lost the PTY while running. | Yes |
 
 `completed`, `failed`, and `blocked` are resumable terminal states: a follow-up
-moves the delegation to `resuming` and then `running` with a new iteration.
-`resuming` is non-terminal so a `wait` issued immediately after `followup` does
-not return the stale previous result. `cancelled` is final
-unless the user creates a new delegation. Worktrees are never removed
-automatically.
+moves the delegation to `running` with a new iteration. The planned quiet-period
+queue will use `resuming` in between. The current implementation moves to
+`running` before returning, so a `wait` issued immediately afterward does not
+return the stale previous result. `cancelled` is final unless the user creates a new
+delegation. Worktrees are never removed automatically.
 
 ### 5.5 Durable files
 
 ```text
 <config_dir>/delegations/
-  pending/<uuid>.md              # staged brief from the CLI, cleaned on startup
+  pending/<uuid>.md              # staged brief from the CLI; stale files are not yet swept
   <delegation-id>/
     brief.md                     # generated preamble + user brief
     result.json                  # latest result; stable path for every iteration
-    result-1.json                # archived copy after the TUI accepts iteration 1
+    result-1.json                # archived copy after a follow-up starts iteration 2
     result-2.json                # archived copy of later iterations
-    inbox.md                     # best-effort follow-up / notification log
-    meta.json                    # non-authoritative recovery copy
+    inbox.md                     # best-effort follow-up message log
 ```
 
-Directory mode `0700`, file mode `0600`. Files are written with
-write-to-temp-then-rename.
+Directory mode `0700`, file mode `0600` for delegation files. The current
+implementation writes briefs and results directly rather than with
+write-to-temp-then-rename; simultaneous readers retry on parse failure. Moving
+these writes to a worker with atomic rename is deferred.
 
 The brief is durable because:
 
@@ -478,14 +514,15 @@ prompt for compatibility. `--prompt` and `--prompt-file` remain aliases for
 Brief staging keeps large prompts off the socket and keeps the TUI from trusting
 an arbitrary path:
 
-1. The CLI checks `brief_max_bytes`, writes the brief to
-   `<config_dir>/delegations/pending/<uuid>.md` with mode `0600`, and sends the
-   path plus SHA-256.
+1. For briefs over 64 KiB, the CLI writes the brief to
+   `<config_dir>/delegations/pending/<uuid>.md` with mode `0600` and sends the
+   path. The CLI currently uses a fixed 8 MiB limit rather than reading
+   `brief_max_bytes`.
 2. The TUI canonicalizes the path, requires it to be inside the pending
-   directory, verifies the hash and size, and moves it to
-   `<delegation-id>/brief.md`.
-3. Pending files older than 24 hours are removed at startup. A rejected request
-   leaves its staged file for that cleanup, not for another delegation.
+   directory, checks size, reads it, writes `<delegation-id>/brief.md`, and
+   removes the staged file.
+3. Stale pending files are not swept yet; failed requests can leave them behind.
+   Hash verification and startup cleanup are deferred.
 
 Inline `--brief` uses the same staging path, so the 256 KiB socket limit only
 applies to control metadata, not task content.
@@ -503,7 +540,7 @@ dux agent followup --session <id> | --delegation <id> --text-file <path|->
 dux agent message  --session <id> | --delegation <id> --text-file <path|->
 dux agent cancel   --session <id> | --delegation <id> [--subtree]
 dux agent retry    --delegation <id>
-dux agent integrate --session <id> --into <parent|session-id> --strategy ...
+dux agent integrate --session <id>
 ```
 
 `dux agent related` remains as the compatibility endpoint for the existing
@@ -519,11 +556,9 @@ flat related-agent listing; it returns the subtree as well.
 4. Reject Scratch as a target; Scratch has no git worktree.
 5. Validate git repo, project path exists, provider exists, and policy allows
    same-repo/cross-repo work.
-6. When `[agent_control] allowed_repo_roots` is non-empty, expand `~` and
-   environment variables, canonicalize every existing root, and require the
-   canonical target path to be inside one root using path-component comparison,
-   not string-prefix matching. This prevents `/code/app-evil` from matching
-   `/code/app` and prevents symlink escapes.
+6. A configurable `allowed_repo_roots` allowlist is deferred. When added, it
+   must expand `~`/environment variables, canonicalize roots, and compare path
+   components rather than string prefixes to prevent symlink escapes.
 
 Same-repo detection uses the canonical repository root, not project ids, so an
 auto-registered path that duplicates an existing project still behaves
@@ -550,14 +585,15 @@ Why freeze the SHA:
 - `git worktree add -b <name> <sha>` works for a branch, tag, or commit.
 
 The delegation-created session stores the description in `source_branch`
-(`main`, `parent: gift-cards`) and the frozen SHA in `base_ref`. Existing
-creation paths that do not set `base_ref` keep their current behavior.
+(`main`, `parent: gift-cards`); the frozen SHA lives on the delegation row and
+is resolved by `delegation_for_session`. Existing creation paths without a
+delegation keep their current behavior.
 
-**Dirty parent warning.** For `parent-head`, if the parent worktree has tracked
-or untracked changes, the response and UI warn that those changes are not
-included. The delegation still succeeds. `parent-snapshot` is the explicit
-opt-in for uncommitted work. Detection must use `git status --porcelain=v1 -z`,
-not `has_tracked_changes`, which ignores untracked files.
+**Dirty parent warning is deferred.** For `parent-head`/`sibling-head`, dirty
+committed state is used and uncommitted work is silently excluded. When added,
+detection should use `git status --porcelain=v1 -z`, not
+`has_tracked_changes`, which ignores untracked files. `parent-snapshot` is the
+explicit opt-in for uncommitted work.
 
 #### Parent snapshot
 
@@ -601,13 +637,11 @@ would duplicate that work.
   - Otherwise fail with `branch_exists` and suggest another name.
 - Idempotency applies to terminal delegations too: a retry with the same request
   key returns the existing delegation and its state rather than creating a second
-  worktree. To retry a failed launch, use `dux agent retry --delegation <id>`
-  (or the UI's `retry-delegation` action). Retry reuses the same delegation id,
-  resets it to `queued`, and picks a new request key so a stale retry cannot
-  match the old attempt. It never removes a worktree that contains commits,
-  tracked changes, or untracked files; it only cleans up a worktree that failed
-  before any user data existed. This prevents a timed-out client from
-  duplicating work.
+  worktree. To retry a pre-launch failure, use
+  `dux agent retry --delegation <id>`. The current implementation creates a new
+  delegation row with a new id and request key, and refuses if the old delegation
+  already has a child session or a surviving branch/worktree. Existing worktrees
+  must be cleaned manually. There is no UI retry action yet.
 
 ### 6.5 Acceptance semantics
 
@@ -641,24 +675,27 @@ would duplicate that work.
 Replace the global `split_out_in_flight` / `create_agent_in_flight` booleans with
 a queue shared by all agent-creation paths:
 
+Current implementation:
+
 ```text
-CreateQueue
-  queued: VecDeque<CreateRequest>
-  active: usize
-  max_active: usize                 # [orchestration] max_concurrent_launches
-  repo_locks: HashMap<PathBuf, Lock>
+delegation_queue: VecDeque<QueuedDelegation>
+pending_delegation_plans: VecDeque<SplitOutPlan>
+split_out_in_flight: bool
+create_agent_in_flight: bool
 ```
 
-- Worktree preparation is serialized per repository to avoid `git worktree add`
-  races, but different repositories may prepare concurrently.
-- PTY launches run concurrently after creation; they do not hold a slot forever.
-- User-created agents and delegated agents share the same guards so dux never
-  performs conflicting operations on one worktree.
-- The status line summarizes the queue: "Creating delegated agents (2 running,
-  3 queued)."
+- One delegation preparation/create pipeline runs at a time. Prepared plans wait
+  for an unrelated user-created agent to finish, then resume.
+- PTYs run concurrently after launch, but worktree preparation is not yet
+  parallelized across repositories.
+- User-created agents and delegated agents share the same creation slot, so dux
+  never performs conflicting operations on one worktree.
+- The status line reports the current creation action rather than a queue
+  summary.
 - Control responders stay attached to each request, so `--wait-for-launch` still
   receives the final launch result while asynchronous requests are answered as
   soon as they are queued.
+- A configurable concurrency limit and per-repository locks are deferred.
 - `MAX_CONTROL_CONNECTIONS` rises from 8 to 32. The default active-descendant
   limit is 8 and the total-descendant limit is 24, so a full fan-out fits without
   exhausting the socket.
@@ -680,7 +717,8 @@ Before queueing:
 - provider is configured;
 - brief size is within limits;
 - request key is unique, or resolves to an existing delegation;
-- target repository is inside `allowed_repo_roots` when that list is non-empty.
+- target repository is allowed by `allow_unregistered_repos` (a configurable
+  `allowed_repo_roots` allowlist is deferred).
 
 Reject with a specific `code` and an actionable message. The existing style of
 explicit failure is preserved.
@@ -719,8 +757,9 @@ dux agent finish \
 
 The path in `DUX_RESULT_FILE` is stable across iterations (`result.json`). The
 environment cannot change when the parent sends a follow-up, and a child should
-never have to know which iteration it is on. The TUI archives the accepted file
-as `result-<iteration>.json` after it records the result.
+never have to know which iteration it is on. The current TUI archives
+`result.json` as `result-<iteration>.json` when a follow-up starts the next
+iteration, not when `finish` first arrives.
 
 Behavior:
 
@@ -730,31 +769,30 @@ Behavior:
    result. A human invocation with no agent environment may target any active
    delegation for repair.
 2. Build a result object with a client-generated `result_id`.
-3. Write `result.json` atomically to the server-owned `DUX_RESULT_FILE`.
+3. Write `result.json` directly to the server-owned `DUX_RESULT_FILE` (atomic
+   temp+rename is deferred).
 4. Send `DelegationFinish` over the control socket, including the result file
    path and `result_id`. The server verifies that the path is inside the
    directory it allocated for this delegation.
-5. The TUI updates the delegation state and summary and notifies the UI. File
-   hashing, archiving, and import are queued to a worker; the UI thread does not
-   read or copy the result payload. Diff and commit facts are also computed by a
-   worker when `result` is requested.
+5. The TUI updates the delegation state and summary and notifies the UI. The
+   current implementation reads/writes the result file on the TUI thread; moving
+   hashing, archiving, and import to a worker is deferred. Git-derived facts are
+   not computed yet.
 
-If the socket is unavailable, the file remains on disk and the command exits 0
-with a warning unless `--strict` is set. On the next TUI start, and periodically
-afterward, dux imports `result.json` for delegations whose stored `result_id`
-does not match. Import and callback are idempotent: the same `result_id` is a
-no-op success, and a newer result for the same iteration supersedes the old one.
+If the socket is unavailable, the file remains on disk but the command reports
+the connection failure and exits nonzero (there is no `--strict` flag yet). The
+next TUI start, or the next status/result/wait/followup/integrate request,
+imports `result.json` for delegations whose stored `result_id` does not match.
 A result file never changes a delegation that is already `cancelled`; it is kept
 as an artifact for inspection.
 
-The result summary stored in SQLite is capped at `result_summary_max_bytes`
-(default 8 KiB). `status` and `wait` return only a `summary_preview` capped at
-`result_summary_preview_bytes` (default 512 bytes) plus a `result_available`
-flag. `dux agent result` returns the summary, git facts, PRs, and the result
-file path; `--full` reads the file directly from disk in the CLI rather than
-sending the payload over the socket. Without this split, a `wait --all` over the
-maximum 24 descendants, or a `result` near `result_max_bytes`, could exceed the
-256 KiB control response limit.
+The result summary stored in SQLite is capped at 8 KiB in the current
+implementation. `status` and `wait` return a summary preview truncated to 512
+bytes; there is no configurable preview size yet. `dux agent result` returns the
+summary and result-file path; `--full` reads the file directly from disk in the
+CLI rather than sending the payload over the socket. Without this split, a
+`wait --all` over the maximum 24 descendants, or a `result` near
+`result_max_bytes`, could exceed the 256 KiB control response limit.
 
 Result shape:
 
@@ -772,20 +810,11 @@ Result shape:
 }
 ```
 
-Dux augments the stored result with git-derived facts:
-
-- commits between `base_ref` and the child HEAD;
-- the working-tree changes the child has not committed yet;
-- changed-file list and diff stat;
-- the child's PRs from the existing PR tracking;
-- worktree path and branch.
-
-Those facts are computed in a background worker when `result` is requested and
-cached in memory for the delegation. `status` never shells out to git and never
-returns the full result payload, so polling during `wait` stays cheap and does
-not block the UI thread. `result` caps the changed-file list at 200 entries and
-sets a `truncated` flag; the full diff remains available in the TUI pane. That
-keeps a result response bounded even for a very large change.
+The current `dux agent result` implementation returns the child's reported
+payload plus the result-file path. It does **not** yet augment that with commits,
+uncommitted changes, changed files, diff stats, or PR links. `status` remains a
+pure SQLite/cache read and never shells out to git. Git-derived result facts are
+deferred; the child's worktree and diff remain inspectable in the UI.
 
 The full result file is capped at `result_max_bytes` (default 256 KiB). SQLite
 stores status, summary, path, iteration, and `result_id`; the file stores the
@@ -803,9 +832,10 @@ dux agent tree --session <id>
 `status` is a pure SQLite/cache read. It returns the delegation rows for the
 source's subtree: id, parent, child session (if any), title, state, reason,
 project, repo path, branch, worktree, base mode and label, depth, iteration,
-provider, timestamps, result status, summary preview, result availability, and
-PR summaries. It never runs git, never opens a result payload, and never returns
-the full brief.
+provider, timestamps, result status, summary preview, and result availability.
+The status response itself never runs git or returns the full brief/result. The
+control handler may first import a pending `result.json` before building the
+response.
 
 `tree` is the human-readable rendering of the same data, with indentation and
 state glyphs. The JSON shape is stable and is what orchestrator prompts should
@@ -855,8 +885,8 @@ Semantics:
   unavailable; `4` at least one is `blocked` and no harder failure occurred.
 - The CLI prints a compact progress line to stderr unless `--quiet`, and the
   final JSON/table to stdout.
-- Polling backoff: 250 ms, 500 ms, 1 s, 2 s, then cap at 2 s, with ±20% jitter so
-  several orchestrators polling at once do not synchronize.
+- Polling backoff: 250 ms, 500 ms, 1 s, 2 s, then cap at 2 s. Jitter is not
+  implemented yet.
 
 `blocked` is a first-class outcome. The child asks a question by finishing with
 `--status blocked --summary "Question..."`. The parent's wait returns; the
@@ -876,29 +906,17 @@ dux agent followup --session <child-id> --text-file - --json
   `exited` require the user to reconnect or create a new delegation.
 - Verifies the child PTY is alive. If it is not, returns `not_running` with
   instructions; dux does not silently relaunch a provider mid-task.
-- Appends the text to the child's `inbox.md` and queues the payload durably.
-  Delivery is not immediate: dux waits until the child PTY has produced output
-  and then has been quiet for `followup_quiet_ms` (default 500 ms). This avoids
-  typing into the middle of the child's final response or a still-running tool
-  call. It is the one place where a short idle heuristic is useful; it affects
-  delivery timing, not task completion.
-- Newlines are flattened the same way the initial handoff prompt is, so a raw
-  newline cannot submit half an instruction. If the provider supports bracketed
-  paste, dux may use it to preserve formatting; the fallback is a single line.
-- The queue is FIFO per child and processes one follow-up at a time. Additional
-  follow-ups append to `inbox.md` and wait for the current one to be delivered;
-  they are not typed concurrently.
-- Returns as soon as the follow-up is queued, not after delivery, so the parent's
-  tool call does not block. `--wait-for-delivery` is available when the caller
-  needs confirmation. The delegation moves to `resuming` at queue time, so a
-  subsequent `wait` cannot observe the stale terminal result.
-- When delivered, sets the delegation to `running`, increments `iteration`,
-  clears the previous terminal result summary, and leaves the old archived
-  result intact. The child must call `finish` again.
-- If delivery fails or times out after `followup_delivery_timeout_secs` (default
-  15), the delegation returns to its previous terminal state with an error and
-  the queued text remains in `inbox.md` for inspection. The iteration number is
-  only advanced on successful delivery.
+- Appends the text to the child's `inbox.md`.
+- **Current implementation:** writes the payload to the child PTY immediately
+  after verifying the PTY is alive. Newlines are flattened so a raw newline
+  cannot submit half an instruction. It moves the delegation to `running`,
+  increments `iteration`, clears the previous result summary, and archives
+  `result.json` to `result-<iteration>.json`.
+- **Planned improvement:** queue delivery until the child has produced output
+  and then been quiet for `followup_quiet_ms`; return after queueing; restore
+  the previous terminal state if delivery times out; keep a persistent FIFO
+  per child. The `resuming` state is reserved for this path.
+- The child must call `finish` again after a follow-up.
 
 This gives orchestrators an approval/revision loop without a live chat protocol:
 
@@ -910,10 +928,10 @@ spawn → wait(completed) → read result/diff → followup("fix the edge case")
 ### 7.6 Mid-run messages
 
 `dux agent message --session <id> | --delegation <id> --text-file -` is a
-best-effort, non-terminal message for a running child. It uses the same durable
-queue and quiet-period delivery as `followup`, appends to `inbox.md`, and does
-not change delegation state. It returns after queuing unless
-`--wait-for-delivery` is set. The ancestry check is the same as `followup`.
+best-effort, non-terminal message for a running child. The current
+implementation appends to `inbox.md`, writes to the live PTY immediately, and
+does not change delegation state. The planned quiet-period queue will apply to
+messages as well. The ancestry check is the same as `followup`.
 
 This exists for corrections, but the reliable coordination path is
 finish/followup. Dux does not pretend it can know when an arbitrary TUI is idle,
@@ -921,15 +939,14 @@ so it does not auto-inject messages and does not make correctness depend on them
 
 ### 7.7 Parent notifications
 
-When a child reaches a terminal state, dux:
+When a child reaches a terminal state, the current implementation updates the
+tree/state glyphs and the status line. It does not write to a parent inbox or
+type into a running parent PTY; `notify_parent_in_pty` is a deferred proposal.
 
-- updates the tree badge and status line;
-- appends a line to the parent's `inbox.md`;
-- optionally writes a one-line message into the parent PTY only if the user
-  enables `[orchestration] notify_parent_in_pty = true` (default false).
-
-The primary notification mechanism is `dux agent wait`. The UI badge and inbox
-cover the case where the orchestrator is not currently waiting.
+The primary notification mechanism is `dux agent wait` or a later
+`status`/`result` call. Without polling, the UI still reflects the child state
+on the next screen refresh after the TUI processes the finish callback or
+imports a result file.
 
 ---
 
@@ -942,32 +959,31 @@ cover the case where the orchestrator is not currently waiting.
 - The target must be a descendant of the caller's session, or the invocation is
   a human one with no agent environment.
 - `--subtree` cancels all non-terminal descendants depth-first.
-- Running PTYs receive a graceful interrupt, then are terminated after
-  `cancel_grace_secs`. This needs a new public PTY termination method; today
-  `PtyClient` only kills the child on drop.
+- A running child is removed from the provider map; `PtyClient` then kills the
+  child on drop. There is no graceful interrupt/`cancel_grace_secs` path yet,
+  and the teardown currently happens on the TUI thread.
 - Delegations become `cancelled` with a reason. Cancelling an already terminal
-  delegation returns `already_terminal` and does not change it.
+  delegation currently reports zero cancelled agents rather than
+  `already_terminal`.
 - A `finish` callback that races with cancellation does not resurrect the
-  delegation: the result is archived for inspection, but the state stays
+  delegation: the result is stored for inspection, but the state stays
   `cancelled`.
 - Worktrees and branches are **kept**. Removing them is a separate, explicit
   user action through the existing delete/cleanup flow.
-- Queued delegations are removed from the queue and marked cancelled. Queued
-  follow-up messages for the cancelled child are dropped from the delivery queue
-  but remain in `inbox.md`.
-- The parent gets a response listing what was cancelled.
+- Queued delegations are removed from the queue and prepared plans waiting for a
+  creation slot are released and marked cancelled.
+- The parent gets a count of cancelled agents, not a per-agent list.
 
-`cleanup-worktrees` must treat any worktree whose delegation is non-terminal as
-active and never offer it for cleanup. Project deletion must warn when the
-project has active delegations; dux does not remove their worktrees.
+`cleanup-worktrees` treats any worktree whose delegation is non-terminal as
+active and never offers it for cleanup. Project removal/deletion refuses while
+the project has active delegations; dux does not remove their worktrees.
 
 Deleting an orchestrator session:
 
-- If it has active descendants, the UI warns and offers "Cancel subtree first" or
-  "Delete only; children become roots of the mission."
-- Deleting only reparents nothing automatically in SQLite; children keep their
-  `parent_session_id`, and the UI treats a missing parent as a mission-root
-  child with an `orphaned` badge. Their worktrees remain intact.
+- The dedicated "Cancel subtree first / Delete only" prompt is proposed but not
+  implemented. The existing delete flow applies.
+- Children keep their `parent_session_id`; the UI treats a missing parent as a
+  mission-root child. Their worktrees remain intact.
 - Archiving preserves delegation rows so results remain inspectable.
 
 `purge_empty_groups` is extended to consider `agent_delegations`. Delegation
@@ -979,72 +995,44 @@ purged with the group.
 ## 9. Integration of same-repo work
 
 Cross-repo integration is not a history merge. The child commits, pushes, and
-opens a PR; the parent reports the PR link. Dux tracks those PRs with the
-existing `gh` integration.
+may open a PR. The existing `gh` integration can track that PR; the delegation
+result itself does not currently include PR links.
 
 Same-repo integration is explicit:
 
 ```bash
-dux agent integrate --session <child-id> --into parent --strategy merge --json
-dux agent integrate --session <child-id> --into parent --strategy patch --json
+dux agent integrate --session <child-id> --json
 ```
+
+The current implementation always targets the child's parent session.
 
 Preconditions:
 
-- child delegation is `completed` (`--allow-incomplete` is a deliberate escape
-  hatch);
-- child branch exists and the child worktree is clean for `merge`/`cherry-pick`
-  (all work committed). `patch` may include uncommitted child changes with
-  `--include-uncommitted`, but the default is to refuse rather than silently
-  omit work;
-- target is an ancestor of the child in the same mission and belongs to the same
-  repository; merging into a sibling or unrelated agent is not allowed;
-- target worktree exists;
-- target worktree has no tracked or untracked changes unless `--allow-dirty`;
-  the default is to refuse rather than risk mixing unrelated work;
-- target agent is not running unless the user explicitly confirms that it is
-  safe to modify the files underneath it;
+- child delegation is `completed`;
+- child branch exists and the child worktree is clean;
+- target is the child's parent, in the same repository;
+- target worktree exists and has no tracked or untracked changes;
+- target agent is not running;
 - agent-initiated integration is disabled by default
-  (`[orchestration] allow_agent_integration = false`). The parent cannot merge
-  its own children without the user opting in. The server distinguishes this by
-  the presence of `DUX_SESSION_ID`/`source_session_id`; a human running
-  `dux agent integrate` from a terminal has no source session and is treated as
-  a user action.
+  (`[orchestration] allow_agent_integration = false`). A human invocation has no
+  `DUX_SESSION_ID`/`source_session_id` and is treated as a user action.
 
-Strategies:
+Current strategy selection is automatic:
 
-- `merge`: `git merge --no-ff <child-branch>` in the target worktree. Used for
+- `merge`: `git merge --no-ff <child-branch>` in the parent worktree, used for
   `parent-head`, `leading`, `ref`, and `sibling-head` children.
-- `cherry-pick`: apply the child's commits one by one.
-- `patch`: compute `git diff --binary <base_ref> <child-branch>` and apply it
-  with `git apply --binary --3way`. Used for `parent-snapshot` children and as
-  a portable fallback. This is also the only sensible way to move changes across
-  repositories by hand. Omitting `--binary` silently loses binary changes.
-- Strategy selection is validated against the base mode. `parent-snapshot`
-  children default to `patch`, and `merge`/`cherry-pick` are rejected for them
-  unless the user passes an explicit override, because the snapshot baseline
-  contains the parent's uncommitted work and merging it back would duplicate
-  that work.
+- `patch`: `git diff --binary <base_ref> <child-branch>` applied with
+  `git apply --binary --3way`, used for `parent-snapshot` children.
+- There is no `--strategy`, `--into`, `--allow-incomplete`, `--allow-dirty`,
+  `--include-uncommitted`, or `--force` yet.
 
 On conflict, dux aborts the operation, leaves the target clean, and returns the
-conflicting paths. `--keep-conflicts` is intentionally not part of v1: leaving a
-running agent's worktree in a conflicted state is a foot-gun.
+error. After success it records `integrated_at` and `integration_commit`, logs
+the strategy, and keeps the child worktree. A second integration is reported as
+already integrated.
 
-After success, record `integrated_at` and `integration_commit` on the
-delegation and log the strategy. The child worktree is not deleted. If
-the same child is integrated twice, return `already_integrated` unless
-`--force`.
-
-### Overlap warnings
-
-Before integration, dux compares the child's changed-file set with:
-
-- files already changed in the target worktree;
-- files changed by siblings already integrated into the same target.
-
-If they overlap, the response includes a warning. Dux does not block the merge,
-because overlapping files are often intentional; it just makes the risk visible
-before the user commits.
+Overlap warnings, temporary integration worktrees, and cherry-pick integration
+remain deferred.
 
 ---
 
@@ -1052,7 +1040,7 @@ before the user commits.
 
 ### 10.1 Sidebar tree
 
-Replace the flat child list in **Multi-repo work** with a depth-first tree:
+Replace the flat child list in **Delegated work** with a depth-first tree:
 
 ```text
 ⇄ Gift-card launch
@@ -1062,25 +1050,31 @@ Replace the flat child list in **Multi-repo work** with a depth-first tree:
     └ ◐ storefront-button    storefront        ! blocked
 ```
 
+Implemented:
+
 - The origin remains the selectable mission heading.
 - Children are indented by depth with existing connector styling.
 - Cross-repo rows show the project name.
-- State icons come from semantic theme colors, not raw colors.
-- Search still matches title, branch, project, provider, state, and paths.
-- A collapsed mission hides descendants but keeps the aggregate state. Aggregate
-  precedence is: failed/interrupted/exited (needs attention), then blocked, then
-  running/queued, then completed. The origin itself is always shown.
-- `next-related-agent` becomes a depth-first traversal of the whole tree.
-- `focus-parent-agent` jumps to `parent_session_id`.
-- A missing parent degrades to a mission-root child with an `orphaned` badge.
-  Tree building must also guard against duplicate or cyclic `parent_session_id`
-  values from a corrupt database and cap the visual indentation.
+- State glyphs reuse existing semantic theme colors.
+- A missing parent is promoted to a mission-root child so it does not disappear.
+
+Deferred:
+
+- search by delegation state (existing search still covers title, branch,
+  project, provider, status, and paths);
+- collapsed missions and aggregate mission state;
+- depth-first `next-related-agent` (it still cycles group members in session
+  order);
+- `focus-parent-agent`;
+- an explicit `orphaned` badge.
+  Tree building already guards against duplicate/cyclic parent ids and caps
+  indentation.
 
 ### 10.2 Right pane: Delegations section
 
-Add a focusable **Delegations** section above Changes, following the pattern
-already used by **Pull Requests**. It appears when the selected session has
-children, or when it is itself a delegated worker.
+The implemented **Delegations** section sits above Changes and appears when the
+selected session has children, or when it is itself a delegated worker. It is
+currently read-only; focusable rows and row actions are deferred.
 
 For an orchestrator:
 
@@ -1101,51 +1095,53 @@ Delegated by checkout-orchestrator
 ```
 
 Queued and preparing delegations appear here too, before they have a session id.
-They can be cancelled by delegation id; they do not get a sidebar row until the
-child session exists.
+The section is currently read-only; queued rows can be cancelled by delegation
+id through the CLI, and the selected child can be cancelled or integrated from
+the palette.
 
-Actions (palette or row keys):
+Implemented actions:
 
-- open child agent;
-- open result;
-- copy branch/worktree/result path;
-- cancel delegation or subtree;
-- integrate (same repo only);
-- follow up (opens the text editor and sends an iteration);
-- retry/recreate after a failed launch;
-- mark complete manually (user override for `exited`/`interrupted`).
+- `cancel-delegation` for the selected active child;
+- `integrate-delegation` for the selected completed same-repo child.
+
+Deferred actions:
+
+- open child agent from the section;
+- open/copy the result;
+- follow up from the UI;
+- retry/recreate;
+- manual mark-complete;
+- subtree cancellation from the UI.
 
 ### 10.3 Command palette
 
-New actions, all rebindable through the existing `[keys]` mechanism:
+Implemented palette entries:
 
-- `delegate-agent` — modal to choose target project/path, title, brief, base
-  mode, provider, and create the child.
 - `cancel-delegation`
 - `integrate-delegation`
-- `followup-delegation`
-- `open-delegation-result`
-- `focus-parent-agent`
-- `focus-next-sibling`
-- `toggle-delegation-subtree`
-- `copy-delegation-brief`
-- `edit-mission` — edit `agent_groups.mission` for the selected mission
 
-The interactive delegate modal uses `PromptState` so `Esc` works uniformly, uses
-the existing multiline editor for the brief, and includes the same
-misclick-safe spacing rules as other dialogs.
+Deferred palette entries:
+
+- `delegate-agent` interactive modal;
+- `followup-delegation`;
+- `open-delegation-result`;
+- `focus-parent-agent`;
+- `focus-next-sibling`;
+- `toggle-delegation-subtree`;
+- `copy-delegation-brief`;
+- `edit-mission`.
+
+The interactive delegate modal, when implemented, should use `PromptState` so
+`Esc` works uniformly, and reuse the multiline editor and misclick-safe dialog
+spacing rules.
 
 ### 10.4 Center pane and status line
 
-- The agent pane title shows a compact role badge: `ORCH 3` for an orchestrator
-  with three children, `DELEGATED` for a worker.
-- The status line reports the full lifecycle:
-  - "Creating delegated agent "ledger-tests" in billing-service from parent HEAD..."
-  - "Delegated agent "gift-card-ledger" completed. Press Enter on its row to read
-    the result."
-  - "Cancelled 3 delegated agents. Their worktrees were kept."
-- Child completion sets an info badge, not an error, unless the result is
-  `failed` or `blocked`.
+- The proposed compact role badge (`ORCH 3` / `DELEGATED`) is not implemented.
+- The status line reports creation, completion, blocked/failed, cancellation,
+  and integration events.
+- Child completion sets an info status, warning for `blocked`, and error for
+  `failed`.
 
 ### 10.5 Theme
 
@@ -1166,28 +1162,28 @@ theme mapping in the same change.
 
 The backend and CLI can ship before the full UI, but an orchestrator that is
 only visible through `dux agent status` would be a poor day-to-day experience.
-The minimum implementation for v1 is:
 
-1. **Recursive sidebar tree.** Extend `LeftItem::Session` with a depth/role
-   field or add a dedicated delegation row type, make `build_left_items`
-   recursive, and render state glyphs, parent/child connectors, and project
-   names for cross-repo children. This is the non-negotiable change.
-2. **Delegations section in the right pane.** Add a `RightSection::Delegations`
-   above the existing PR/Changes layout in `render_files`, with state, project,
-   branch, age, and summary preview. Queued delegations appear here before they
-   have a session row.
-3. **Control actions.** Cancel, follow up, integrate, open result, and retry from
-   the Delegations section or palette. Without these, a human cannot recover
-   from a blocked or failed child without dropping to the CLI.
-4. **Status-line lifecycle messages.** Reuse the existing status API for
-   creation, completion, blocked, cancellation, and integration.
-5. **Navigation.** Make `next-related-agent` depth-first and add a
-   `focus-parent-agent` action.
+Implemented minimum:
 
-The interactive `delegate-agent` modal, editable mission text, collapse/expand
-state, role badges, result viewer, and search-by-delegation-state can follow in a
-second UI pass. The diff pane, PR pane, macros, companion terminals, and existing
-theme structure need no new UI beyond consuming `base_ref`.
+1. **Recursive sidebar tree** with depth connectors, state glyphs, and
+   cross-repo project names.
+2. **Read-only Delegations section** in the right pane, including queued rows
+   and summary previews.
+3. **Status-line lifecycle messages** for creation, completion, blocked/failed,
+   cancellation, and integration.
+4. **Palette cancel/integrate actions** for the selected child.
+
+Still needed for the full minimum UI:
+
+1. Make `next-related-agent` traverse the tree depth-first.
+2. Add `focus-parent-agent`.
+3. Add cancel/follow-up/integrate/open-result/retry actions directly on the
+   Delegations section.
+4. Add the interactive `delegate-agent` modal, editable mission text,
+   collapse/expand, role badges, result viewer, and search by delegation state.
+
+The diff pane, PR pane, macros, companion terminals, and existing theme
+structure need no new UI beyond consuming the frozen delegation base.
 
 The UI must remain a pure reader for delegation status. `dux agent wait` polling
 and the right-pane refresh read cached SQLite state; they do not run git on the
@@ -1207,11 +1203,6 @@ enabled = true
 
 # Allow --repo <path> to register an unregistered checkout as a project.
 allow_unregistered_repos = true
-
-# Optional allowlist of repository roots. Empty means any path allowed by the
-# other rules. Supports ~ and environment expansion. Roots and candidate paths
-# are canonicalized before comparison.
-allowed_repo_roots = []
 
 [orchestration]
 # Allow agents to delegate work to child agents.
@@ -1236,10 +1227,6 @@ max_active_descendants_per_mission = 8
 # consume this budget, so old completed trees do not permanently block new work.
 max_total_descendants_per_mission = 24
 
-# Simultaneous worktree preparations. PTY launches continue concurrently.
-# Values below 1 are treated as 1.
-max_concurrent_launches = 2
-
 # Default base mode for same-repo delegations.
 # leading | parent-head | parent-snapshot
 same_repo_default_base = "parent-head"
@@ -1255,25 +1242,9 @@ allow_parent_snapshot = true
 # Allow a parent agent to merge its children into its own worktree.
 allow_agent_integration = false
 
-# Allow dux to type child-completion notices into a running parent PTY.
-notify_parent_in_pty = false
-
 # Default `dux agent wait` timeout. Keep this below the tool-call timeout of the
 # agents you use; a timeout exits 2 and the caller polls again.
 wait_default_timeout_secs = 100
-
-# Maximum delay between wait status polls.
-wait_poll_max_interval_ms = 2000
-
-# How long a follow-up must see no child output before dux types it into the PTY.
-followup_quiet_ms = 500
-
-# How long dux tries to deliver a queued follow-up before returning it to the
-# previous terminal state with an error.
-followup_delivery_timeout_secs = 15
-
-# How long to wait for a cancelled child to exit before terminating it.
-cancel_grace_secs = 5
 
 # Maximum brief size accepted by the CLI and TUI.
 brief_max_bytes = 8388608
@@ -1281,17 +1252,16 @@ brief_max_bytes = 8388608
 # Maximum result payload stored on disk. `status` and `wait` only carry the
 # summary, never this full payload.
 result_max_bytes = 262144
-
-# Maximum result summary copied into SQLite.
-result_summary_max_bytes = 8192
-
-# Maximum summary preview returned by status/wait. Full text comes from result.
-result_summary_preview_bytes = 512
 ```
 
-The `[orchestration]` table and every field are added to the `ConfigEntry`
-registry, default config template, `dux config diff`, and config tests in the
-same change.
+The `[orchestration]` table and every field above are in the `ConfigEntry`
+registry, default config template, `dux config diff`, and config tests.
+
+These proposed settings are not in the generated config yet:
+`agent_control.allowed_repo_roots`, `orchestration.max_concurrent_launches`,
+`notify_parent_in_pty`, `wait_poll_max_interval_ms`, `followup_quiet_ms`,
+`followup_delivery_timeout_secs`, `cancel_grace_secs`,
+`result_summary_max_bytes`, and `result_summary_preview_bytes`.
 
 ---
 
@@ -1299,8 +1269,10 @@ same change.
 
 - **Policy first.** Every spawn, follow-up, cancel, and integration re-checks
   policy in the TUI. The CLI is not trusted to enforce limits.
-- **Bounded fan-out.** Depth, direct children, active descendants, total
-  descendants, and launch concurrency are all configurable and enforced.
+- **Bounded fan-out.** Depth, direct children, active descendants, and total
+  descendants are configurable and enforced. Worktree creation is currently
+  serialized behind one pipeline slot rather than by a configurable concurrency
+  limit.
 - **No automatic deletion.** Cancelling keeps worktrees. Deleting a worktree
   still requires the existing explicit user confirmation.
 - **No automatic merge.** Integration is opt-in and disabled for
@@ -1309,10 +1281,10 @@ same change.
   The parent only reads its result and diff.
 - **Single writer.** Only the TUI mutates git worktrees, sessions, and SQLite.
   Agents and the CLI request work over the socket.
-- **Path validation.** Repo paths are canonicalized, rejected if they point
-  inside dux's data directory, and optionally constrained by
-  `allowed_repo_roots`. Allowlist checks compare path components after
-  canonicalization, so a prefix or symlink cannot escape a root.
+- **Path validation.** Repo paths are canonicalized and rejected if they point
+  inside dux's data directory. A configurable `allowed_repo_roots` allowlist is
+  proposed but not implemented; today the boundary is
+  `[agent_control] allow_unregistered_repos`.
 - **Brief/result privacy.** Delegation files are `0600` in a `0700` directory.
 - **Bounded payloads.** Request, brief, result, and response sizes are capped,
   and oversized payloads fail explicitly rather than being truncated.
@@ -1333,10 +1305,10 @@ same change.
 | Child PTY exits without `finish` | Delegation `exited`; parent wait returns; outcome is unknown. |
 | Child PTY exits after `finish` | Leave the terminal delegation state alone; a clean exit after reporting is normal for some providers. |
 | Dux restarts while child runs | On startup, live sessions become `interrupted`; delegation waits return `interrupted` until reattached. Auto-reopen can return it to `running`. |
-| Dux restarts after result file write but before callback | `result.json` is imported on startup and by the periodic scanner. |
-| Socket unavailable during `finish` | File remains; command warns; import happens later. |
+| Dux restarts after result file write but before callback | `result.json` is imported on startup. |
+| Socket unavailable during `finish` | File remains; command warns; the next status/result/wait/followup/integrate request imports it, or the next startup does. |
 | Duplicate or late `finish` | Same `result_id` is an idempotent success; a newer result for the same iteration supersedes the old one; a result for a cancelled delegation is archived but does not change state. |
-| `finish` arrives while `resuming` | Archive the result but keep `resuming`; the queued follow-up still gets delivered and starts the next iteration. |
+| `finish` arrives while `resuming` | Planned quiet-period queue behavior: archive the result but keep `resuming`. Not reachable in the current immediate-delivery implementation. |
 | `finish` races `cancel` | Cancel wins. The result is retained as an artifact; the delegation stays `cancelled`. |
 | Parent cancelled while waiting | CLI receives `not_running` or status showing cancellation; exits nonzero. |
 | `wait` hits its 100 s timeout | Exit 2 with current progress; not a failure. The caller polls again. |
@@ -1387,17 +1359,50 @@ On startup, reconcile every non-terminal delegation:
 - **Follow-ups need a live PTY.** If a provider exits after `finish`, follow-up
   returns `not_running`. The user can reconnect/resume the agent, then retry.
   Dux does not silently relaunch a provider in the middle of a task.
-- **Follow-up delivery is best-effort.** The quiet-period gate prevents most
-  interleaving, but an arbitrary TUI can still be mid-render or mid-tool-call.
-  The inbox keeps the text if delivery fails.
+- **Follow-up delivery is immediate.** The planned quiet-period queue is not
+  implemented. A follow-up can land while the child is still printing its final
+  response or running a tool. `message` has the same limitation, though it
+  leaves delegation state unchanged.
+- **Delegation file I/O is on the UI thread.** Brief writes/copies can reach the
+  configured 8 MiB limit, and result reads/writes can reach 256 KiB. Moving these
+  to workers, with atomic writes, is deferred.
+- **PTY cancellation is on the UI thread.** Dropping a `PtyClient` joins its
+  reader thread and can briefly stall the TUI.
+- **Legacy split-out sessions are not delegations.** Groups created before this
+  migration still render in the sidebar and in `dux agent related`, but
+  `status`, `wait`, `result`, and `finish` do not synthesize rows for them.
+- **Results do not include git-derived facts.** `dux agent result` returns the
+  child's reported payload and file path, not commits, changed files, diff
+  stats, or PR links.
+- **No dirty-parent warning.** `parent-head` and `sibling-head` silently exclude
+  uncommitted parent/sibling files.
+- **Integration is basic.** It merges or patches directly into the parent
+  worktree and refuses dirty or running parents. There is no `--allow-dirty`,
+  strategy selection, overlap warning, or temporary integration worktree.
+- **Integration is not atomic across children.** Later merges can conflict with
+  earlier ones; dux does not make the set conflict-free.
+- **Cross-repo work cannot be merged by dux.** It lands through commits and PRs.
+- **Result import is lazy.** It runs at startup or when status/result/wait/
+  followup/integrate is called. If a callback is lost and nobody polls, the TUI
+  does not update until the next request or restart.
+- **Result-file writes are not atomic.** A poll can see a partial file; parsing
+  fails and retries.
+- **Mission budgets count failed/cancelled attempts.**
+  `max_total_descendants_per_mission` counts non-archived rows, including failed
+  retries.
+- **No repository allowlist.** `allowed_repo_roots` is proposed but not
+  implemented; the boundary is `allow_unregistered_repos`.
+- **The UI is partial.** Cancel and integrate are available from the palette;
+  follow-up, result viewing, interactive delegation creation, mission text,
+  role badges, subtree collapse, and delegation-state search are not.
+- **Parent notifications are not implemented.** A parent learns about a child
+  only by polling or by being in `wait`; there is no parent PTY notification or
+  inbox read command.
+- **`wait` polling has no jitter.** Several orchestrators polling together can
+  synchronize on the same backoff schedule.
 - **Snapshot excludes ignored files.** Local `.env`, dependency caches, and
   generated artifacts are not copied. Startup commands should recreate what a
   checkout needs.
-- **Integration is not atomic across children.** Merging several same-repo
-  children is a sequence of normal git merges; later merges can conflict with
-  earlier ones. Dux warns about overlapping files but cannot make the set
-  conflict-free.
-- **Cross-repo work cannot be merged by dux.** It lands through commits and PRs.
 - **A parent agent's tool timeout is outside dux's control.** This is why `wait`
   defaults to a short timeout and must be repeated on exit code 2.
 
@@ -1416,30 +1421,33 @@ On startup, reconcile every non-terminal delegation:
   `CONTROL_PROTOCOL = 1`; old clients talking to a new TUI keep working, and a
   new client talking to an old TUI receives `invalid_request` for unknown
   commands. `DUX_BIN` normally keeps both sides in lockstep.
-- Legacy sessions have `base_ref = NULL`; `diff_base_ref_for_session` keeps the
-  current project-leading behavior until a new delegation sets a base.
-- Legacy split-out rows have no `agent_delegations` row. `dux agent status` and
-  the tree synthesize a read-only delegation from the session on demand, with
-  state derived from `SessionStatus` and an empty result. New work always gets a
-  real row.
-- `agent_groups.mission` is nullable.
+- Sessions have no new columns. A legacy session with no delegation keeps the
+  current project-leading diff fallback; delegated sessions resolve their frozen
+  base through the delegation row.
+- Legacy split-out sessions have no `agent_delegations` row. The sidebar tree
+  and `dux agent related` still show them, but `dux agent status`, `wait`,
+  `result`, and `finish` do not synthesize delegation rows for them.
+- Editable `agent_groups.mission` text is not implemented in this pass.
 - All schema changes use the existing `ensure_column` migration pattern and are
   covered by a migration test that opens the oldest supported schema.
 - The UI section is renamed to **Delegated work**; `README.md`,
-  `docs/user-guide.md`, and the generated config comments are updated in the same
-  change. The search and help overlay copy are updated too.
+  `docs/user-guide.md`, and the generated config comments are updated. The help
+  overlay does not yet include delegation entries; palette entries exist for
+  cancel/integrate.
 
 ---
 
 ## 15. Implementation plan
 
-Each phase is shippable and testable on its own.
+Each phase is shippable and testable on its own. The implementation status at
+the top of this document is authoritative for what shipped; the phases below
+remain the target plan, including deferred polish.
 
 ### Phase 1 — Foundation
 
-- Add `agent_delegations`, `agent_groups.mission`, and session `base_ref` /
-  `delegation_id`, including archive-table migration. Reuse `source_branch` for
-  the human-readable base label.
+- Add `agent_delegations` (base refs live here; no session schema change).
+  Session `source_branch` remains the human-readable base label. Editable mission
+  text is deferred.
 - Add `DelegationState`, `BaseMode`, `Delegation`, and result types in
   `src/model.rs`.
 - Add storage CRUD and reconciliation.
@@ -1448,7 +1456,7 @@ Each phase is shippable and testable on its own.
   prefer it.
 - Add `--base-mode parent-head` and same-repo targeting.
 - Add `dux agent status`, `result`, and `finish`. Keep `status` a pure SQLite
-  read; compute result git facts on a worker.
+  read. Git-derived result facts are a later enhancement, not part of this pass.
 - Add durable `brief.md` / `result.json` files, idempotent result import, and
   `result_id`-based deduplication.
 - Add `dux agent wait` with the 100 s default and chunked polling semantics.
@@ -1526,6 +1534,9 @@ Each phase is shippable and testable on its own.
 ---
 
 ## 16. Testing strategy
+
+The current suite covers the implemented core. Items below that correspond to
+deferred features are planned coverage, not existing tests.
 
 ### Unit tests
 
@@ -1606,31 +1617,20 @@ than running the TUI automatically.
 
 ## 18. Open questions
 
-1. **Section rename.** Is "Delegated work" the right replacement for "Multi-repo
-   work", or should the section stay named for cross-repo work and show
-   same-repo trees under their project instead? Recommendation: one section.
-2. **Same-repo default.** `parent-head` is the safest useful default. Should dux
-   instead require an explicit base mode for same-repo spawns until users opt in?
-3. **Snapshot scope.** Are tracked plus untracked non-ignored files enough, or do
-   users need configured ignored files (`.env`) copied too? If so, add
-   `snapshot_include_ignored` with diff-noise handling.
-4. **Mission brief ownership.** Should the orchestrator's first prompt be copied
-   into `agent_groups.mission` automatically, or only when explicitly set?
-5. **Manual mark-complete.** Should users be able to mark an `exited` child as
-   completed without a child result, or should `exited` always require a new
-   child?
-6. **Agent-initiated integration.** Default off is safe. Is an explicit
-   `--yes-i-know` flag enough for power users, or should all integration require
-   the UI?
-7. **Large result payloads.** Is 256 KiB enough, or should results be split into
-   summary plus separate artifact files referenced by path?
-8. **Integration target.** Should v1 merge into the parent worktree, or should
-   dux create a temporary integration branch/worktree per mission so a dirty or
-   running parent is never touched? The latter is safer but adds lifecycle and
-   branch-cleanup complexity.
-9. **Wait defaults per provider.** Provider tool-call limits differ. Should
-   `wait_default_timeout_secs` be global, project-level, or provider-level, and
-   should the generated skill tell each provider how to loop?
+1. **Section rename.** Resolved: the UI uses **Delegated work**.
+2. **Same-repo default.** Resolved: `parent-head`.
+3. **Snapshot scope.** Open: tracked plus untracked non-ignored files only;
+   ignored `.env`/cache handling is deferred.
+4. **Mission brief ownership.** Deferred with mission text.
+5. **Manual mark-complete.** Open: `exited` still requires a new child or manual
+   worktree inspection.
+6. **Agent-initiated integration.** Resolved: off by default.
+7. **Large result payloads.** Resolved for now: 256 KiB file cap plus compact
+   control messages; splitting artifacts is still open.
+8. **Integration target.** Open: the current implementation merges/patches into
+   the parent worktree; a temporary integration worktree is deferred.
+9. **Wait defaults per provider.** Resolved for now: one global
+   `wait_default_timeout_secs` (default 100). Per-provider overrides are open.
 
 ---
 
@@ -1680,8 +1680,9 @@ The ledger API is POST /ledger/entries with {gift_card_id, amount}.
 Continue and report the PR.
 ANSWER
 
-# 6. Integrate the same-repo child after review (user or allowlisted agent).
-dux agent integrate --session <ledger-id> --into parent --strategy merge --json
+# 6. Integrate the same-repo child after review. The current command always
+# targets the parent and picks merge or patch from the base mode.
+dux agent integrate --session <ledger-id> --json
 
 # 7. Cross-repo child opens a PR; dux tracks it and the parent reports the link.
 ```
