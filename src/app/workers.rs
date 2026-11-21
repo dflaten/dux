@@ -25,6 +25,46 @@ impl App {
             })
     }
 
+    /// Status hint pointing at the force-push palette action without
+    /// hardcoding a keybinding label the user may have reconfigured.
+    fn force_push_hint(&self) -> String {
+        let palette_key = self.bindings.label_for(Action::OpenPalette);
+        if palette_key.is_empty() {
+            "Run the \"force-push-to-remote\" command from the command palette to update it with --force-with-lease.".to_string()
+        } else {
+            format!(
+                "Open the command palette with {palette_key} and run \"force-push-to-remote\" to update it with --force-with-lease."
+            )
+        }
+    }
+
+    /// Report a blocked git operation and let the running agent inspect and
+    /// integrate the remote commits that caused the block.
+    fn handle_blocked_git_operation(
+        &mut self,
+        session_id: &str,
+        operation_label: &str,
+        operation_word: &str,
+        branch_name: &str,
+        divergence: &git::RemoteDivergence,
+    ) {
+        let prompt =
+            super::input::build_remote_divergence_prompt(operation_word, branch_name, divergence);
+        let summary = format!(
+            "{operation_label} paused: {} has {} commit(s) that are not in \"{branch_name}\".",
+            divergence.remote_ref, divergence.total
+        );
+        match self.send_prompt_to_agent(session_id, &prompt, true) {
+            Ok(()) => self.set_warning(format!(
+                "{summary} Sent the details to the agent to integrate them."
+            )),
+            Err(send_err) => self.set_error(format!(
+                "{summary} Agent was not available ({send_err}); fetch and integrate {} before retrying.",
+                divergence.remote_ref
+            )),
+        }
+    }
+
     pub(crate) fn drain_events(&mut self) {
         while let Ok(event) = self.worker_rx.try_recv() {
             match event {
@@ -136,12 +176,52 @@ impl App {
                         ));
                     }
                 }
-                WorkerEvent::PushCompleted(result) => match result {
-                    Ok(()) => self.set_info(
-                        "Pushed to remote successfully. Your changes are now available to collaborators.",
-                    ),
-                    Err(e) => self.set_error(format!("Push to remote failed: {e}")),
-                },
+                WorkerEvent::PushCompleted {
+                    session_id,
+                    branch_name,
+                    force,
+                    outcome,
+                } => {
+                    if force {
+                        self.force_pushes_in_flight.remove(&session_id);
+                    }
+                    match outcome {
+                        PushOutcome::Pushed => {
+                            if force {
+                                self.set_info(format!(
+                                    "Force-pushed \"{branch_name}\" with --force-with-lease. The remote branch now points at the rebased commits."
+                                ));
+                            } else {
+                                self.set_info(
+                                    "Pushed to remote successfully. Your changes are now available to collaborators.",
+                                );
+                            }
+                        }
+                        PushOutcome::NeedsForcePush { remote_ref } => {
+                            let hint = self.force_push_hint();
+                            self.set_warning(format!(
+                                "Push blocked: {remote_ref} still contains the pre-rebase commits for \"{branch_name}\". {hint}"
+                            ));
+                        }
+                        PushOutcome::Blocked { divergence } => {
+                            let label = if force { "Force-push" } else { "Push" };
+                            let word = if force { "force-push" } else { "push" };
+                            self.handle_blocked_git_operation(
+                                &session_id,
+                                label,
+                                word,
+                                &branch_name,
+                                &divergence,
+                            );
+                        }
+                        PushOutcome::Failed(err) => {
+                            self.set_error(format!(
+                                "{} failed: {err}",
+                                if force { "Force-push" } else { "Push to remote" }
+                            ));
+                        }
+                    }
+                }
                 WorkerEvent::PullCompleted {
                     repo_path,
                     target,
@@ -200,15 +280,24 @@ impl App {
                     session_id,
                     branch_name,
                     base_ref,
+                    needs_force_push,
                     result,
                 } => {
                     self.rebases_in_flight.remove(&session_id);
                     match result {
                         Ok(()) => {
                             self.base_branch_updates.remove(&session_id);
-                            self.set_info(format!(
-                                "Rebased \"{branch_name}\" onto {base_ref}. Changes will refresh against the updated base."
-                            ));
+                            let message = if needs_force_push {
+                                let hint = self.force_push_hint();
+                                format!(
+                                    "Rebased \"{branch_name}\" onto {base_ref}. The remote branch still has the old commits. {hint}"
+                                )
+                            } else {
+                                format!(
+                                    "Rebased \"{branch_name}\" onto {base_ref}. Changes will refresh against the updated base."
+                                )
+                            };
+                            self.set_info(message);
                             self.reload_changed_files();
                         }
                         Err(e) => {
@@ -227,6 +316,16 @@ impl App {
                             }
                         }
                     }
+                }
+                WorkerEvent::RebaseBlockedByRemote {
+                    session_id,
+                    branch_name,
+                    divergence,
+                } => {
+                    self.rebases_in_flight.remove(&session_id);
+                    self.handle_blocked_git_operation(
+                        &session_id, "Rebase", "rebase", &branch_name, &divergence,
+                    );
                 }
                 WorkerEvent::ClipboardCopyCompleted { label, result } => match result {
                     Ok(()) => self.set_info(label),

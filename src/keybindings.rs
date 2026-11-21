@@ -114,6 +114,7 @@ pub enum Action {
     ConfigureProjectEnv,
     RerunStartupCommandOnAgent,
     ReadStartupCommandLogs,
+    ForcePushToRemote,
     ToggleRandomizedPetNameDefault,
     TogglePrBannerPosition,
     ForceReconnectAgent,
@@ -269,6 +270,7 @@ impl Action {
             Action::DiscardChanges => "discard_changes",
             Action::EngageCommitInput => "engage_commit_input",
             Action::PushToRemote => "push_to_remote",
+            Action::ForcePushToRemote => "force_push_to_remote",
             Action::PullFromRemote => "pull_from_remote",
             Action::RebaseCurrentBranch => "rebase_current_branch",
             Action::SearchFiles => "search_files",
@@ -424,6 +426,9 @@ impl Action {
             Action::DiscardChanges => "Discard changes to the selected file.",
             Action::EngageCommitInput => "Open the commit message editor.",
             Action::PushToRemote => "Push to remote.",
+            Action::ForcePushToRemote => {
+                "Force-push the selected agent branch with --force-with-lease to update an existing PR."
+            }
             Action::PullFromRemote => "Pull from remote.",
             Action::RebaseCurrentBranch => "Rebase the selected agent branch onto its base branch.",
             Action::SearchFiles => "Start searching changed files in the files pane.",
@@ -612,6 +617,7 @@ impl Action {
             | Action::ConfigureProjectEnv
             | Action::RerunStartupCommandOnAgent
             | Action::ReadStartupCommandLogs
+            | Action::ForcePushToRemote
             | Action::ToggleRandomizedPetNameDefault
             | Action::TogglePrBannerPosition
             | Action::ForceReconnectAgent
@@ -1460,6 +1466,17 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         palette: Some(PaletteEntry {
             name: "rebase-current-branch",
             description: "Rebase the selected agent branch onto its base branch",
+        }),
+    },
+    BindingDef {
+        action: Action::ForcePushToRemote,
+        default_keys: &[],
+        scopes: &[],
+        help: None,
+        hint_contexts: &[],
+        palette: Some(PaletteEntry {
+            name: "force-push-to-remote",
+            description: "Force-push the selected agent branch with --force-with-lease to update an existing PR",
         }),
     },
     BindingDef {
@@ -3121,6 +3138,7 @@ mod tests {
         assert!(actions_in_defs.contains(&Action::StageUnstage));
         assert!(actions_in_defs.contains(&Action::ExitCommitInput));
         assert!(actions_in_defs.contains(&Action::PushToRemote));
+        assert!(actions_in_defs.contains(&Action::ForcePushToRemote));
         assert!(actions_in_defs.contains(&Action::AddCurrentDir));
         assert!(actions_in_defs.contains(&Action::ExitPathEditorOnProjectAdd));
         assert!(actions_in_defs.contains(&Action::SearchFiles));
