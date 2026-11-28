@@ -133,11 +133,13 @@ pub fn execute(plan: MigrationPlan) -> Result<MigrationSummary> {
         summary.delegation_paths = db_summary.delegation_paths;
         summary.project_paths = db_summary.project_paths;
         summary.scratch_rows = db_summary.scratch_rows;
-
-        let (repaired, warnings) = repair_worktrees(&db_path, &plan.new_root);
-        summary.worktrees_repaired = repaired;
-        summary.warnings.extend(warnings);
     }
+
+    // Repair every worktree under the moved root, not only the ones that still
+    // have sessions. Old branches and archived worktrees are user data too.
+    let (repaired, warnings) = repair_worktrees(&plan.old_root, &plan.new_root);
+    summary.worktrees_repaired = repaired;
+    summary.warnings.extend(warnings);
 
     let config_path = new_root.join("config.toml");
     if config_path.exists() {
@@ -392,76 +394,27 @@ fn rewrite_comment_lines(raw: &str) -> String {
     out
 }
 
-/// Repair git worktree admin files for sessions that moved with the config
-/// directory. Failures are reported as warnings: the data has already moved,
-/// so aborting would leave the user with a half-finished migration.
-fn repair_worktrees(db_path: &Path, new_root: &Path) -> (usize, Vec<String>) {
-    let conn = match Connection::open(db_path) {
-        Ok(conn) => conn,
-        Err(err) => {
-            return (
-                0,
-                vec![format!(
-                    "could not open {} to repair worktrees: {err}",
-                    db_path.display()
-                )],
-            );
-        }
-    };
-
+/// Repair git worktree admin files for every worktree under the moved root.
+///
+/// Worktrees store an absolute `gitdir` pointer, so a directory move breaks
+/// the link even when the project repository itself did not move. Walking the
+/// worktree tree (rather than only session rows) also repairs archived and
+/// unreferenced branches, which are still user data.
+///
+/// Failures are reported as warnings: the data has already moved, so aborting
+/// would leave the user with a half-finished migration.
+fn repair_worktrees(old_root: &Path, new_root: &Path) -> (usize, Vec<String>) {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let new_prefix = format!("{}/", path_string(new_root));
-    for table in ["agent_sessions", "deleted_agent_sessions"] {
-        match table_exists(&conn, table) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(err) => {
-                return (
-                    0,
-                    vec![format!(
-                        "could not inspect {table} for worktree repair: {err}"
-                    )],
-                );
-            }
-        }
-        let query = format!(
-            "select project_path, worktree_path from {table} \
-             where project_path is not null and project_path <> '' \
-               and worktree_path is not null and worktree_path <> '' \
-               and project_id <> ?1"
-        );
-        let mut stmt = match conn.prepare(&query) {
-            Ok(stmt) => stmt,
-            Err(err) => {
-                return (
-                    0,
-                    vec![format!(
-                        "could not inspect {table} for worktree repair: {err}"
-                    )],
-                );
-            }
-        };
-        let rows = match stmt.query_map([SCRATCH_PROJECT_ID], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) {
-            Ok(rows) => rows,
-            Err(err) => {
-                return (
-                    0,
-                    vec![format!(
-                        "could not inspect {table} for worktree repair: {err}"
-                    )],
-                );
-            }
-        };
-
-        for row in rows.flatten() {
-            let (project, worktree) = row;
-            if project == worktree || !worktree.starts_with(&new_prefix) {
-                continue;
-            }
-            grouped.entry(project).or_default().push(worktree);
-        }
+    collect_moved_worktrees(
+        &new_root.join("worktrees"),
+        old_root,
+        new_root,
+        0,
+        &mut grouped,
+    );
+    for worktrees in grouped.values_mut() {
+        worktrees.sort();
+        worktrees.dedup();
     }
 
     let mut repaired = 0;
@@ -495,6 +448,56 @@ fn repair_worktrees(db_path: &Path, new_root: &Path) -> (usize, Vec<String>) {
         }
     }
     (repaired, warnings)
+}
+
+fn collect_moved_worktrees(
+    dir: &Path,
+    old_root: &Path,
+    new_root: &Path,
+    depth: usize,
+    grouped: &mut BTreeMap<String, Vec<String>>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let git_file = path.join(".git");
+        if git_file.is_file() {
+            if let Some(repo) = worktree_repo(&git_file, old_root, new_root) {
+                grouped
+                    .entry(repo)
+                    .or_default()
+                    .push(path.to_string_lossy().into_owned());
+            }
+            continue;
+        }
+        collect_moved_worktrees(&path, old_root, new_root, depth + 1, grouped);
+    }
+}
+
+/// Read a worktree's `.git` file and return the project repository it belongs
+/// to. A `gitdir` pointing inside the old root is rewritten to the new root so
+/// project repositories that moved with the migration are still found.
+fn worktree_repo(git_file: &Path, old_root: &Path, new_root: &Path) -> Option<String> {
+    let text = fs::read_to_string(git_file).ok()?;
+    let gitdir = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir: "))?
+        .trim();
+    let repo = gitdir.split("/.git/worktrees/").next()?;
+    if !repo.starts_with('/') {
+        return None;
+    }
+    let old_prefix = path_string(old_root);
+    let new_prefix = path_string(new_root);
+    Some(rewrite_path_prefix(repo, &old_prefix, &new_prefix).unwrap_or_else(|| repo.to_string()))
 }
 
 #[cfg(test)]
@@ -637,6 +640,38 @@ name = "dux"
             )
             .expect("sibling");
         assert_eq!(sibling, "/home/me/.config/dux-old/worktrees/p/a");
+    }
+
+    #[test]
+    fn discovers_worktrees_under_the_new_root_and_maps_moved_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_root = temp.path().join("dux");
+        let new_root = temp.path().join("yvo");
+        let worktree = new_root.join("worktrees/project/branch");
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}/repo/.git/worktrees/branch\n",
+                old_root.display()
+            ),
+        )
+        .expect("gitfile");
+
+        let mut grouped = BTreeMap::new();
+        collect_moved_worktrees(
+            &new_root.join("worktrees"),
+            &old_root,
+            &new_root,
+            0,
+            &mut grouped,
+        );
+
+        let repo = new_root.join("repo").to_string_lossy().into_owned();
+        assert_eq!(
+            grouped.get(&repo),
+            Some(&vec![worktree.to_string_lossy().into_owned()])
+        );
     }
 
     #[test]
