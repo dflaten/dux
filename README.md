@@ -9,7 +9,7 @@
   <img alt="License" src="https://img.shields.io/github/license/dflaten/yvo" />
 </p>
 
-<img src="assets/yvo-logo.svg" width="200" align="right" />
+<img src="assets/yvo-logo.svg" width="200" align="right" alt="yvo logo" />
 
 `yvo` is a terminal UI for orchestrating multiple AI coding agents, each project agent in its own git worktree, plus ad-hoc scratch agents that are not attached to a project, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
 
