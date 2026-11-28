@@ -410,7 +410,7 @@ impl App {
             || git::is_under(&self.paths.root, &destination)
         {
             self.set_error(format!(
-                "Destination must be outside dux's data directory ({}).",
+                "Destination must be outside yvo's data directory ({}).",
                 self.paths.root.display()
             ));
             return Ok(());
@@ -1025,7 +1025,7 @@ impl App {
     }
 
     /// Actionable warning shown when a worktree is pinned to a provider that
-    /// isn't configured. dux refuses to launch it and keeps running; the user
+    /// isn't configured. yvo refuses to launch it and keeps running; the user
     /// switches the provider or adds a `[providers.<name>]` block. Kept short
     /// enough to read on one status line.
     pub(crate) fn unavailable_provider_warning(
@@ -1386,7 +1386,7 @@ impl App {
         );
         let tx = self.worker_tx.clone();
         self.set_busy(
-            "Scanning for inactive dux-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes.",
+            "Scanning for inactive yvo-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes.",
         );
         std::thread::spawn(move || {
             let candidates = build_worktree_cleanup_candidates(
@@ -1415,7 +1415,7 @@ impl App {
         };
         if count == 0 {
             self.set_info(
-                "No inactive dux-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open.",
+                "No inactive yvo-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open.",
             );
         } else {
             let confirm_key = self.bindings.label_for(Action::Confirm);
@@ -1491,7 +1491,7 @@ impl App {
             else {
                 self.worktree_cleanup_failed.push(WorktreeCleanupFailure {
                     candidate,
-                    message: "Project record is no longer available, so dux could not determine the source checkout for removal.".to_string(),
+                    message: "Project record is no longer available, so yvo could not determine the source checkout for removal.".to_string(),
                 });
                 continue;
             };
@@ -1534,7 +1534,7 @@ impl App {
                         let path = std::path::Path::new(&worktree_path);
                         if !git::is_under(root, path) {
                             Err(format!(
-                                "scratch workspace {} is outside dux's scratch root",
+                                "scratch workspace {} is outside yvo's scratch root",
                                 worktree_path
                             ))
                         } else {
@@ -2060,7 +2060,7 @@ impl App {
             focus: ChangeAgentProviderFocus::List,
         });
         self.set_info(
-            "Choose a provider for this worktree. The change takes effect on the next launch; dux resumes each provider's prior session on this worktree when available.",
+            "Choose a provider for this worktree. The change takes effect on the next launch; yvo resumes each provider's prior session on this worktree when available.",
         );
         Ok(())
     }
@@ -2129,7 +2129,7 @@ impl App {
             ));
         } else {
             let resume_note = if selected.resume_available {
-                " dux will resume its prior session on this worktree."
+                " yvo will resume its prior session on this worktree."
             } else {
                 " This provider hasn't run on this worktree yet, so it'll start a fresh session."
             };
@@ -2785,7 +2785,7 @@ impl App {
         Ok(())
     }
 
-    fn spawn_delete_startup_command_logs(paths: DuxPaths, project_id: String, session_id: String) {
+    fn spawn_delete_startup_command_logs(paths: YvoPaths, project_id: String, session_id: String) {
         std::thread::spawn(move || {
             if let Err(err) = crate::startup::delete_agent_logs(&paths, &project_id, &session_id) {
                 logger::error(&format!(
@@ -3908,7 +3908,7 @@ fn newest_modification_time(root: &Path) -> Option<std::time::SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DuxPaths;
+    use crate::config::YvoPaths;
     use crate::keybindings::{BINDING_DEFS, RuntimeBindings};
     use crate::model::{AgentSession, Project, ProviderKind, SessionStatus};
     use crate::storage::SessionStore;
@@ -3937,12 +3937,12 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
 
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
@@ -4065,7 +4065,6 @@ mod tests {
             force_redraw: false,
             welcome_tip_index: 0,
             welcome_logo_visible: false,
-            welcome_logo_alt: false,
             welcome_tip_selection: usize::MAX,
             branch_sync_sessions: Arc::new(Mutex::new(Vec::new())),
             gh_status: crate::model::GhStatus::Unknown,
@@ -4146,8 +4145,8 @@ mod tests {
             );
         };
         run_git(&["init", "-b", "main"]);
-        run_git(&["config", "user.email", "dux@example.com"]);
-        run_git(&["config", "user.name", "dux"]);
+        run_git(&["config", "user.email", "yvo@example.com"]);
+        run_git(&["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "initial"]);
@@ -4253,8 +4252,8 @@ mod tests {
             );
         };
         run_git(&["init", "-b", "main"]);
-        run_git(&["config", "user.email", "dux@example.com"]);
-        run_git(&["config", "user.name", "dux"]);
+        run_git(&["config", "user.email", "yvo@example.com"]);
+        run_git(&["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&["add", "."]);
         run_git(&["commit", "-m", "initial"]);
@@ -4424,21 +4423,21 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(
-            env.get("DUX_SESSION_ID").map(String::as_str),
+            env.get("YVO_SESSION_ID").map(String::as_str),
             Some("session-env")
         );
         assert_eq!(
-            env.get("DUX_WORKTREE_PATH").map(String::as_str),
+            env.get("YVO_WORKTREE_PATH").map(String::as_str),
             Some("/tmp/worktree-env")
         );
         let root = app.paths.root.to_string_lossy().to_string();
         let socket = app.paths.control_socket_path.to_string_lossy().to_string();
-        assert_eq!(env.get("DUX_HOME").map(String::as_str), Some(root.as_str()));
+        assert_eq!(env.get("YVO_HOME").map(String::as_str), Some(root.as_str()));
         assert_eq!(
-            env.get("DUX_SOCKET").map(String::as_str),
+            env.get("YVO_SOCKET").map(String::as_str),
             Some(socket.as_str())
         );
-        assert!(env.contains_key("DUX_BIN"));
+        assert!(env.contains_key("YVO_BIN"));
     }
 
     #[test]
@@ -4533,7 +4532,7 @@ mod tests {
     fn make_scratch_project() -> Project {
         let mut project = make_project(SCRATCH_PROJECT_ID, "claude");
         project.name = SCRATCH_PROJECT_NAME.to_string();
-        project.path = "/tmp/dux-scratch".to_string();
+        project.path = "/tmp/yvo-scratch".to_string();
         project.leading_branch = None;
         project.current_branch = String::new();
         project
@@ -4636,7 +4635,7 @@ mod tests {
         std::fs::create_dir_all(&projects_dir).expect("projects dir");
 
         let scratch_project = make_scratch_project();
-        let mut session = make_session("scratch-1", "claude", "/tmp/dux-scratch/scratch-1");
+        let mut session = make_session("scratch-1", "claude", "/tmp/yvo-scratch/scratch-1");
         session.project_id = scratch_project.id.clone();
         session.title = Some("Notes".to_string());
         let mut app = test_app_with_sessions(vec![session], vec![scratch_project]);
@@ -4691,7 +4690,7 @@ mod tests {
     #[test]
     fn toggling_from_a_scratch_session_row_collapses_the_scratch_group() {
         let project = make_project("project-1", "claude");
-        let mut session = make_session("scratch-1", "claude", "/tmp/dux-scratch/scratch-1");
+        let mut session = make_session("scratch-1", "claude", "/tmp/yvo-scratch/scratch-1");
         session.project_id = SCRATCH_PROJECT_ID.to_string();
         let mut app = test_app_with_sessions(vec![session], vec![project, make_scratch_project()]);
         app.rebuild_left_items();
@@ -4734,9 +4733,9 @@ mod tests {
             path,
             &[
                 "-c",
-                "user.name=Dux Tests",
+                "user.name=Yvo Tests",
                 "-c",
-                "user.email=dux-tests@example.invalid",
+                "user.email=yvo-tests@example.invalid",
                 "commit",
                 "-m",
                 "Initial commit",
@@ -4890,7 +4889,7 @@ mod tests {
         assert!(selected.is_empty());
         assert_eq!(
             app.status.message(),
-            "No inactive dux-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open."
+            "No inactive yvo-managed worktrees or scratch workspaces are old enough for cleanup. Entries are eligible when their latest activity is at least two weeks old and no agent is open."
         );
     }
 

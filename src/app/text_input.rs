@@ -1560,13 +1560,13 @@ mod tests {
     #[test]
     fn wordwrap_long_path_no_spaces() {
         // A long path with no spaces — hard breaks at width
-        let path = "/var/home/user/.config/dux/worktrees/project";
+        let path = "/var/home/user/.config/yvo/worktrees/project";
         assert_eq!(
             wordwrap_visual_lines(path, Some(10)),
             vec![
                 "/var/home/",
                 "user/.conf",
-                "ig/dux/wor",
+                "ig/yvo/wor",
                 "ktrees/pro",
                 "ject"
             ]
@@ -1576,12 +1576,12 @@ mod tests {
     #[test]
     fn wordwrap_path_with_spaces_around() {
         // Path embedded in text with spaces
-        let text = "check /usr/local/bin/dux for details";
+        let text = "check /usr/local/bin/yvo for details";
         // "check " (6) fits, "/usr/local/bin/" (15) fits exactly,
-        // "dux for details" (15) fits exactly
+        // "yvo for details" (15) fits exactly
         assert_eq!(
             wordwrap_visual_lines(text, Some(15)),
-            vec!["check ", "/usr/local/bin/", "dux for details"]
+            vec!["check ", "/usr/local/bin/", "yvo for details"]
         );
     }
 
@@ -1637,7 +1637,7 @@ mod tests {
 
     #[test]
     fn wordwrap_long_path_roundtrip() {
-        let path = "/var/home/user/.config/dux/worktrees/project/src/main.rs";
+        let path = "/var/home/user/.config/yvo/worktrees/project/src/main.rs";
         let width = Some(12);
         for cursor in 0..=path.len() {
             if !path.is_char_boundary(cursor) {
@@ -1739,7 +1739,7 @@ mod tests {
             ("a b c d e f", 4),
             ("test\n", 10),
             ("line1\nline2\nline3", 6),
-            ("/usr/local/bin/dux", 7),
+            ("/usr/local/bin/yvo", 7),
         ];
         for &(text, width) in cases {
             let mut ti = multiline_input(text, 20);

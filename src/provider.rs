@@ -25,7 +25,7 @@ impl GenericProvider {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let tmpfile = std::env::temp_dir().join(format!(
-            "dux-{}-{}-{}.txt",
+            "yvo-{}-{}-{}.txt",
             self.name,
             std::process::id(),
             unique
@@ -216,7 +216,7 @@ mod tests {
         let prov = create_provider("cleanup-test", codex_like_config());
         let cwd = std::env::temp_dir();
         // run_oneshot should create a tempfile, read it, then delete it.
-        // Check that no dux-cleanup-test-* files remain afterward.
+        // Check that no yvo-cleanup-test-* files remain afterward.
         let _ = prov.run_oneshot("check cleanup", &cwd).unwrap();
         let leftover: Vec<_> = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
@@ -224,7 +224,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("dux-cleanup-test-")
+                    .starts_with("yvo-cleanup-test-")
             })
             .collect();
         assert!(

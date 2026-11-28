@@ -1,4 +1,4 @@
-# dux
+# yvo
 
 <p align="center">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-0f766e" />
@@ -6,23 +6,23 @@
   <img alt="Interface" src="https://img.shields.io/badge/interface-terminal%20UI-2563eb" />
   <img alt="Providers" src="https://img.shields.io/badge/providers-Claude%20%2B%20Codex%20%2B%20OpenCode-7c3aed" />
   <img alt="Validation" src="https://img.shields.io/badge/validation-cargo%20test-16a34a" />
-  <img alt="License" src="https://img.shields.io/github/license/dflaten/dux" />
+  <img alt="License" src="https://img.shields.io/github/license/dflaten/yvo" />
 </p>
 
-<img src="assets/dux-logo.png" width="200" align="right" />
+<img src="assets/yvo-logo.svg" width="200" align="right" alt="yvo logo" />
 
-`dux` is a terminal UI for orchestrating multiple AI coding agents, each project agent in its own git worktree, plus ad-hoc scratch agents that are not attached to a project, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
+`yvo` is a terminal UI for orchestrating multiple AI coding agents, each project agent in its own git worktree, plus ad-hoc scratch agents that are not attached to a project, with live agent terminals, companion terminals, macros, commit generation, and a command palette.
 
-This repository is a personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). The original package was great, but I needed a few more workflow features to use it as my day-to-day agent manager. This fork is intended to be installed from source rather than through upstream release channels.
+yvo is a renamed personal fork of [patrickdappollonio/dux](https://github.com/patrickdappollonio/dux). The original package was great, but I needed a few more workflow features to use it as my day-to-day agent manager. This fork is intended to be installed from source rather than through upstream release channels.
 
 <br clear="right" />
 
 <p align="center">
-  <img alt="An agent splits work into two related agents in other repositories" src="assets/dux-multi-repo.png" width="100%" />
+  <img alt="An agent splits work into two related agents in other repositories" src="assets/yvo-multi-repo.png" width="100%" />
 </p>
 
 <p align="center">
-  <a href="https://asciinema.org/a/IvqL89rXvwCzvSxQ">Watch the asciicast demo</a>
+  <a href="https://asciinema.org/a/IvqL89rXvwCzvSxQ">Watch the asciicast demo</a> <em>(recorded before the rename)</em>
 </p>
 
 ## Table Of Contents
@@ -32,6 +32,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 - [Delegated Worktrees](#delegated-worktrees)
 - [Documentation](#documentation)
 - [Install](#install)
+- [Migrating From dux](#migrating-from-dux)
 - [Prerequisites](#prerequisites)
 - [Development Setup](#development-setup)
 
@@ -50,7 +51,7 @@ This repository is a personal fork of [patrickdappollonio/dux](https://github.co
 
 ## Status
 
-`dux` currently supports macOS and Linux, with Windows users expected to run it through WSL2. The app is under active development as a personal fork.
+`yvo` currently supports macOS and Linux, with Windows users expected to run it through WSL2. The app is under active development as a personal fork.
 
 Recent fork additions include:
 
@@ -69,10 +70,10 @@ Recent fork additions include:
 
 ## Delegated Worktrees
 
-An agent running inside dux can delegate work to a child agent:
+An agent running inside yvo can delegate work to a child agent:
 
 ```bash
-"$DUX_BIN" agent delegate \
+"$YVO_BIN" agent delegate \
   --repo /path/to/other-repo \
   --name fix-api-contract \
   --title "Fix the API contract" \
@@ -85,24 +86,24 @@ agent's own repository. The default same-repo base is the parent's HEAD; use
 `--base-mode leading` for the project leading branch or
 `--base-mode parent-snapshot` to include the parent's uncommitted files.
 
-Dux creates the worktree, launches the child agent with a brief that points at a
+Yvo creates the worktree, launches the child agent with a brief that points at a
 durable task file, and links the child to the parent. The child reports back
 with:
 
 ```bash
-"$DUX_BIN" agent finish --status success --summary-file - <<'DUX'
+"$YVO_BIN" agent finish --status success --summary-file - <<'YVO'
 What changed, how it was verified, and anything the parent must know.
-DUX
+YVO
 ```
 
 The parent can then inspect the tree and result, wait for completion, or ask for
 another iteration:
 
 ```bash
-"$DUX_BIN" agent status --json
-"$DUX_BIN" agent wait --all --timeout 100 --json
-"$DUX_BIN" agent result --delegation <id> --json
-"$DUX_BIN" agent followup --delegation <id> --text-file -
+"$YVO_BIN" agent status --json
+"$YVO_BIN" agent wait --all --timeout 100 --json
+"$YVO_BIN" agent result --delegation <id> --json
+"$YVO_BIN" agent followup --delegation <id> --text-file -
 ```
 
 A `wait` timeout exits with code 2 and is not a failure; call it again to keep
@@ -111,15 +112,15 @@ the worktree; `retry` is for failed launches; `integrate` merges a completed
 same-repo child into its parent. The command palette also exposes
 `cancel-delegation` and `integrate-delegation` for the selected child.
 
-The target repo can already be a dux project, or dux can register it
+The target repo can already be a yvo project, or yvo can register it
 automatically. Set `[agent_control] allow_unregistered_repos = false` in
 `config.toml` if agents should only target projects you have added manually.
 Delegation limits live under `[orchestration]`; set
 `[agent_control] enabled = false` or `[orchestration] enabled = false` to
 disable agent-initiated changes.
 
-Agent control uses a user-only local socket at `<config_dir>/dux.sock`. The
-socket is not an agent protocol; it only lets the `dux` CLI request workspace
+Agent control uses a user-only local socket at `<config_dir>/yvo.sock`. The
+socket is not an agent protocol; it only lets the `yvo` CLI request workspace
 changes from the running TUI.
 
 The screenshot at the top of this README is generated by the reproducible
@@ -128,24 +129,24 @@ changes to refresh it.
 
 ### Agent Skill
 
-Dux ships optional skills that teach agents how and when to delegate work:
+Yvo ships optional skills that teach agents how and when to delegate work:
 
 ```text
-skills/dux-split-out/SKILL.md    # one cross-repo child
-skills/dux-orchestrate/SKILL.md  # fan out, wait, follow up, integrate
+skills/yvo-split-out/SKILL.md    # one cross-repo child
+skills/yvo-orchestrate/SKILL.md  # fan out, wait, follow up, integrate
 ```
 
 Copy them into the global skill directory of the agent you use. For example:
 
 ```bash
-mkdir -p ~/.config/opencode/skills/dux-split-out
-cp skills/dux-split-out/SKILL.md ~/.config/opencode/skills/dux-split-out/SKILL.md
-mkdir -p ~/.config/opencode/skills/dux-orchestrate
-cp skills/dux-orchestrate/SKILL.md ~/.config/opencode/skills/dux-orchestrate/SKILL.md
+mkdir -p ~/.config/opencode/skills/yvo-split-out
+cp skills/yvo-split-out/SKILL.md ~/.config/opencode/skills/yvo-split-out/SKILL.md
+mkdir -p ~/.config/opencode/skills/yvo-orchestrate
+cp skills/yvo-orchestrate/SKILL.md ~/.config/opencode/skills/yvo-orchestrate/SKILL.md
 ```
 
 OpenCode also discovers `~/.claude/skills` and `~/.agents/skills`. The skills are
-not installed automatically. Run `dux agent --help` for the authoritative
+not installed automatically. Run `yvo agent --help` for the authoritative
 command reference.
 
 ## Documentation
@@ -160,26 +161,39 @@ User and setup documentation:
 Clone the repository and install the binary from source:
 
 ```bash
-git clone https://github.com/dflaten/dux.git
-cd dux
+git clone https://github.com/dflaten/yvo.git
+cd yvo
 cargo build --release
 mkdir -p ~/.local/bin
-install -m 755 target/release/dux ~/.local/bin/dux
+install -m 755 target/release/yvo ~/.local/bin/yvo
 ```
 
 Make sure `~/.local/bin` is on your `PATH`, then run:
 
 ```bash
-dux
+yvo
 ```
 
-On first launch, dux creates a fully commented config file. That file is the documentation for every setting.
+On first launch, yvo creates a fully commented config file. That file is the documentation for every setting.
+
+## Migrating From dux
+
+Existing installs keep their state under `~/.config/dux` (Linux) or `~/.dux` (macOS). yvo refuses to start until that data is moved, so the first launch cannot silently create an empty second workspace.
+
+Close all dux agents, run the migration from outside the old directory, and preview it first:
+
+```bash
+yvo config migrate          # show what will move and change
+yvo config migrate --yes    # move the data and rewrite stored paths
+```
+
+The migration moves the config directory, renames `dux.log`/`dux.lock`/`dux.sock` to their yvo names, rewrites project and worktree paths in `sessions.sqlite3`, updates the theme and log path in `config.toml`, and runs `git worktree repair` for affected repositories. Custom themes that define `dux.*` tokens need those tokens renamed to `yvo.*`. Afterward, re-copy `skills/yvo-orchestrate` and `skills/yvo-split-out` into your agent skill directory and update any scripts that use `DUX_BIN`, `DUX_SESSION_ID`, or other `DUX_*` variables to `YVO_*`.
 
 ## Prerequisites
 
-- **`git`** — dux is built around git worktrees, so git is non-negotiable.
+- **`git`** — yvo is built around git worktrees, so git is non-negotiable.
 - **Rust and Cargo** — required to build this fork from source.
-- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and dux can pull PR statuses, check details, and show them in the interface.
+- **`gh` CLI** *(optional)* — authenticate it with your GitHub account and yvo can pull PR statuses, check details, and show them in the interface.
 
 ## Development Setup
 

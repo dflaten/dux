@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn spawn_with_env_passes_custom_environment() {
-        let args = vec!["-c".to_string(), "printf \"$DUX_TEST_PTY_ENV\"".to_string()];
+        let args = vec!["-c".to_string(), "printf \"$YVO_TEST_PTY_ENV\"".to_string()];
         let mut client = PtyClient::spawn_with_env(
             "/bin/sh",
             &args,
@@ -1302,7 +1302,7 @@ mod tests {
             5,
             40,
             100,
-            &[("DUX_TEST_PTY_ENV".to_string(), "visible".to_string())],
+            &[("YVO_TEST_PTY_ENV".to_string(), "visible".to_string())],
         )
         .expect("spawn pty");
 

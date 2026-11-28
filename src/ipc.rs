@@ -1,8 +1,8 @@
-//! Local control channel for agents running inside dux.
+//! Local control channel for agents running inside yvo.
 //!
 //! The TUI owns all workspace state, so an agent process cannot safely write
-//! SQLite or git worktrees on its own. Instead, agents invoke the `dux` CLI,
-//! which connects to a user-only Unix socket under the dux config directory.
+//! SQLite or git worktrees on its own. Instead, agents invoke the `yvo` CLI,
+//! which connects to a user-only Unix socket under the yvo config directory.
 //! The TUI receives the request on its event loop, performs the work through
 //! its normal workers, and returns a JSON response to the waiting CLI.
 
@@ -282,7 +282,7 @@ pub struct PullRequestInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct SplitOutParams {
-    /// Defaults to the `DUX_SESSION_ID` inherited from the dux-launched agent.
+    /// Defaults to the `YVO_SESSION_ID` inherited from the yvo-launched agent.
     pub source_session_id: Option<String>,
     /// Target git checkout. Ignored when `project` is also supplied.
     pub repo: Option<String>,
@@ -530,7 +530,7 @@ impl ControlServer {
                                 stream,
                                 &ControlResponse::error(
                                     "busy",
-                                    "dux is handling too many agent control requests. Try again shortly.",
+                                    "yvo is handling too many agent control requests. Try again shortly.",
                                 ),
                             );
                             continue;
@@ -588,11 +588,11 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if !metadata.file_type().is_socket() {
         bail!(
-            "control socket path {} already exists and is not a socket. Remove it or set DUX_SOCKET to a different path.",
+            "control socket path {} already exists and is not a socket. Remove it or set YVO_SOCKET to a different path.",
             path.display()
         );
     }
-    // The single-instance lock guarantees no other dux owns this directory, so
+    // The single-instance lock guarantees no other yvo owns this directory, so
     // any pre-existing socket is left over from a previous process.
     fs::remove_file(path)
         .with_context(|| format!("failed to remove stale control socket {}", path.display()))?;
@@ -627,7 +627,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<IncomingControlRequest>) {
             &ControlResponse::error(
                 "protocol_mismatch",
                 format!(
-                    "This dux CLI speaks control protocol {} but dux speaks {}. Use the DUX_BIN path injected by dux or update dux.",
+                    "This yvo CLI speaks control protocol {} but yvo speaks {}. Use the YVO_BIN path injected by yvo or update yvo.",
                     request.protocol, CONTROL_PROTOCOL
                 ),
             ),
@@ -646,7 +646,7 @@ fn handle_connection(stream: UnixStream, tx: Sender<IncomingControlRequest>) {
     {
         let _ = write_response(
             stream,
-            &ControlResponse::error("not_running", "dux is shutting down."),
+            &ControlResponse::error("not_running", "yvo is shutting down."),
         );
         return;
     }
@@ -660,14 +660,14 @@ fn handle_connection(stream: UnixStream, tx: Sender<IncomingControlRequest>) {
                 stream,
                 &ControlResponse::error(
                     "timeout",
-                    "dux did not finish the request in time. The operation may still complete; check dux before retrying.",
+                    "yvo did not finish the request in time. The operation may still complete; check yvo before retrying.",
                 ),
             );
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let _ = write_response(
                 stream,
-                &ControlResponse::error("not_running", "dux closed the control channel."),
+                &ControlResponse::error("not_running", "yvo closed the control channel."),
             );
         }
     }
@@ -733,7 +733,7 @@ fn write_response(mut stream: UnixStream, response: &ControlResponse) -> Result<
     Ok(())
 }
 
-/// Send a request to the running dux TUI and wait for its response.
+/// Send a request to the running yvo TUI and wait for its response.
 pub fn send_request(
     socket_path: &Path,
     request: &ControlRequest,
@@ -741,7 +741,7 @@ pub fn send_request(
 ) -> Result<ControlResponse> {
     let mut stream = UnixStream::connect(socket_path).map_err(|err| {
         anyhow!(
-            "could not connect to dux at {}: {err}. Is dux running with agent control enabled?",
+            "could not connect to yvo at {}: {err}. Is yvo running with agent control enabled?",
             socket_path.display()
         )
     })?;
@@ -763,19 +763,19 @@ pub fn send_request(
     }
     stream
         .write_all(&encoded)
-        .context("failed to send control request to dux")?;
+        .context("failed to send control request to yvo")?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
     let line = read_limited_line(&mut reader, MAX_CONTROL_MESSAGE_BYTES)?;
     if line.is_empty() {
-        bail!("dux closed the control connection without a response");
+        bail!("yvo closed the control connection without a response");
     }
     let response: ControlResponse =
-        serde_json::from_str(&line).context("dux returned invalid control response JSON")?;
+        serde_json::from_str(&line).context("yvo returned invalid control response JSON")?;
     if response.protocol != CONTROL_PROTOCOL {
         bail!(
-            "dux responded with control protocol {}, expected {}. Update dux or the CLI binary.",
+            "yvo responded with control protocol {}, expected {}. Update yvo or the CLI binary.",
             response.protocol,
             CONTROL_PROTOCOL
         );
@@ -791,7 +791,7 @@ mod tests {
 
     fn test_server(dir: &Path) -> (ControlServer, Receiver<IncomingControlRequest>) {
         let (tx, rx) = mpsc::channel();
-        let server = ControlServer::start(dir.join("dux.sock"), tx).expect("start server");
+        let server = ControlServer::start(dir.join("yvo.sock"), tx).expect("start server");
         (server, rx)
     }
 
@@ -888,7 +888,7 @@ mod tests {
     #[test]
     fn stale_socket_is_replaced_but_regular_files_are_rejected() {
         let dir = tempdir().unwrap();
-        let socket_path = dir.path().join("dux.sock");
+        let socket_path = dir.path().join("yvo.sock");
         let stale = UnixListener::bind(&socket_path).unwrap();
         drop(stale);
         let _server = ControlServer::start(socket_path.clone(), mpsc::channel().0).unwrap();

@@ -164,7 +164,7 @@ pub struct PrStackEdge {
 /// Reserved project id for the built-in scratch workspace. Scratch agents are
 /// stored in SQLite like any other agent but are never written to
 /// `config.toml`, so the workspace stays runtime-only state.
-pub const SCRATCH_PROJECT_ID: &str = "__dux_scratch__";
+pub const SCRATCH_PROJECT_ID: &str = "__yvo_scratch__";
 
 /// Display name for the built-in scratch workspace.
 pub const SCRATCH_PROJECT_NAME: &str = "Scratch";
@@ -508,7 +508,7 @@ impl Delegation {
     }
 }
 
-/// The durable result a delegated child reports through `dux agent finish`.
+/// The durable result a delegated child reports through `yvo agent finish`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DelegationResult {
     #[serde(default)]

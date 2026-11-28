@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Minimal deterministic `gh` stand-in for the dux multi-repo demo.
-# Only the commands dux's PR integration calls are implemented.
+# Minimal deterministic `gh` stand-in for the yvo multi-repo demo.
+# Only the commands yvo's PR integration calls are implemented.
 set -u
 
 pr_json_for_branch() {

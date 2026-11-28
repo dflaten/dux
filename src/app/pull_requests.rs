@@ -117,7 +117,7 @@ impl App {
 
     /// Drop per-session and per-base lookup caches that no longer refer to
     /// live work. Without this the maps grow for every session and branch a
-    /// long-running dux process ever sees.
+    /// long-running yvo process ever sees.
     pub(crate) fn prune_pr_tracking_caches(&mut self) {
         let active_sessions = self
             .sessions
@@ -564,7 +564,7 @@ impl App {
         let Some(source_session_id) = source_session_id else {
             return crate::ipc::ControlResponse::error(
                 "invalid_source",
-                "No source session was supplied. Set DUX_SESSION_ID or pass --session.",
+                "No source session was supplied. Set YVO_SESSION_ID or pass --session.",
             );
         };
         let Some(session) = self
@@ -774,7 +774,7 @@ impl App {
         Ok(())
     }
 
-    /// Resolve parent PRs that are not attached to any dux session yet. This is
+    /// Resolve parent PRs that are not attached to any yvo session yet. This is
     /// what makes stacks created by other tools (or on branches without an
     /// agent) show up automatically.
     pub(crate) fn spawn_missing_base_pr_lookups(&mut self) {

@@ -165,7 +165,7 @@ impl App {
         let Some(source_session_id) = source_session_id else {
             let _ = respond.send(ControlResponse::error(
                 "invalid_source",
-                "No source session was supplied. Set DUX_SESSION_ID or pass --session.",
+                "No source session was supplied. Set YVO_SESSION_ID or pass --session.",
             ));
             return;
         };
@@ -432,7 +432,7 @@ impl App {
             .clone()
             .unwrap_or_else(|| source_session.branch_name.clone());
         self.set_busy(format!(
-            "Agent \"{source_label}\" asked dux to create delegated work. Queueing \"{}\"...",
+            "Agent \"{source_label}\" asked yvo to create delegated work. Queueing \"{}\"...",
             delegation.title
         ));
         let queued = QueuedDelegation {
@@ -565,7 +565,7 @@ impl App {
         if text.trim().is_empty() {
             text = "(No brief was supplied.)".to_string();
         }
-        let completion = "\n\n## Completion contract\n\nWhen the task is done, run:\n\n```bash\n\"$DUX_BIN\" agent finish --status success --summary-file - <<'DUX'\nOne or two paragraphs: what changed, how it was verified, and anything the parent must know before integrating.\nDUX\n```\n\nIf you need input, use `--status blocked` and put the question in the summary. If you failed, use `--status failed` and include the error.\n";
+        let completion = "\n\n## Completion contract\n\nWhen the task is done, run:\n\n```bash\n\"$YVO_BIN\" agent finish --status success --summary-file - <<'YVO'\nOne or two paragraphs: what changed, how it was verified, and anything the parent must know before integrating.\nYVO\n```\n\nIf you need input, use `--status blocked` and put the question in the summary. If you failed, use `--status failed` and include the error.\n";
         write_delegation_file(destination, &format!("{text}{completion}"))?;
         if let Some(staged) = params.brief_path.as_deref() {
             let _ = fs::remove_file(staged);
@@ -826,7 +826,7 @@ impl App {
         );
         let request_id = plan.request_id.clone();
         let handoff_prompt = Some(format!(
-            "You are a delegated dux agent. Read the task brief at {} and complete it. When done, run \"$DUX_BIN\" agent finish --status success --summary-file - and pass your summary on stdin. If you need a decision, use --status blocked.",
+            "You are a delegated yvo agent. Read the task brief at {} and complete it. When done, run \"$YVO_BIN\" agent finish --status success --summary-file - and pass your summary on stdin. If you need a decision, use --status blocked.",
             plan.brief_path
         ));
         let root_session_id = group
@@ -1056,9 +1056,9 @@ impl App {
             if next != delegation.state {
                 delegation.state = next;
                 delegation.state_reason = Some(if next == DelegationState::Failed {
-                    "child session or worktree disappeared while dux was not running".to_string()
+                    "child session or worktree disappeared while yvo was not running".to_string()
                 } else {
-                    "dux restarted while the delegation was in flight; reattach the child to continue"
+                    "yvo restarted while the delegation was in flight; reattach the child to continue"
                         .to_string()
                 });
                 delegation.updated_at = Utc::now();
@@ -1092,7 +1092,7 @@ impl App {
         }
     }
 
-    /// Import a result file whose callback was lost while dux was busy. The
+    /// Import a result file whose callback was lost while yvo was busy. The
     /// CLI writes the file before sending the control request, so polling
     /// status is enough to recover a missed finish without a background timer.
     fn import_pending_delegation_results(&mut self) {
@@ -1423,7 +1423,7 @@ impl App {
         } else {
             return ControlResponse::error(
                 "invalid_target",
-                "Pass --session, --delegation, or run inside a dux agent.",
+                "Pass --session, --delegation, or run inside a yvo agent.",
             );
         };
         let mut response = ControlResponse::success();
@@ -1516,7 +1516,7 @@ impl App {
             && let Some(source) = source_session_id.or(session_id)
         {
             // The child can report before the TUI processes its launch event.
-            // DUX_DELEGATION_ID is authoritative, so bind the session now.
+            // YVO_DELEGATION_ID is authoritative, so bind the session now.
             self.delegations[delegation_index].child_session_id = Some(source.to_string());
         }
         let delegation_id = self.delegations[delegation_index].id.clone();
@@ -1997,7 +1997,7 @@ impl App {
         if parent.project_id != child.project_id {
             let _ = respond.send(ControlResponse::error(
                 "cross_repo",
-                "Cross-repository delegations land through commits and pull requests; dux does not merge their histories.",
+                "Cross-repository delegations land through commits and pull requests; yvo does not merge their histories.",
             ));
             return;
         }
@@ -2081,7 +2081,7 @@ impl App {
         let Some(source_session_id) = source_session_id else {
             return ControlResponse::error(
                 "invalid_source",
-                "No source session was supplied. Set DUX_SESSION_ID or pass --session.",
+                "No source session was supplied. Set YVO_SESSION_ID or pass --session.",
             );
         };
         let Some(source) = self
@@ -2165,32 +2165,32 @@ fn truncate_summary(text: &str, max_bytes: usize) -> String {
     out
 }
 
-/// Environment variables injected into agent PTYs so the `dux` CLI can talk
+/// Environment variables injected into agent PTYs so the `yvo` CLI can talk
 /// back to the running TUI.
-pub(crate) fn agent_control_env(paths: &DuxPaths, session: &AgentSession) -> Vec<(String, String)> {
+pub(crate) fn agent_control_env(paths: &YvoPaths, session: &AgentSession) -> Vec<(String, String)> {
     let mut env = vec![
         (
-            "DUX_HOME".to_string(),
+            "YVO_HOME".to_string(),
             paths.root.to_string_lossy().to_string(),
         ),
         (
-            "DUX_SOCKET".to_string(),
+            "YVO_SOCKET".to_string(),
             paths.control_socket_path.to_string_lossy().to_string(),
         ),
-        ("DUX_SESSION_ID".to_string(), session.id.clone()),
-        ("DUX_AGENT_ID".to_string(), session.id.clone()),
-        ("DUX_PROJECT_ID".to_string(), session.project_id.clone()),
+        ("YVO_SESSION_ID".to_string(), session.id.clone()),
+        ("YVO_AGENT_ID".to_string(), session.id.clone()),
+        ("YVO_PROJECT_ID".to_string(), session.project_id.clone()),
         (
-            "DUX_WORKTREE_PATH".to_string(),
+            "YVO_WORKTREE_PATH".to_string(),
             session.worktree_path.clone(),
         ),
-        ("DUX_BRANCH".to_string(), session.branch_name.clone()),
+        ("YVO_BRANCH".to_string(), session.branch_name.clone()),
         (
-            "DUX_PROVIDER".to_string(),
+            "YVO_PROVIDER".to_string(),
             session.provider.as_str().to_string(),
         ),
         (
-            "DUX_AGENT_TITLE".to_string(),
+            "YVO_AGENT_TITLE".to_string(),
             session
                 .title
                 .clone()
@@ -2198,10 +2198,10 @@ pub(crate) fn agent_control_env(paths: &DuxPaths, session: &AgentSession) -> Vec
         ),
     ];
     if let Some(project_path) = session.project_path.as_deref() {
-        env.push(("DUX_PROJECT_PATH".to_string(), project_path.to_string()));
+        env.push(("YVO_PROJECT_PATH".to_string(), project_path.to_string()));
     }
     if let Ok(exe) = std::env::current_exe() {
-        env.push(("DUX_BIN".to_string(), exe.to_string_lossy().to_string()));
+        env.push(("YVO_BIN".to_string(), exe.to_string_lossy().to_string()));
     }
     env
 }
@@ -2209,43 +2209,43 @@ pub(crate) fn agent_control_env(paths: &DuxPaths, session: &AgentSession) -> Vec
 /// Extra environment for a delegated child. The brief and result paths are
 /// stable for the life of the delegation, including follow-up iterations.
 pub(crate) fn delegation_control_env(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     request: &SplitOutCreateRequest,
 ) -> Vec<(String, String)> {
     let dir = paths.root.join("delegations").join(&request.delegation_id);
     vec![
         (
-            "DUX_DELEGATION_ID".to_string(),
+            "YVO_DELEGATION_ID".to_string(),
             request.delegation_id.clone(),
         ),
         (
-            "DUX_PARENT_SESSION_ID".to_string(),
+            "YVO_PARENT_SESSION_ID".to_string(),
             request.parent_session_id.clone(),
         ),
         (
-            "DUX_ROOT_SESSION_ID".to_string(),
+            "YVO_ROOT_SESSION_ID".to_string(),
             request.root_session_id.clone(),
         ),
-        ("DUX_GROUP_ID".to_string(), request.group_id.clone()),
+        ("YVO_GROUP_ID".to_string(), request.group_id.clone()),
         (
-            "DUX_DELEGATION_DEPTH".to_string(),
+            "YVO_DELEGATION_DEPTH".to_string(),
             request.depth.to_string(),
         ),
-        ("DUX_BRIEF_FILE".to_string(), request.brief_path.clone()),
+        ("YVO_BRIEF_FILE".to_string(), request.brief_path.clone()),
         (
-            "DUX_RESULT_FILE".to_string(),
+            "YVO_RESULT_FILE".to_string(),
             dir.join("result.json").to_string_lossy().to_string(),
         ),
         (
-            "DUX_INBOX_FILE".to_string(),
+            "YVO_INBOX_FILE".to_string(),
             dir.join("inbox.md").to_string_lossy().to_string(),
         ),
         (
-            "DUX_PARENT_WORKTREE".to_string(),
+            "YVO_PARENT_WORKTREE".to_string(),
             request.source_session.worktree_path.clone(),
         ),
         (
-            "DUX_PARENT_BRANCH".to_string(),
+            "YVO_PARENT_BRANCH".to_string(),
             request.source_session.branch_name.clone(),
         ),
     ]

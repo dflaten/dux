@@ -8,17 +8,17 @@ install:
 		Darwin|Linux) ;; \
 		*) echo "Error: make install is supported on macOS and Linux only."; exit 1 ;; \
 	esac
-	@echo "Installing dux $$(cat DEV_VERSION)"
+	@echo "Installing yvo $$(cat DEV_VERSION)"
 	@cargo install --path . --force --locked --quiet
-	@echo "Installed dux $$(cat DEV_VERSION)"
+	@echo "Installed yvo $$(cat DEV_VERSION)"
 	@cargo_root="$${CARGO_INSTALL_ROOT:-$${CARGO_HOME:-$$HOME/.cargo}}"; \
-	installed="$$cargo_root/bin/dux"; \
-	resolved="$$(command -v dux || true)"; \
+	installed="$$cargo_root/bin/yvo"; \
+	resolved="$$(command -v yvo || true)"; \
 	if [ -n "$$resolved" ] && [ "$$resolved" != "$$installed" ]; then \
-		echo "Warning: your shell resolves dux to $$resolved, not $$installed"; \
-		echo "Put $$(dirname "$$installed") before $$(dirname "$$resolved") in PATH or remove the older dux."; \
+		echo "Warning: your shell resolves yvo to $$resolved, not $$installed"; \
+		echo "Put $$(dirname "$$installed") before $$(dirname "$$resolved") in PATH or remove the older yvo."; \
 	else \
-		echo "dux resolves to $$installed"; \
+		echo "yvo resolves to $$installed"; \
 	fi
 
 fmt:
@@ -35,7 +35,7 @@ lint-fix:
 
 profiling:
 	@command -v flamegraph >/dev/null 2>&1 || { echo "Error: 'flamegraph' not found. Install it with: cargo install flamegraph"; exit 1; }
-	cargo flamegraph --profile profiling --bin dux -o flamegraph.svg
+	cargo flamegraph --profile profiling --bin yvo -o flamegraph.svg
 
 screenshots:
 	cargo build

@@ -297,7 +297,7 @@ pub fn rebase_onto_stashing_tracked_changes(repo_path: &Path, base_ref: &str) ->
                 "stash",
                 "push",
                 "-m",
-                "dux automatic stash before rebase",
+                "yvo automatic stash before rebase",
             ])
             .output()?;
         if !output.status.success() {
@@ -864,7 +864,7 @@ pub fn create_worktree_from_start_point(
 /// and commit the current working tree (including an empty tree).
 ///
 /// The user's configured git identity is used when available. When git has no
-/// identity configured, a neutral `dux <dux@localhost>` identity is applied to
+/// identity configured, a neutral `yvo <yvo@localhost>` identity is applied to
 /// the initial commit only (via `-c`, never persisted into the repository), so
 /// converting a scratch agent into a project never fails just because git
 /// identity is missing. The user can amend or re-author the commit later.
@@ -885,9 +885,9 @@ fn initial_commit_identity_args(identity: Option<(&str, &str)>, configured: bool
         ],
         None if !configured => vec![
             "-c".to_string(),
-            "user.name=dux".to_string(),
+            "user.name=yvo".to_string(),
             "-c".to_string(),
-            "user.email=dux@localhost".to_string(),
+            "user.email=yvo@localhost".to_string(),
         ],
         None => Vec::new(),
     }
@@ -905,7 +905,7 @@ fn git_identity_configured(path: &Path) -> bool {
 
 /// `identity` is applied to the initial commit only (via `-c`); it is never
 /// written into the repository. When `None`, the configured identity is used,
-/// falling back to the neutral dux identity if none is configured.
+/// falling back to the neutral yvo identity if none is configured.
 fn init_repository_with_initial_commit_and_identity(
     path: &Path,
     identity: Option<(&str, &str)>,
@@ -947,7 +947,7 @@ fn init_repository_with_initial_commit_and_identity(
     let identity_configured = git_identity_configured(path);
     if identity.is_none() && !identity_configured {
         logger::info(&format!(
-            "git identity is not configured; using dux fallback identity for the initial commit in {}",
+            "git identity is not configured; using yvo fallback identity for the initial commit in {}",
             path.display()
         ));
     }
@@ -1019,7 +1019,7 @@ pub fn head_commit(repo_path: &Path) -> Result<String> {
 pub fn snapshot_worktree_commit(worktree: &Path) -> Result<String> {
     let head = head_commit(worktree)?;
     let index_path = std::env::temp_dir().join(format!(
-        "dux-snapshot-index-{}-{}",
+        "yvo-snapshot-index-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1068,9 +1068,9 @@ pub fn snapshot_worktree_commit(worktree: &Path) -> Result<String> {
             .env("GIT_INDEX_FILE", &index_path)
             .args([
                 "-c",
-                "user.name=dux",
+                "user.name=yvo",
                 "-c",
-                "user.email=dux@localhost",
+                "user.email=yvo@localhost",
                 "-C",
                 worktree.to_string_lossy().as_ref(),
                 "commit-tree",
@@ -1078,7 +1078,7 @@ pub fn snapshot_worktree_commit(worktree: &Path) -> Result<String> {
                 "-p",
                 &head,
                 "-m",
-                "dux parent snapshot",
+                "yvo parent snapshot",
             ])
             .output()?;
         if !output.status.success() {
@@ -2583,9 +2583,9 @@ mod tests {
             initial_commit_identity_args(None, false),
             vec![
                 "-c".to_string(),
-                "user.name=dux".to_string(),
+                "user.name=yvo".to_string(),
                 "-c".to_string(),
-                "user.email=dux@localhost".to_string(),
+                "user.email=yvo@localhost".to_string(),
             ]
         );
     }
