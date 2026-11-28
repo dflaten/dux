@@ -143,7 +143,7 @@ pub fn execute(plan: MigrationPlan) -> Result<MigrationSummary> {
 
     let config_path = new_root.join("config.toml");
     if config_path.exists() {
-        summary.config_updated = rewrite_config(&config_path)?;
+        summary.config_updated = rewrite_config(&config_path, &plan.old_root, &plan.new_root)?;
     }
 
     Ok(summary)
@@ -334,14 +334,17 @@ fn rewrite_path_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> Optio
         .map(|rest| format!("{new_prefix}/{rest}"))
 }
 
-fn rewrite_config(path: &Path) -> Result<bool> {
+fn rewrite_config(path: &Path, old_root: &Path, new_root: &Path) -> Result<bool> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut doc: toml_edit::DocumentMut = raw
         .parse()
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
+    let old_prefix = path_string(old_root);
+    let new_prefix = path_string(new_root);
     let mut changed = false;
+
     if let Some(ui) = doc.get_mut("ui").and_then(|item| item.as_table_mut())
         && let Some(theme) = ui.get_mut("theme").and_then(|item| item.as_value_mut())
         && matches!(theme.as_str(), Some("dux_dark") | Some("dux-dark"))
@@ -349,12 +352,44 @@ fn rewrite_config(path: &Path) -> Result<bool> {
         *theme = toml_edit::Value::from("yvo_dark");
         changed = true;
     }
+
     if let Some(logging) = doc.get_mut("logging").and_then(|item| item.as_table_mut())
         && let Some(log_path) = logging.get_mut("path").and_then(|item| item.as_value_mut())
-        && log_path.as_str() == Some("dux.log")
     {
-        *log_path = toml_edit::Value::from("yvo.log");
-        changed = true;
+        if log_path.as_str() == Some("dux.log") {
+            *log_path = toml_edit::Value::from("yvo.log");
+            changed = true;
+        } else if let Some(current) = log_path.as_str()
+            && let Some(rewritten) = rewrite_path_prefix(current, &old_prefix, &new_prefix)
+        {
+            let rewritten = if Path::new(&rewritten)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("dux.log")
+            {
+                Path::new(&rewritten)
+                    .with_file_name("yvo.log")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                rewritten
+            };
+            *log_path = toml_edit::Value::from(rewritten);
+            changed = true;
+        }
+    }
+
+    if let Some(projects) = doc
+        .get_mut("projects")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        for project in projects.iter_mut() {
+            if let Some(path_value) = project.get_mut("path").and_then(|item| item.as_value_mut())
+                && rewrite_string_value(path_value, &old_prefix, &new_prefix)
+            {
+                changed = true;
+            }
+        }
     }
 
     let rendered = doc.to_string();
@@ -370,9 +405,20 @@ fn rewrite_config(path: &Path) -> Result<bool> {
     Ok(changed)
 }
 
-/// Rewrite old product names only on comment lines. Project paths, names,
-/// startup commands, and environment values are user data and must not be
-/// touched by a cosmetic rename.
+fn rewrite_string_value(value: &mut toml_edit::Value, old_prefix: &str, new_prefix: &str) -> bool {
+    let Some(current) = value.as_str() else {
+        return false;
+    };
+    let Some(rewritten) = rewrite_path_prefix(current, old_prefix, new_prefix) else {
+        return false;
+    };
+    *value = toml_edit::Value::from(rewritten);
+    true
+}
+
+/// Rewrite old product names only on comment lines. User data such as project
+/// names, startup commands, and environment values is left alone; only paths
+/// that moved with the state directory are rewritten.
 fn rewrite_comment_lines(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for line in raw.split_inclusive('\n') {
@@ -457,7 +503,7 @@ fn collect_moved_worktrees(
     depth: usize,
     grouped: &mut BTreeMap<String, Vec<String>>,
 ) {
-    if depth > 4 {
+    if depth > 8 {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
@@ -535,6 +581,8 @@ mod tests {
     fn rewrites_config_values_and_comments_without_touching_project_data() {
         let root = temp_root("config");
         let path = root.join("config.toml");
+        let old_root = Path::new("/home/me/.config/dux");
+        let new_root = Path::new("/home/me/.config/yvo");
         fs::write(
             &path,
             r#"# dux configuration
@@ -548,18 +596,25 @@ path = "dux.log"
 id = "00000000-0000-0000-0000-000000000000"
 path = "$HOME/projects/dux"
 name = "dux"
+
+[[projects]]
+id = "00000000-0000-0000-0000-000000000001"
+path = "/home/me/.config/dux/local-project"
+name = "local"
 "#,
         )
         .expect("write config");
 
-        assert!(rewrite_config(&path).expect("rewrite config"));
+        assert!(rewrite_config(&path, old_root, new_root).expect("rewrite config"));
         let rendered = fs::read_to_string(&path).expect("read config");
         assert!(rendered.contains("# yvo configuration"));
         assert!(rendered.contains("theme = \"yvo_dark\""));
         assert!(rendered.contains("path = \"yvo.log\""));
-        // Project data that happens to contain the old name must survive.
+        // Project data that happens to contain the old name must survive, but a
+        // project path that moved with the state directory is rewritten.
         assert!(rendered.contains("path = \"$HOME/projects/dux\""));
         assert!(rendered.contains("name = \"dux\""));
+        assert!(rendered.contains("path = \"/home/me/.config/yvo/local-project\""));
     }
 
     #[test]

@@ -147,12 +147,13 @@ pub struct Theme {
 /// Returns an error if none of the above match. The caller is expected to fall
 /// back to [`Theme::fallback`] in that case.
 pub fn load(name: &str, paths: &YvoPaths) -> Result<Theme> {
-    let name = normalize_theme_name(name);
     let user_path = paths.root.join("themes").join(format!("{name}.toml"));
     if user_path.exists() {
         return load_from_file(&user_path)
             .with_context(|| format!("failed to load user theme {}", user_path.display()));
     }
+
+    let name = normalize_theme_name(name);
 
     if name == DEFAULT_THEME_NAME {
         return load_from_str(YVO_DARK_TOML)

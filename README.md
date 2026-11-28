@@ -22,7 +22,7 @@ yvo is a renamed personal fork of [patrickdappollonio/dux](https://github.com/pa
 </p>
 
 <p align="center">
-  <a href="https://asciinema.org/a/IvqL89rXvwCzvSxQ">Watch the asciicast demo</a>
+  <a href="https://asciinema.org/a/IvqL89rXvwCzvSxQ">Watch the asciicast demo</a> <em>(recorded before the rename)</em>
 </p>
 
 ## Table Of Contents

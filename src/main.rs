@@ -122,12 +122,15 @@ fn wants_top_level_help(args: &[String]) -> bool {
 /// Everything else is blocked so a fresh yvo directory cannot be created
 /// beside the real data.
 fn legacy_pending_allowed(args: &[String]) -> bool {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return true;
+    }
     if args.first().map(String::as_str) != Some("config") {
         return false;
     }
     matches!(
         args.get(1).map(String::as_str),
-        None | Some("migrate") | Some("path") | Some("diff") | Some("--help") | Some("-h")
+        None | Some("migrate") | Some("path") | Some("diff")
     )
 }
 
@@ -238,6 +241,10 @@ mod tests {
         assert!(!legacy_pending_allowed(&[
             "agent".to_string(),
             "status".to_string()
+        ]));
+        assert!(legacy_pending_allowed(&[
+            "agent".to_string(),
+            "--help".to_string()
         ]));
         assert!(!legacy_pending_allowed(&[]));
     }

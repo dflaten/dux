@@ -27,29 +27,6 @@ const ASCII_LOGO_WIDTH: u16 = 33;
 /// Number of lines in `ASCII_LOGO`.
 const ASCII_LOGO_HEIGHT: u16 = 7;
 
-/// Alternate braille-art duck logo, same width as the text logo.
-const ASCII_LOGO_ALT: &[&str] = &[
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⠤⣄⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠔⠉⠀⠀⢸⢰⢸⢰⢰⠉⠢⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡔⢰⠀⢸⢰⢸⢸⢸⢸⢸⢸⢸⢸⢈⢦⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⢠⢸⠤⣤⠤⢸⢸⢸⢸⢸⠤⠤⢐⢸⢸⡆⠀⠀⠀⠀⠀⠀⠀",
-    "⢠⠀⠀⠀⠀⠀⠀⠀⠀⢹⢸⢸⢸⢸⢸⣤⢰⢲⢤⣄⢸⢸⢸⢸⢸⡇⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠙⡄⠀⠀⠀⠀⠀⠀⠀⣄⢸⢰⣶⣿⣤⣤⣶⣤⣤⣬⣷⡤⢸⣰⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠈⢦⠀⠀⠀⠀⠀⠀⠈⢦⢸⢈⠛⠿⣿⣼⣼⠿⠛⠁⢸⡼⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠸⠉⢻⣍⠉⠤⣀⣠⣤⣾⢸⣿⣿⣿⣶⣾⣾⣿⣿⢸⢸⠓⠤⣄⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠈⠒⠭⣀⢸⢸⢈⢈⢸⢸⢸⠙⠻⢸⢸⢸⠿⠛⢸⢸⢸⢸⢸⢈⠑⢄⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⣼⢸⢸⢈⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⣠⠤⠒⠁⢸⣦⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⣿⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢩⡂⢸⢸⣀⣴⣿⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠹⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢉⠉⠉⠁⢸⠃⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⢳⢨⠘⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⢸⣴⢸⢸⢸⢸⡟⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠳⣀⢠⢨⢘⢘⢸⢸⢸⢸⢸⢸⢸⢸⣤⣿⢸⢸⢸⣀⠛⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀",
-];
-/// Display width of each line in `ASCII_LOGO_ALT`.
-const ASCII_LOGO_ALT_WIDTH: u16 = 33;
-/// Number of lines in `ASCII_LOGO_ALT`.
-const ASCII_LOGO_ALT_HEIGHT: u16 = 15;
-
 /// Maximum display width for a tip line (logo width + padding on each side).
 const TIP_MAX_WIDTH: u16 = 47;
 /// Blank lines between the bottom of the logo and the tip.
@@ -1801,27 +1778,16 @@ impl App {
             return;
         }
 
-        // Rotate the tip and randomly pick a logo variant when the logo
-        // becomes visible again after being hidden, or when the selected
-        // left-pane item changes while the logo stays visible.
+        // Rotate the tip when the logo becomes visible again after being
+        // hidden, or when the selected left-pane item changes while the logo
+        // stays visible.
         if !self.welcome_logo_visible || self.welcome_tip_selection != self.selected_left {
             self.welcome_tip_index = self.welcome_tip_index.wrapping_add(1);
-            self.welcome_logo_alt = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() % 2 == 0)
-                .unwrap_or(false);
         }
         self.welcome_logo_visible = true;
         self.welcome_tip_selection = self.selected_left;
 
-        // Pick the active logo variant. Fall back to the text logo when the
-        // area is too short for the taller duck.
-        let use_alt = self.welcome_logo_alt && area.height >= ASCII_LOGO_ALT_HEIGHT;
-        let (logo, logo_w, logo_h) = if use_alt {
-            (ASCII_LOGO_ALT, ASCII_LOGO_ALT_WIDTH, ASCII_LOGO_ALT_HEIGHT)
-        } else {
-            (ASCII_LOGO, ASCII_LOGO_WIDTH, ASCII_LOGO_HEIGHT)
-        };
+        let (logo, logo_w, logo_h) = (ASCII_LOGO, ASCII_LOGO_WIDTH, ASCII_LOGO_HEIGHT);
 
         let total_height = logo_h + TIP_GAP + TIP_MAX_LINES;
         let show_tip = area.width >= TIP_MAX_WIDTH && area.height >= total_height;
@@ -9388,6 +9354,18 @@ fn status_footer_lines(status_text: &str, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_logo_dimensions_match_the_rendered_rect() {
+        assert_eq!(ASCII_LOGO.len(), ASCII_LOGO_HEIGHT as usize);
+        for line in ASCII_LOGO {
+            assert_eq!(
+                UnicodeWidthStr::width(*line),
+                ASCII_LOGO_WIDTH as usize,
+                "logo line has an unexpected display width: {line:?}"
+            );
+        }
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
