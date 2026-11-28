@@ -7,8 +7,8 @@ DEMO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=env.sh
 source "$DEMO_DIR/env.sh"
 
-if [ ! -x "$DEMO_DUX_BIN" ]; then
-  echo "dux binary not found at $DEMO_DUX_BIN" >&2
+if [ ! -x "$DEMO_YVO_BIN" ]; then
+  echo "yvo binary not found at $DEMO_YVO_BIN" >&2
   echo "Build it first with: cargo build" >&2
   exit 1
 fi
@@ -22,31 +22,31 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 REPOS=$DEMO_ROOT/repos
-WORKTREES=$DUX_HOME/worktrees
-INIT_TMUX=dux-demo-init
+WORKTREES=$YVO_HOME/worktrees
+INIT_TMUX=yvo-demo-init
 
-export GIT_AUTHOR_NAME="dux demo"
-export GIT_AUTHOR_EMAIL="demo@dux.local"
-export GIT_COMMITTER_NAME="dux demo"
-export GIT_COMMITTER_EMAIL="demo@dux.local"
+export GIT_AUTHOR_NAME="yvo demo"
+export GIT_AUTHOR_EMAIL="demo@yvo.local"
+export GIT_COMMITTER_NAME="yvo demo"
+export GIT_COMMITTER_EMAIL="demo@yvo.local"
 
 tmux -L "$INIT_TMUX" kill-server 2>/dev/null || true
-tmux -L dux-demo-capture kill-server 2>/dev/null || true
+tmux -L yvo-demo-capture kill-server 2>/dev/null || true
 
-# Never delete the demo state out from under a running dux instance.
-if [ -f "$DUX_HOME/dux.lock" ]; then
-  pid=$(cat "$DUX_HOME/dux.lock" 2>/dev/null || true)
+# Never delete the demo state out from under a running yvo instance.
+if [ -f "$YVO_HOME/yvo.lock" ]; then
+  pid=$(cat "$YVO_HOME/yvo.lock" 2>/dev/null || true)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    echo "A dux instance is already running for $DUX_HOME (pid $pid)." >&2
-    echo "Close it before rebuilding the demo, or set DUX_DEMO_ROOT to a different directory." >&2
+    echo "A yvo instance is already running for $YVO_HOME (pid $pid)." >&2
+    echo "Close it before rebuilding the demo, or set YVO_DEMO_ROOT to a different directory." >&2
     exit 1
   fi
 fi
 
-pkill -f "$DEMO_DIR/bin/dux-demo-agent" 2>/dev/null || true
+pkill -f "$DEMO_DIR/bin/yvo-demo-agent" 2>/dev/null || true
 
-rm -rf "$REPOS" "$DUX_HOME"
-mkdir -p "$REPOS" "$WORKTREES" "$DUX_HOME"
+rm -rf "$REPOS" "$YVO_HOME"
+mkdir -p "$REPOS" "$WORKTREES" "$YVO_HOME"
 
 create_repo() {
   local name=$1
@@ -63,7 +63,7 @@ create_repo storefront
 create_repo checkout-api
 create_repo billing-service
 
-# The origin agent already has storefront changes when dux starts.
+# The origin agent already has storefront changes when yvo starts.
 git -C "$REPOS/storefront" worktree add -q \
   -b feature/gift-cards \
   "$WORKTREES/storefront/gift-cards" main
@@ -80,10 +80,10 @@ git -C "$REPOS/storefront" worktree add -q \
 template=$(cat "$DEMO_DIR/config.toml.in")
 demo_root_toml=${DEMO_ROOT//\\/\\\\}
 demo_root_toml=${demo_root_toml//\"/\\\"}
-printf '%s\n' "${template//__DEMO_ROOT__/$demo_root_toml}" >"$DUX_HOME/config.toml"
+printf '%s\n' "${template//__DEMO_ROOT__/$demo_root_toml}" >"$YVO_HOME/config.toml"
 
 db_ready() {
-  python3 - "$DUX_HOME/sessions.sqlite3" >/dev/null 2>&1 <<'PY'
+  python3 - "$YVO_HOME/sessions.sqlite3" >/dev/null 2>&1 <<'PY'
 import sqlite3
 import sys
 
@@ -93,27 +93,27 @@ raise SystemExit(0 if {"projects", "agent_sessions"} <= tables else 1)
 PY
 }
 
-# Open dux once inside tmux so it creates and migrates the session database.
+# Open yvo once inside tmux so it creates and migrates the session database.
 # The loop watches for the schema instead of assuming a fixed startup delay.
 # Run through a relative symlink so a repo path with spaces does not get split
 # by tmux's shell command handling.
-ln -sf "$DEMO_DUX_BIN" "$DEMO_ROOT/dux-demo-bin"
+ln -sf "$DEMO_YVO_BIN" "$DEMO_ROOT/yvo-demo-bin"
 tmux -L "$INIT_TMUX" -f /dev/null new-session -d -s init -x 200 -y 50 \
-  -c "$DEMO_ROOT" ./dux-demo-bin
+  -c "$DEMO_ROOT" ./yvo-demo-bin
 for _ in $(seq 1 100); do
   db_ready && break
   sleep 0.1
 done
 tmux -L "$INIT_TMUX" kill-server 2>/dev/null || true
-rm -f "$DEMO_ROOT/dux-demo-bin"
+rm -f "$DEMO_ROOT/yvo-demo-bin"
 
 if ! db_ready; then
-  echo "dux did not initialize $DUX_HOME/sessions.sqlite3" >&2
-  echo "Check $DUX_HOME/dux.log for details." >&2
+  echo "yvo did not initialize $YVO_HOME/sessions.sqlite3" >&2
+  echo "Check $YVO_HOME/yvo.log for details." >&2
   exit 1
 fi
 
-python3 - "$DUX_HOME/sessions.sqlite3" "$DEMO_ROOT" <<'PY'
+python3 - "$YVO_HOME/sessions.sqlite3" "$DEMO_ROOT" <<'PY'
 import os
 import sqlite3
 import sys
@@ -188,6 +188,6 @@ print(f"seeded {len(rows)} sessions")
 PY
 
 echo "Demo ready under $DEMO_ROOT"
-echo "  dux binary: $DEMO_DUX_BIN"
+echo "  yvo binary: $DEMO_YVO_BIN"
 echo "  run:        $DEMO_DIR/run.sh --fresh"
 echo "  capture:    $DEMO_DIR/capture.sh"

@@ -117,18 +117,18 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
     },
     |b| {
         format!(
-            "Open the palette with `{}` and run `change-agent-provider` to swap a worktree's CLI. Been here before? dux resumes that provider's last session automatically.",
+            "Open the palette with `{}` and run `change-agent-provider` to swap a worktree's CLI. Been here before? yvo resumes that provider's last session automatically.",
             b.label_for(Action::OpenPalette)
         )
     },
     |_b| {
-        "dux remembers which providers you've run on each worktree. Swap away and back, and each one picks up right where you left it.".into()
+        "yvo remembers which providers you've run on each worktree. Swap away and back, and each one picks up right where you left it.".into()
     },
     |_b| {
         "Need to change which CLI new agents use? `change-default-provider` updates the global fallback. `change-project-default-provider` overrides just one project.".into()
     },
     |_b| {
-        "Swapped providers while an agent was still running? A `↻` badge marks the queued swap until you exit and relaunch. dux queues the swap, you run the show.".into()
+        "Swapped providers while an agent was still running? A `↻` badge marks the queued swap until you exit and relaunch. yvo queues the swap, you run the show.".into()
     },
     // --- new tips ---
     |_b| {
@@ -153,7 +153,7 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
             b.label_for(Action::ToggleSidebar)
         )
     },
-    |_b| "Every keybinding is configurable. Open config.toml and make dux truly yours.".into(),
+    |_b| "Every keybinding is configurable. Open config.toml and make yvo truly yours.".into(),
     |_b| {
         "Worktrees are the secret sauce: each agent gets its own isolated branch. No conflicts, ever."
             .into()
@@ -184,23 +184,23 @@ const WELCOME_TIPS: &[fn(&RuntimeBindings) -> String] = &[
         "Tired of typing the same prompt to your AI agent over and over? Turn it into a macro!"
             .into()
     },
-    |_b| "Dux runs Claude the way Anthropic intended. No workarounds, no bans. Just vibes.".into(),
+    |_b| "Yvo runs Claude the way Anthropic intended. No workarounds, no bans. Just vibes.".into(),
     |_b| {
         "The config file is also the documentation. Every option is configurable and the comments explain it all."
             .into()
     },
     |_b| {
-        "Curious what you changed in your config? Run `dux config diff` to see exactly what's different from the defaults."
+        "Curious what you changed in your config? Run `yvo config diff` to see exactly what's different from the defaults."
             .into()
     },
     |b| {
         format!(
-            "Agent keybinds clashing with dux? `{}` toggles interactive mode. Most keys go straight to the agent.",
+            "Agent keybinds clashing with yvo? `{}` toggles interactive mode. Most keys go straight to the agent.",
             b.label_for(Action::ExitInteractive)
         )
     },
     |_b| {
-        "New agent prompt looking too empty? Tick the pet-name checkbox and let dux name your next chaos gremlin."
+        "New agent prompt looking too empty? Tick the pet-name checkbox and let yvo name your next chaos gremlin."
             .into()
     },
     |_b| {
@@ -703,9 +703,9 @@ impl App {
         let sep_fg = self.theme.header_separator_fg;
         let label_fg = self.theme.header_label_fg;
         let mut spans = vec![
-            Span::styled(" dux ", Style::default().fg(label_fg).bg(bg)),
+            Span::styled(" yvo ", Style::default().fg(label_fg).bg(bg)),
             Span::styled(
-                env!("DUX_DISPLAY_VERSION"),
+                env!("YVO_DISPLAY_VERSION"),
                 Style::default().fg(self.theme.branch_fg).bg(bg),
             ),
         ];
@@ -1794,7 +1794,7 @@ impl App {
         }
     }
 
-    /// Render the ASCII "dux" logo centered in the given area, with an
+    /// Render the ASCII "yvo" logo centered in the given area, with an
     /// optional feature tip displayed below.
     fn render_ascii_logo(&mut self, frame: &mut Frame, area: Rect) {
         if area.width < ASCII_LOGO_WIDTH || area.height < ASCII_LOGO_HEIGHT {
@@ -3031,10 +3031,10 @@ impl App {
             lines.push(Line::from(""));
         };
 
-        // ── About dux ──────────────────────────────────────────
-        push_banner(&mut lines, "About dux", content_width);
+        // ── About yvo ──────────────────────────────────────────
+        push_banner(&mut lines, "About yvo", content_width);
         lines.push(Line::from(Span::styled(
-            "dux is a terminal UI for orchestrating AI coding agents.",
+            "yvo is a terminal UI for orchestrating AI coding agents.",
             body_style,
         )));
         lines.push(Line::from(Span::styled(
@@ -5034,7 +5034,7 @@ impl App {
                                 .unwrap_or_default();
                             let kind_style = if !entry.is_selectable {
                                 Style::default().fg(self.theme.hint_dim_desc_fg)
-                            } else if entry.is_managed_by_dux {
+                            } else if entry.is_managed_by_yvo {
                                 Style::default().fg(self.theme.branch_fg)
                             } else {
                                 Style::default().fg(self.theme.hint_desc_fg)
@@ -5916,7 +5916,7 @@ impl App {
                 let lines = vec![
                     Line::from(""),
                     Line::from(
-                        " Cleanup removes inactive dux-managed worktrees and scratch workspaces.",
+                        " Cleanup removes inactive yvo-managed worktrees and scratch workspaces.",
                     ),
                     Line::from(""),
                     Line::from(Span::styled(
@@ -5965,7 +5965,7 @@ impl App {
                     vec![
                         Line::from(""),
                         Line::from(
-                            " No inactive dux-managed worktrees or scratch workspaces meet the cleanup criteria.",
+                            " No inactive yvo-managed worktrees or scratch workspaces meet the cleanup criteria.",
                         ),
                         Line::from(""),
                         Line::from(Span::styled(
@@ -6285,7 +6285,7 @@ impl App {
                 self.render_dim_overlay(frame);
                 let area = centered_rect(56, 30, frame.area());
                 self.clear_overlay_area(frame, area);
-                let outer = self.themed_overlay_block("Quit dux");
+                let outer = self.themed_overlay_block("Quit yvo");
                 let inner = outer.inner(area);
                 outer.render(area, frame.buffer_mut());
 
@@ -6467,7 +6467,7 @@ impl App {
                     matches!(kind, BranchWarningKind::Known { .. }) && action.allows_add_anyway();
 
                 // Body: warning text + the "new worktrees branch from …" note,
-                // plus a dim info line on the heuristic path explaining why dux
+                // plus a dim info line on the heuristic path explaining why yvo
                 // won't offer to switch branches automatically.
                 let mut body_lines = vec![Line::from("")];
                 match kind {
@@ -6511,7 +6511,7 @@ impl App {
                 if matches!(kind, BranchWarningKind::Heuristic) {
                     body_lines.push(Line::from(""));
                     body_lines.push(Line::from(Span::styled(
-                        " Dux can't confidently identify this repo's default",
+                        " Yvo can't confidently identify this repo's default",
                         Style::default().fg(self.theme.hint_desc_fg),
                     )));
                     body_lines.push(Line::from(Span::styled(
@@ -7195,7 +7195,7 @@ impl App {
                         source_worktree_path,
                         ..
                     } => Some(format!(
-                        " External worktree will be copied into a fresh managed dux worktree: {}.",
+                        " External worktree will be copied into a fresh managed yvo worktree: {}.",
                         source_worktree_path.display()
                     )),
                     _ => None,
@@ -8689,7 +8689,7 @@ fn xterm256_to_rgb(idx: u8) -> (u8, u8, u8) {
 ///
 /// Interactive mode (fullscreen agent or focused agent/terminal) always
 /// passes the CLI's colors through unchanged so the user's configured
-/// palette renders end-to-end without dux fighting it.
+/// palette renders end-to-end without yvo fighting it.
 ///
 /// Non-interactive (minimized / read-only) mode dims the foreground to a
 /// single muted shade. Cells the CLI explicitly colored have their
@@ -9932,7 +9932,7 @@ mod tests {
     fn pty_cell_colors_preserves_default_bg_in_interactive_mode() {
         // Color::Reset must pass through so the agent/terminal pane shows
         // whatever the user's CLI configured rather than fighting it with
-        // a dux-themed surface.
+        // a yvo-themed surface.
         let theme = Theme::default_dark();
         let fg = Color::Rgb(200, 100, 50);
         assert_eq!(

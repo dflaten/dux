@@ -2178,7 +2178,7 @@ impl App {
         session.updated_at = Utc::now();
         let _ = self.session_store.upsert_session(session);
         logger::info(&format!(
-            "recorded {} session id for dux session {}: {}",
+            "recorded {} session id for yvo session {}: {}",
             provider.as_str(),
             session_id,
             provider_session_id
@@ -3004,7 +3004,7 @@ fn truncate_status_output(text: &str, max_chars: usize) -> TruncatedStatusOutput
     }
 }
 
-/// Background job for "Add Project" when the user opted to have dux switch to
+/// Background job for "Add Project" when the user opted to have yvo switch to
 /// the default branch first. Runs `git switch <target_branch>` in the source
 /// repo and reports the outcome via
 /// `WorkerEvent::NonDefaultBranchCheckoutCompleted` so the main loop can
@@ -3223,7 +3223,7 @@ type CreateAgentWorktreeResult = (String, String, String, PathBuf, bool, Option<
 /// Create a unique scratch workspace directory for `requested`. Existing
 /// folders are preserved and skipped, so converting or deleting an agent never
 /// makes a future agent silently reuse old files.
-fn create_scratch_workspace(paths: &DuxPaths, requested: &str) -> Result<(String, PathBuf)> {
+fn create_scratch_workspace(paths: &YvoPaths, requested: &str) -> Result<(String, PathBuf)> {
     let root = paths.scratch_root();
     fs::create_dir_all(&root)
         .map_err(|err| anyhow::anyhow!("failed to create {}: {err}", root.display()))?;
@@ -3253,7 +3253,7 @@ fn create_scratch_workspace(paths: &DuxPaths, requested: &str) -> Result<(String
 
 fn existing_worktree_request_for_branch(
     project: &Project,
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     sessions: &[AgentSession],
     branch_name: &str,
 ) -> Option<CreateAgentRequest> {
@@ -3289,7 +3289,7 @@ fn existing_worktree_request_for_branch(
 
 fn create_agent_worktree_from_existing_request(
     request: CreateAgentRequest,
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     worker_tx: &Sender<WorkerEvent>,
 ) -> Option<CreateAgentWorktreeResult> {
     match request {
@@ -3406,7 +3406,7 @@ fn create_agent_worktree_from_existing_request(
 
 pub(crate) fn run_create_agent_job(
     request: CreateAgentRequest,
-    paths: DuxPaths,
+    paths: YvoPaths,
     config: Config,
     sessions: Vec<AgentSession>,
     worker_tx: Sender<WorkerEvent>,
@@ -4190,7 +4190,7 @@ fn converted_scratch_session(
 
 pub(crate) fn run_scratch_conversion_job(
     request: ScratchConversionRequest,
-    paths: DuxPaths,
+    paths: YvoPaths,
     config: Config,
     worker_tx: Sender<WorkerEvent>,
 ) {
@@ -4352,7 +4352,7 @@ pub(crate) fn run_scratch_conversion_job(
 }
 
 fn prepare_new_project_from_scratch(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     scratch_path: &Path,
     destination: &Path,
     config: &Config,
@@ -4393,7 +4393,7 @@ fn prepare_new_project_from_scratch(
     let result = (|| -> Result<Project> {
         if git::is_under(&paths.root, destination) {
             return Err(anyhow::anyhow!(
-                "destination must be outside dux's data directory ({})",
+                "destination must be outside yvo's data directory ({})",
                 paths.root.display()
             ));
         }
@@ -4616,7 +4616,7 @@ fn run_pr_sync(sessions: &Arc<Mutex<Vec<PrSyncEntry>>>) -> Vec<(String, super::P
 }
 
 /// Look up the PR for an untracked base branch so stacks whose parent has no
-/// dux agent still resolve automatically.
+/// yvo agent still resolve automatically.
 pub(crate) fn run_pr_base_lookup_job(
     host: String,
     owner_repo: String,
@@ -5102,7 +5102,7 @@ pub(crate) fn run_split_out_prepare_job(
                     &request_id,
                     "project_not_found",
                     format!(
-                        "No dux project matches \"{query}\". Pass --repo <path> to target a git checkout directly."
+                        "No yvo project matches \"{query}\". Pass --repo <path> to target a git checkout directly."
                     ),
                 );
                 return;
@@ -5127,7 +5127,7 @@ pub(crate) fn run_split_out_prepare_job(
                 &request_id,
                 "invalid_repo",
                 format!(
-                    "Target repository {} is inside dux's data directory. Pass the source checkout path instead.",
+                    "Target repository {} is inside yvo's data directory. Pass the source checkout path instead.",
                     repo_path.display()
                 ),
             );
@@ -5147,7 +5147,7 @@ pub(crate) fn run_split_out_prepare_job(
                 &request_id,
                 "unregistered_repo",
                 format!(
-                    "Repository {} is not a dux project, and agent-initiated project registration is disabled. Add it in dux first or enable [agent_control] allow_unregistered_repos.",
+                    "Repository {} is not a yvo project, and agent-initiated project registration is disabled. Add it in yvo first or enable [agent_control] allow_unregistered_repos.",
                     repo_path.display()
                 ),
             );
@@ -5728,7 +5728,7 @@ fn resolve_split_out_name(
 
 pub(crate) fn run_split_out_create_job(
     request: SplitOutCreateRequest,
-    paths: DuxPaths,
+    paths: YvoPaths,
     config: Config,
     worker_tx: Sender<WorkerEvent>,
     term_size: (u16, u16),
@@ -6049,13 +6049,13 @@ mod tests {
         }
     }
 
-    fn test_paths(root: &Path) -> DuxPaths {
-        DuxPaths {
+    fn test_paths(root: &Path) -> YvoPaths {
+        YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.to_path_buf().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.to_path_buf().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.to_path_buf(),
         }
     }
@@ -6066,13 +6066,13 @@ mod tests {
         let repo = tmp.path().join("other-repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         run_git(&repo, &["init", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "dux@example.com"]);
-        run_git(&repo, &["config", "user.name", "dux"]);
+        run_git(&repo, &["config", "user.email", "yvo@example.com"]);
+        run_git(&repo, &["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "initial"]);
 
-        let paths = test_paths(&tmp.path().join("dux-home"));
+        let paths = test_paths(&tmp.path().join("yvo-home"));
         let source = test_session(&tmp.path().join("source"));
         let (tx, rx) = mpsc::channel();
         run_split_out_prepare_job(
@@ -6113,8 +6113,8 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         run_git(&repo, &["init", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "dux@example.com"]);
-        run_git(&repo, &["config", "user.name", "dux"]);
+        run_git(&repo, &["config", "user.email", "yvo@example.com"]);
+        run_git(&repo, &["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "initial"]);
@@ -6212,8 +6212,8 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         run_git(&repo, &["init", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "dux@example.com"]);
-        run_git(&repo, &["config", "user.name", "dux"]);
+        run_git(&repo, &["config", "user.email", "yvo@example.com"]);
+        run_git(&repo, &["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "initial"]);
@@ -6231,7 +6231,7 @@ mod tests {
         );
         let expected_head = git::head_commit(&parent_worktree).expect("parent head");
 
-        let paths = test_paths(&tmp.path().join("dux-home"));
+        let paths = test_paths(&tmp.path().join("yvo-home"));
         let project = test_project(&repo);
         let mut source = test_session(&parent_worktree);
         source.project_id = project.id.clone();
@@ -6276,8 +6276,8 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         run_git(&repo, &["init", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "dux@example.com"]);
-        run_git(&repo, &["config", "user.name", "dux"]);
+        run_git(&repo, &["config", "user.email", "yvo@example.com"]);
+        run_git(&repo, &["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "initial"]);
@@ -6328,8 +6328,8 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         run_git(&repo, &["init", "-b", "main"]);
-        run_git(&repo, &["config", "user.email", "dux@example.com"]);
-        run_git(&repo, &["config", "user.name", "dux"]);
+        run_git(&repo, &["config", "user.email", "yvo@example.com"]);
+        run_git(&repo, &["config", "user.name", "yvo"]);
         std::fs::write(repo.join("README.md"), "hello\n").expect("write");
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "initial"]);
@@ -6343,7 +6343,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let paths = test_paths(&tmp.path().join("dux-home"));
+        let paths = test_paths(&tmp.path().join("yvo-home"));
         let mut project = test_project(&repo);
         project.default_provider = ProviderKind::from_str("fake");
         let mut source = test_session(&tmp.path().join("source"));
@@ -6931,12 +6931,12 @@ mod tests {
     #[test]
     fn fork_worker_requires_name_from_prompt() {
         let tmp = tempdir().expect("tempdir");
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
-            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
-            lock_path: tmp.path().join("dux.lock"),
+            control_socket_path: tmp.path().to_path_buf().join("yvo.sock"),
+            lock_path: tmp.path().join("yvo.lock"),
             root: tmp.path().to_path_buf(),
         };
         let project = Project {
@@ -7001,12 +7001,12 @@ mod tests {
     #[test]
     fn fresh_worker_reports_pre_create_pull_failure_before_worktree_creation() {
         let tmp = tempdir().expect("tempdir");
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
-            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
-            lock_path: tmp.path().join("dux.lock"),
+            control_socket_path: tmp.path().to_path_buf().join("yvo.sock"),
+            lock_path: tmp.path().join("yvo.lock"),
             root: tmp.path().to_path_buf(),
         };
         let project = Project {
@@ -7063,7 +7063,7 @@ mod tests {
     fn create_worker_refuses_provider_not_in_config() {
         // A project pinned to a provider that isn't configured (the state a
         // project is left in after a default like Gemini is retired and its
-        // stock block pruned). dux must refuse rather than spawn a bare command
+        // stock block pruned). yvo must refuse rather than spawn a bare command
         // from PATH, and must point the user at config.
         let repo = tempdir().expect("repo tempdir");
         run_git(repo.path(), &["init", "-b", "main"]);
@@ -7074,12 +7074,12 @@ mod tests {
         run_git(repo.path(), &["commit", "-m", "init"]);
 
         let work = tempdir().expect("work tempdir");
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: work.path().join("config.toml"),
             sessions_db_path: work.path().join("sessions.sqlite3"),
             worktrees_root: work.path().join("worktrees"),
-            control_socket_path: work.path().to_path_buf().join("dux.sock"),
-            lock_path: work.path().join("dux.lock"),
+            control_socket_path: work.path().to_path_buf().join("yvo.sock"),
+            lock_path: work.path().join("yvo.lock"),
             root: work.path().to_path_buf(),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees root");

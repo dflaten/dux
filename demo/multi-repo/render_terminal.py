@@ -7,7 +7,7 @@ script draws that grid with Pillow.
 
 Font discovery is deliberately configurable. The demo was tuned with GeistMono
 Nerd Font Mono, DejaVu Sans Mono, DejaVu Sans, and Noto Sans Math. Set the
-DUX_DEMO_FONT* environment variables to override the choices.
+YVO_DEMO_FONT* environment variables to override the choices.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ CELL_H = 27
 APP_BG = (20, 20, 20)
 DEFAULT_FG = (210, 210, 210)
 
-# One Dark-ish 16-color palette. dux's default theme uses named ANSI colors for
+# One Dark-ish 16-color palette. yvo's default theme uses named ANSI colors for
 # accents (cyan), status (yellow), and diffs (green/red).
 ANSI16 = [
     (40, 44, 52),
@@ -230,7 +230,7 @@ def resolve_font(
 
 def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
     regular_path = resolve_font(
-        "DUX_DEMO_FONT",
+        "YVO_DEMO_FONT",
         ["GeistMono Nerd Font Mono", "DejaVu Sans Mono", "Menlo", "Noto Sans Mono"],
         [
             "~/.fonts/GeistMono/GeistMonoNerdFontMono-Regular.otf",
@@ -242,11 +242,11 @@ def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
     )
     if regular_path is None:
         raise SystemExit(
-            "No usable monospace font found. Set DUX_DEMO_FONT to a font path."
+            "No usable monospace font found. Set YVO_DEMO_FONT to a font path."
         )
 
     bold_path = resolve_font(
-        "DUX_DEMO_FONT_BOLD",
+        "YVO_DEMO_FONT_BOLD",
         ["GeistMono Nerd Font Mono:bold", "DejaVu Sans Mono:bold", "Menlo:bold"],
         [
             "~/.fonts/GeistMono/GeistMonoNerdFontMono-Bold.otf",
@@ -257,7 +257,7 @@ def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
     ) or regular_path
 
     symbol_path = resolve_font(
-        "DUX_DEMO_SYMBOL_FONT",
+        "YVO_DEMO_SYMBOL_FONT",
         ["DejaVu Sans Mono", "Apple Symbols", "Menlo"],
         [
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -267,7 +267,7 @@ def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
     ) or regular_path
 
     symbol_sans_path = resolve_font(
-        "DUX_DEMO_SYMBOL_SANS_FONT",
+        "YVO_DEMO_SYMBOL_SANS_FONT",
         ["DejaVu Sans", "Apple Symbols"],
         [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -277,7 +277,7 @@ def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
     ) or symbol_path
 
     math_path = resolve_font(
-        "DUX_DEMO_MATH_FONT",
+        "YVO_DEMO_MATH_FONT",
         ["Noto Sans Math", "Apple Symbols", "DejaVu Sans"],
         [
             "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
@@ -296,7 +296,7 @@ def load_fonts() -> Dict[str, ImageFont.FreeTypeFont]:
 
 
 # GeistMono is a good text face but its Unicode coverage stops short of a few
-# symbols dux uses. PIL does not perform fontconfig fallback, so route those
+# symbols yvo uses. PIL does not perform fontconfig fallback, so route those
 # glyphs through a known-good face and center them inside the cell.
 DEJAVU_MONO_SYMBOLS = set("▾⇄↳◐✻⠏●")
 

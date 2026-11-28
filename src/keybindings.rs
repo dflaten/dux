@@ -472,14 +472,14 @@ impl Action {
             Action::EditMacros => "Open the text macros editor.",
             Action::DebugInput => "Open input event debugger to inspect keyboard and mouse events.",
             Action::ToggleDiffLineNumbers => "Toggle line numbers in diff view.",
-            Action::ResourceMonitor => "Show CPU and memory usage for dux and all running agents.",
+            Action::ResourceMonitor => "Show CPU and memory usage for yvo and all running agents.",
             Action::ToggleGithubIntegration => "Toggle GitHub PR integration.",
             Action::ToggleProjectAutoReopenAgents => {
                 "Toggle startup auto-reopen for agents in the selected project."
             }
             Action::ToggleAgentAutoReopen => "Toggle startup auto-reopen for the selected agent.",
             Action::CleanupWorktrees => {
-                "Permanently remove inactive dux-managed worktrees and unreferenced scratch workspaces older than two weeks."
+                "Permanently remove inactive yvo-managed worktrees and unreferenced scratch workspaces older than two weeks."
             }
             Action::ConfigureStartupCommand => {
                 "Configure the selected project's startup command for newly created agents."
@@ -503,7 +503,7 @@ impl Action {
                 "Move PR banner between top and bottom of agent pane."
             }
             Action::ForceReconnectAgent => "Restart the agent without resuming the prior session.",
-            Action::ChangeTheme => "Open a picker to switch the dux color theme.",
+            Action::ChangeTheme => "Open a picker to switch the yvo color theme.",
             Action::ReloadConfig => "Reload the configuration file.",
             Action::RecoverDeletedAgent => "Search and recover recently deleted agent sessions.",
             Action::NextRelatedAgent => {
@@ -869,7 +869,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "change-theme",
-            description: "Switch the dux color theme",
+            description: "Switch the yvo color theme",
         }),
     },
     BindingDef {
@@ -1113,7 +1113,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         scopes: &[BindingScope::Left, BindingScope::Center],
         help: Some(HelpEntry {
             section: "Projects pane",
-            description: "Remove selected agent from dux (preserves worktree)",
+            description: "Remove selected agent from yvo (preserves worktree)",
         }),
         hint_contexts: &[
             (HintContext::LeftSession, "Delete"),
@@ -1122,7 +1122,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         ],
         palette: Some(PaletteEntry {
             name: "delete-agent",
-            description: "Remove the selected agent from dux and preserve its worktree",
+            description: "Remove the selected agent from yvo and preserve its worktree",
         }),
     },
     BindingDef {
@@ -2051,7 +2051,7 @@ pub const BINDING_DEFS: &[BindingDef] = &[
         hint_contexts: &[],
         palette: Some(PaletteEntry {
             name: "resource-monitor",
-            description: "Show CPU and memory usage for dux and all running agents",
+            description: "Show CPU and memory usage for yvo and all running agents",
         }),
     },
     BindingDef {

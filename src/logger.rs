@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
 
-use crate::config::{DuxPaths, LoggingConfig};
+use crate::config::{LoggingConfig, YvoPaths};
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
@@ -42,7 +42,7 @@ impl LogLevel {
     }
 }
 
-pub fn init(config: &LoggingConfig, paths: &DuxPaths) {
+pub fn init(config: &LoggingConfig, paths: &YvoPaths) {
     let path = resolve_log_path(config, paths);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -93,10 +93,10 @@ fn log(level: LogLevel, message: &str) {
     }
 }
 
-pub fn resolve_log_path(config: &LoggingConfig, paths: &DuxPaths) -> PathBuf {
+pub fn resolve_log_path(config: &LoggingConfig, paths: &YvoPaths) -> PathBuf {
     let configured = PathBuf::from(&config.path);
     if configured.as_os_str().is_empty() {
-        return paths.root.join("dux.log");
+        return paths.root.join("yvo.log");
     }
     if configured.is_absolute() {
         configured

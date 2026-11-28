@@ -2,7 +2,7 @@
 
 Status: Implemented (core); deferred polish tracked below  
 Date: 2026-11-20  
-Scope: `dux` TUI, `dux` CLI, agent control socket, SQLite state, UI
+Scope: `yvo` TUI, `yvo` CLI, agent control socket, SQLite state, UI
 
 ## Implementation status
 
@@ -48,7 +48,7 @@ Still deferred or incomplete from the full proposal:
   TUI thread and into workers;
 - moving PTY cancellation off the TUI thread;
 - lazy synthesis of delegation rows for split-out sessions created before this
-  migration (`dux agent related` and the sidebar tree still show them);
+  migration (`yvo agent related` and the sidebar tree still show them);
 - git-derived result facts (commits, changed files, diff stat, PR links);
 - dirty-parent warnings for `parent-head` and `sibling-head`;
 - richer integration options (`--allow-dirty`, strategy choice, overlap
@@ -66,14 +66,14 @@ Still deferred or incomplete from the full proposal:
 
 ## TL;DR
 
-Dux already has the seed of this feature: `dux agent split-out` lets an agent ask
+Yvo already has the seed of this feature: `yvo agent split-out` lets an agent ask
 the running TUI to create a related worktree in another project, launch a child
 agent in it, and group both agents under the related-work section.
 
 This design generalizes that primitive into a **delegation tree**:
 
 - Any agent can become an **orchestrator** by delegating work to child agents.
-- Children are ordinary dux agents in ordinary worktrees, so they can delegate
+- Children are ordinary yvo agents in ordinary worktrees, so they can delegate
   further and form arbitrarily deep trees.
 - Delegations can target the **same repository** or a **different repository**.
 - The base for a child is explicit and frozen: project leading branch, an
@@ -82,16 +82,16 @@ This design generalizes that primitive into a **delegation tree**:
 - Each delegation has durable state, a durable brief, a completion contract, and
   a result. The parent can wait, read results, answer blockers, request another
   iteration, cancel a subtree, and integrate same-repo work.
-- Dux remains the only writer of worktrees, sessions, and state. Agents still
-  talk to dux through the existing JSON-over-Unix-socket CLI. There is no agent
+- Yvo remains the only writer of worktrees, sessions, and state. Agents still
+  talk to yvo through the existing JSON-over-Unix-socket CLI. There is no agent
   protocol and no new adapter layer.
 
 The core interaction is **task-level turn-taking**, not live chat:
 
 1. Orchestrator spawns a child with a self-contained brief.
-2. Child works, then calls `dux agent finish` with `success`, `failed`, or
+2. Child works, then calls `yvo agent finish` with `success`, `failed`, or
    `blocked`.
-3. Orchestrator calls `dux agent wait`, receives the terminal result, inspects
+3. Orchestrator calls `yvo agent wait`, receives the terminal result, inspects
    the diff/result, then either integrates, sends a follow-up iteration, or
    cancels.
 
@@ -105,8 +105,8 @@ parsing provider output.
 
 ### 1.1 Control plane
 
-`src/ipc.rs` implements a user-only Unix socket at `<config_dir>/dux.sock`.
-`src/cli.rs` exposes `dux agent split-out` and `dux agent related`. The CLI
+`src/ipc.rs` implements a user-only Unix socket at `<config_dir>/yvo.sock`.
+`src/cli.rs` exposes `yvo agent split-out` and `yvo agent related`. The CLI
 sends a `ControlRequest`, the TUI's `src/app/control.rs` handles it, the work
 runs on the existing worker paths, and a JSON `ControlResponse` is written back.
 
@@ -118,8 +118,8 @@ Relevant constraints in the current implementation:
   one related worktree can be created at a time.
 - The handoff prompt is flattened to one line and typed into the child PTY after
   the child produces its first output (`write_bytes_after_first_output`).
-- `DUX_BIN`, `DUX_SESSION_ID`, `DUX_AGENT_ID`, `DUX_PROJECT_ID`,
-  `DUX_WORKTREE_PATH`, `DUX_BRANCH`, `DUX_PROVIDER`, and `DUX_AGENT_TITLE` are
+- `YVO_BIN`, `YVO_SESSION_ID`, `YVO_AGENT_ID`, `YVO_PROJECT_ID`,
+  `YVO_WORKTREE_PATH`, `YVO_BRANCH`, `YVO_PROVIDER`, and `YVO_AGENT_TITLE` are
   injected into agent PTYs.
 
 ### 1.2 Worktree creation
@@ -165,7 +165,7 @@ child's diff. A delegation-aware diff base is required.
 
 1. Let an agent decompose a task into multiple child tasks in the same or other
    repositories, and let those children decompose further.
-2. Keep every child a real dux agent: own worktree, own branch, own provider,
+2. Keep every child a real yvo agent: own worktree, own branch, own provider,
    own PTY, own diff, own companion terminals.
 3. Give the parent a reliable way to know when a child is done, read its result,
    ask for another iteration, and collect its changes.
@@ -182,7 +182,7 @@ child's diff. A delegation-aware diff base is required.
 ### Non-goals
 
 - No agent-to-agent RPC, JSON-RPC, ACP, MCP message bus, or adapter binary.
-  Agents still talk to dux through the CLI and the local control socket.
+  Agents still talk to yvo through the CLI and the local control socket.
 - No automatic merge or auto-commit of delegated work. Integration is explicit
   and user-authorized.
 - No cross-repository history merge. Cross-repo work lands through commits and
@@ -194,7 +194,7 @@ child's diff. A delegation-aware diff base is required.
   results and diffs, and can open the child agent when it needs to see the
   terminal.
 - "Subtree" here means a subtree of agent work, not `git subtree`. If a project
-  wants literal `git subtree`, agents can run it inside their own worktree; dux
+  wants literal `git subtree`, agents can run it inside their own worktree; yvo
   does not special-case it.
 
 ---
@@ -223,13 +223,13 @@ first-class.
 ```text
 ┌──────────────────────────────┐
 │ Orchestrator agent PTY       │
-│  shell: dux agent delegate   │
-│  shell: dux agent wait       │
+│  shell: yvo agent delegate   │
+│  shell: yvo agent wait       │
 └──────────────┬───────────────┘
                │ JSON over 0600 Unix socket
                ▼
 ┌──────────────────────────────┐
-│ dux CLI                      │
+│ yvo CLI                      │
 │  delegate / status / wait    │
 │  result / finish / followup  │
 │  cancel / integrate          │
@@ -237,7 +237,7 @@ first-class.
                │
                ▼
 ┌──────────────────────────────┐        ┌───────────────────────────┐
-│ dux TUI                      │        │ SQLite                    │
+│ yvo TUI                      │        │ SQLite                    │
 │  control.rs: validate/policy │◄──────►│  agent_groups             │
 │  queue + workers             │        │  agent_delegations        │
 │  UI tree + task pane         │        │  delegation base_ref      │
@@ -247,8 +247,8 @@ first-class.
        ▼               ▼
 ┌──────────────┐  ┌──────────────────────────────┐
 │ Worktrees    │  │ Worker agent PTY             │
-│ parent/child │  │  reads $DUX_BRIEF_FILE       │
-│ other repo   │  │  runs dux agent finish       │
+│ parent/child │  │  reads $YVO_BRIEF_FILE       │
+│ other repo   │  │  runs yvo agent finish       │
 └──────────────┘  └──────────────┬───────────────┘
                                  │
                                  ▼
@@ -259,8 +259,8 @@ first-class.
 
 - **Control plane:** CLI ↔ TUI socket. Short JSON requests. The TUI owns all
   mutations, policy checks, and persistence.
-- **Data plane:** the child's PTY. Dux types the initial prompt and follow-ups
-  into it exactly like a user would. Dux never parses provider output for
+- **Data plane:** the child's PTY. Yvo types the initial prompt and follow-ups
+  into it exactly like a user would. Yvo never parses provider output for
   correctness.
 - **Durable side channel:** briefs, results, and inboxes live under
   `<config_dir>/delegations/`. They survive a missed socket callback and keep
@@ -268,7 +268,7 @@ first-class.
 
 ### Why polling for `wait`
 
-`dux agent wait` is a CLI-side polling loop over `dux agent status`, not a
+`yvo agent wait` is a CLI-side polling loop over `yvo agent status`, not a
 server-side long-poll. This:
 
 - avoids holding one of the limited control connections for minutes;
@@ -355,7 +355,7 @@ indicator, and tree rendering.
   project-leading fallback.
 - `delegation.child_session_id` binds the task row to the session once it
   launches. If a child reports before the launch event is processed,
-  `DUX_DELEGATION_ID` lets the TUI bind it early.
+  `YVO_DELEGATION_ID` lets the TUI bind it early.
 
 `App::diff_base_ref_for_session` prefers the delegation base when present. This
 makes a same-repo child's right pane show only the child's work rather than the
@@ -398,7 +398,7 @@ so it moves directly from a resumable terminal state to `running`.
 | `blocked` | Child needs a decision. Resumable with `followup`. | Yes |
 | `cancelled` | Parent or user cancelled. Worktree is kept. | Yes |
 | `exited` | PTY ended without a `finish` call. Outcome unknown. | Yes |
-| `interrupted` | Dux restarted or lost the PTY while running. | Yes |
+| `interrupted` | Yvo restarted or lost the PTY while running. | Yes |
 
 `completed`, `failed`, and `blocked` are resumable terminal states: a follow-up
 moves the delegation to `running` with a new iteration. The planned quiet-period
@@ -435,23 +435,23 @@ The brief is durable because:
 
 ### 5.6 Environment injected into delegated agents
 
-In addition to the existing `DUX_*` variables:
+In addition to the existing `YVO_*` variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `DUX_DELEGATION_ID` | Delegation id. |
-| `DUX_PARENT_SESSION_ID` | Parent session id. |
-| `DUX_ROOT_SESSION_ID` | Mission origin session id. |
-| `DUX_GROUP_ID` | Mission/group id. |
-| `DUX_DELEGATION_DEPTH` | 1 for a direct child. |
-| `DUX_BRIEF_FILE` | Absolute path to the generated brief. |
-| `DUX_RESULT_FILE` | Absolute path where `dux agent finish` writes the result. |
-| `DUX_INBOX_FILE` | Absolute path to the best-effort message log. |
-| `DUX_PARENT_WORKTREE` | Parent's worktree, for context only. |
-| `DUX_PARENT_BRANCH` | Parent's branch, for context only. |
+| `YVO_DELEGATION_ID` | Delegation id. |
+| `YVO_PARENT_SESSION_ID` | Parent session id. |
+| `YVO_ROOT_SESSION_ID` | Mission origin session id. |
+| `YVO_GROUP_ID` | Mission/group id. |
+| `YVO_DELEGATION_DEPTH` | 1 for a direct child. |
+| `YVO_BRIEF_FILE` | Absolute path to the generated brief. |
+| `YVO_RESULT_FILE` | Absolute path where `yvo agent finish` writes the result. |
+| `YVO_INBOX_FILE` | Absolute path to the best-effort message log. |
+| `YVO_PARENT_WORKTREE` | Parent's worktree, for context only. |
+| `YVO_PARENT_BRANCH` | Parent's branch, for context only. |
 
-These are additional to the existing `DUX_WORKTREE_PATH`, `DUX_BRANCH`,
-`DUX_BIN`, `DUX_SESSION_ID`, and friends.
+These are additional to the existing `YVO_WORKTREE_PATH`, `YVO_BRANCH`,
+`YVO_BIN`, `YVO_SESSION_ID`, and friends.
 
 ---
 
@@ -459,10 +459,10 @@ These are additional to the existing `DUX_WORKTREE_PATH`, `DUX_BRANCH`,
 
 ### 6.1 CLI
 
-`dux agent split-out` remains, but becomes an alias for the general command:
+`yvo agent split-out` remains, but becomes an alias for the general command:
 
 ```bash
-dux agent delegate \
+yvo agent delegate \
   --same-repo \
   --title "Add gift-card ledger entries" \
   --name gift-card-ledger \
@@ -530,27 +530,27 @@ applies to control metadata, not task content.
 The rest of the surface, covered later in this document:
 
 ```text
-dux agent status [--session <id>] [--delegation <id>] [--json]
-dux agent tree   [--session <id>] [--delegation <id>] [--json]
-dux agent result --session <id> | --delegation <id> [--json]
-dux agent wait   [--session <id> | --delegation <id> | --all | --any]
+yvo agent status [--session <id>] [--delegation <id>] [--json]
+yvo agent tree   [--session <id>] [--delegation <id>] [--json]
+yvo agent result --session <id> | --delegation <id> [--json]
+yvo agent wait   [--session <id> | --delegation <id> | --all | --any]
                  [--until started] [--timeout <s>] [--allow-empty]
-dux agent finish [--session <id>] --status success|failed|blocked ...
-dux agent followup --session <id> | --delegation <id> --text-file <path|->
-dux agent message  --session <id> | --delegation <id> --text-file <path|->
-dux agent cancel   --session <id> | --delegation <id> [--subtree]
-dux agent retry    --delegation <id>
-dux agent integrate --session <id>
+yvo agent finish [--session <id>] --status success|failed|blocked ...
+yvo agent followup --session <id> | --delegation <id> --text-file <path|->
+yvo agent message  --session <id> | --delegation <id> --text-file <path|->
+yvo agent cancel   --session <id> | --delegation <id> [--subtree]
+yvo agent retry    --delegation <id>
+yvo agent integrate --session <id>
 ```
 
-`dux agent related` remains as the compatibility endpoint for the existing
+`yvo agent related` remains as the compatibility endpoint for the existing
 flat related-agent listing; it returns the subtree as well.
 
 ### 6.2 Target resolution
 
 1. Resolve `--project` by id or case-insensitive name.
 2. Else resolve `--repo` to a canonical git root. Reject paths inside
-   `dux`'s data directory. If the repo is not registered, require
+   `yvo`'s data directory. If the repo is not registered, require
    `[agent_control] allow_unregistered_repos = true`.
 3. Else use the source session's project for `--same-repo`.
 4. Reject Scratch as a target; Scratch has no git worktree.
@@ -606,7 +606,7 @@ touching the parent:
    worktree.
 4. `git write-tree`; if the tree equals `HEAD`'s tree, use `HEAD` as the
    baseline instead of creating an empty commit.
-5. Otherwise `git commit-tree` with a neutral `dux <dux@localhost>` identity
+5. Otherwise `git commit-tree` with a neutral `yvo <yvo@localhost>` identity
    passed via `-c user.name` / `-c user.email`, matching the existing scratch
    init path. A machine with no git identity must not break snapshot creation.
 6. Create the child worktree branch at that baseline commit.
@@ -628,7 +628,7 @@ would duplicate that work.
 - Generated names remain docker-style pet names.
 - Worktree path remains `worktrees/<project>/<name>`.
 - For same-repo delegations, the UI shows the parent branch next to the child
-  branch. Dux does not require a slash-style branch name, because that would
+  branch. Yvo does not require a slash-style branch name, because that would
   create nested worktree directories and complicate cleanup. The relationship
   is stored in SQLite, not encoded in the branch name.
 - If the branch already exists:
@@ -638,7 +638,7 @@ would duplicate that work.
 - Idempotency applies to terminal delegations too: a retry with the same request
   key returns the existing delegation and its state rather than creating a second
   worktree. To retry a pre-launch failure, use
-  `dux agent retry --delegation <id>`. The current implementation creates a new
+  `yvo agent retry --delegation <id>`. The current implementation creates a new
   delegation row with a new id and request key, and refuses if the old delegation
   already has a child session or a surviving branch/worktree. Existing worktrees
   must be cleaned manually. There is no UI retry action yet.
@@ -660,7 +660,7 @@ would duplicate that work.
   intended for single spawns and for the legacy `split-out` command, which keeps
   `wait-for-launch` as its default so existing skills see the old response shape.
   A configured startup command runs before launch, so this flag can be slow.
-- `dux agent wait --until started` is available when a parent wants to queue
+- `yvo agent wait --until started` is available when a parent wants to queue
   several children quickly and then wait for launch.
 - A provider launch failure removes the newly created worktree (as today) and
   marks the delegation `failed`.
@@ -688,7 +688,7 @@ create_agent_in_flight: bool
   for an unrelated user-created agent to finish, then resume.
 - PTYs run concurrently after launch, but worktree preparation is not yet
   parallelized across repositories.
-- User-created agents and delegated agents share the same creation slot, so dux
+- User-created agents and delegated agents share the same creation slot, so yvo
   never performs conflicting operations on one worktree.
 - The status line reports the current creation action rather than a queue
   summary.
@@ -733,9 +733,9 @@ Every generated brief ends with a mandatory completion section. The typed
 initial prompt is short and points at the brief:
 
 ```text
-You are a delegated dux agent. Read the task brief at
-/home/you/.config/dux/delegations/<id>/brief.md and complete it. When you are
-done, run "$DUX_BIN" agent finish --status success --summary-file - and pass
+You are a delegated yvo agent. Read the task brief at
+/home/you/.config/yvo/delegations/<id>/brief.md and complete it. When you are
+done, run "$YVO_BIN" agent finish --status success --summary-file - and pass
 your summary on stdin. If you need a decision, use --status blocked.
 ```
 
@@ -743,10 +743,10 @@ The generated brief contains the full instructions, including a here-doc example
 for the summary. This keeps the typed prompt one line and avoids newline
 flattening problems.
 
-### 7.2 `dux agent finish`
+### 7.2 `yvo agent finish`
 
 ```bash
-dux agent finish \
+yvo agent finish \
   --status success|failed|blocked \
   --summary "Short summary" \
   --summary-file - \
@@ -755,7 +755,7 @@ dux agent finish \
   --json
 ```
 
-The path in `DUX_RESULT_FILE` is stable across iterations (`result.json`). The
+The path in `YVO_RESULT_FILE` is stable across iterations (`result.json`). The
 environment cannot change when the parent sends a follow-up, and a child should
 never have to know which iteration it is on. The current TUI archives
 `result.json` as `result-<iteration>.json` when a follow-up starts the next
@@ -763,13 +763,13 @@ iteration, not when `finish` first arrives.
 
 Behavior:
 
-1. Resolve the child session from `DUX_SESSION_ID` (or `--session` for a manual
+1. Resolve the child session from `YVO_SESSION_ID` (or `--session` for a manual
    user invocation). If the caller is itself an agent and the target is not its
    own session, reject with `not_owner`; a parent cannot report a child's
    result. A human invocation with no agent environment may target any active
    delegation for repair.
 2. Build a result object with a client-generated `result_id`.
-3. Write `result.json` directly to the server-owned `DUX_RESULT_FILE` (atomic
+3. Write `result.json` directly to the server-owned `YVO_RESULT_FILE` (atomic
    temp+rename is deferred).
 4. Send `DelegationFinish` over the control socket, including the result file
    path and `result_id`. The server verifies that the path is inside the
@@ -788,7 +788,7 @@ as an artifact for inspection.
 
 The result summary stored in SQLite is capped at 8 KiB in the current
 implementation. `status` and `wait` return a summary preview truncated to 512
-bytes; there is no configurable preview size yet. `dux agent result` returns the
+bytes; there is no configurable preview size yet. `yvo agent result` returns the
 summary and result-file path; `--full` reads the file directly from disk in the
 CLI rather than sending the payload over the socket. Without this split, a
 `wait --all` over the maximum 24 descendants, or a `result` near
@@ -810,7 +810,7 @@ Result shape:
 }
 ```
 
-The current `dux agent result` implementation returns the child's reported
+The current `yvo agent result` implementation returns the child's reported
 payload plus the result-file path. It does **not** yet augment that with commits,
 uncommitted changes, changed files, diff stats, or PR links. `status` remains a
 pure SQLite/cache read and never shells out to git. Git-derived result facts are
@@ -821,12 +821,12 @@ stores status, summary, path, iteration, and `result_id`; the file stores the
 full payload. When `result.json` is absent (for example after an interrupted
 follow-up), `result` falls back to the newest archived `result-<iteration>.json`.
 
-### 7.3 `dux agent status` and `dux agent tree`
+### 7.3 `yvo agent status` and `yvo agent tree`
 
 ```bash
-dux agent status --session <id> --json
-dux agent status --delegation <id> --json
-dux agent tree --session <id>
+yvo agent status --session <id> --json
+yvo agent status --delegation <id> --json
+yvo agent tree --session <id>
 ```
 
 `status` is a pure SQLite/cache read. It returns the delegation rows for the
@@ -841,13 +841,13 @@ response.
 state glyphs. The JSON shape is stable and is what orchestrator prompts should
 parse.
 
-### 7.4 `dux agent wait`
+### 7.4 `yvo agent wait`
 
 ```bash
-dux agent wait --all --timeout 100 --json
-dux agent wait --session <child-id> --timeout 100
-dux agent wait --delegation <delegation-id> --timeout 100
-dux agent wait --all --until started
+yvo agent wait --all --timeout 100 --json
+yvo agent wait --session <child-id> --timeout 100
+yvo agent wait --delegation <delegation-id> --timeout 100
+yvo agent wait --all --until started
 ```
 
 **The default timeout is intentionally short.** Agent CLIs commonly kill a tool
@@ -881,7 +881,7 @@ Semantics:
 - If no matching delegations exist, return `no_delegations` unless
   `--allow-empty` is set, instead of returning success for an accidental typo.
 - Exit codes: `0` all requested delegations completed successfully; `1` at least
-  one failed, was cancelled, exited, or was interrupted; `2` timeout; `3` dux
+  one failed, was cancelled, exited, or was interrupted; `2` timeout; `3` yvo
   unavailable; `4` at least one is `blocked` and no harder failure occurred.
 - The CLI prints a compact progress line to stderr unless `--quiet`, and the
   final JSON/table to stdout.
@@ -896,7 +896,7 @@ is not a failure and is not retried automatically.
 ### 7.5 Follow-up iterations
 
 ```bash
-dux agent followup --session <child-id> --text-file - --json
+yvo agent followup --session <child-id> --text-file - --json
 ```
 
 - Targets a session or a delegation id. The target must be a descendant of the
@@ -905,7 +905,7 @@ dux agent followup --session <child-id> --text-file - --json
 - Allowed when the child is `completed`, `failed`, or `blocked`. `cancelled` and
   `exited` require the user to reconnect or create a new delegation.
 - Verifies the child PTY is alive. If it is not, returns `not_running` with
-  instructions; dux does not silently relaunch a provider mid-task.
+  instructions; yvo does not silently relaunch a provider mid-task.
 - Appends the text to the child's `inbox.md`.
 - **Current implementation:** writes the payload to the child PTY immediately
   after verifying the PTY is alive. Newlines are flattened so a raw newline
@@ -927,14 +927,14 @@ spawn → wait(completed) → read result/diff → followup("fix the edge case")
 
 ### 7.6 Mid-run messages
 
-`dux agent message --session <id> | --delegation <id> --text-file -` is a
+`yvo agent message --session <id> | --delegation <id> --text-file -` is a
 best-effort, non-terminal message for a running child. The current
 implementation appends to `inbox.md`, writes to the live PTY immediately, and
 does not change delegation state. The planned quiet-period queue will apply to
 messages as well. The ancestry check is the same as `followup`.
 
 This exists for corrections, but the reliable coordination path is
-finish/followup. Dux does not pretend it can know when an arbitrary TUI is idle,
+finish/followup. Yvo does not pretend it can know when an arbitrary TUI is idle,
 so it does not auto-inject messages and does not make correctness depend on them.
 
 ### 7.7 Parent notifications
@@ -943,7 +943,7 @@ When a child reaches a terminal state, the current implementation updates the
 tree/state glyphs and the status line. It does not write to a parent inbox or
 type into a running parent PTY; `notify_parent_in_pty` is a deferred proposal.
 
-The primary notification mechanism is `dux agent wait` or a later
+The primary notification mechanism is `yvo agent wait` or a later
 `status`/`result` call. Without polling, the UI still reflects the child state
 on the next screen refresh after the TUI processes the finish callback or
 imports a result file.
@@ -952,7 +952,7 @@ imports a result file.
 
 ## 8. Cancellation and subtree lifecycle
 
-`dux agent cancel --session <id> | --delegation <id> [--subtree]`:
+`yvo agent cancel --session <id> | --delegation <id> [--subtree]`:
 
 - Accepting a delegation id is required for queued or preparing children,
   because they do not have a session id yet.
@@ -976,7 +976,7 @@ imports a result file.
 
 `cleanup-worktrees` treats any worktree whose delegation is non-terminal as
 active and never offers it for cleanup. Project removal/deletion refuses while
-the project has active delegations; dux does not remove their worktrees.
+the project has active delegations; yvo does not remove their worktrees.
 
 Deleting an orchestrator session:
 
@@ -1001,7 +1001,7 @@ result itself does not currently include PR links.
 Same-repo integration is explicit:
 
 ```bash
-dux agent integrate --session <child-id> --json
+yvo agent integrate --session <child-id> --json
 ```
 
 The current implementation always targets the child's parent session.
@@ -1015,7 +1015,7 @@ Preconditions:
 - target agent is not running;
 - agent-initiated integration is disabled by default
   (`[orchestration] allow_agent_integration = false`). A human invocation has no
-  `DUX_SESSION_ID`/`source_session_id` and is treated as a user action.
+  `YVO_SESSION_ID`/`source_session_id` and is treated as a user action.
 
 Current strategy selection is automatic:
 
@@ -1026,7 +1026,7 @@ Current strategy selection is automatic:
 - There is no `--strategy`, `--into`, `--allow-incomplete`, `--allow-dirty`,
   `--include-uncommitted`, or `--force` yet.
 
-On conflict, dux aborts the operation, leaves the target clean, and returns the
+On conflict, yvo aborts the operation, leaves the target clean, and returns the
 error. After success it records `integrated_at` and `integration_commit`, logs
 the strategy, and keeps the child worktree. A second integration is reported as
 already integrated.
@@ -1153,7 +1153,7 @@ theme mapping in the same change.
 ### 10.6 Minimum UI for v1
 
 The backend and CLI can ship before the full UI, but an orchestrator that is
-only visible through `dux agent status` would be a poor day-to-day experience.
+only visible through `yvo agent status` would be a poor day-to-day experience.
 
 Implemented minimum:
 
@@ -1176,7 +1176,7 @@ Still needed for the full minimum UI:
 The diff pane, PR pane, macros, companion terminals, and existing theme
 structure need no new UI beyond consuming the frozen delegation base.
 
-The UI must remain a pure reader for delegation status. `dux agent wait` polling
+The UI must remain a pure reader for delegation status. `yvo agent wait` polling
 and the sidebar refresh read cached SQLite state; they do not run git on the
 UI thread.
 
@@ -1189,7 +1189,7 @@ Runtime state stays in SQLite.
 
 ```toml
 [agent_control]
-# Allow agents running inside dux to control dux through the local socket.
+# Allow agents running inside yvo to control yvo through the local socket.
 enabled = true
 
 # Allow --repo <path> to register an unregistered checkout as a project.
@@ -1233,7 +1233,7 @@ allow_parent_snapshot = true
 # Allow a parent agent to merge its children into its own worktree.
 allow_agent_integration = false
 
-# Default `dux agent wait` timeout. Keep this below the tool-call timeout of the
+# Default `yvo agent wait` timeout. Keep this below the tool-call timeout of the
 # agents you use; a timeout exits 2 and the caller polls again.
 wait_default_timeout_secs = 100
 
@@ -1246,7 +1246,7 @@ result_max_bytes = 262144
 ```
 
 The `[orchestration]` table and every field above are in the `ConfigEntry`
-registry, default config template, `dux config diff`, and config tests.
+registry, default config template, `yvo config diff`, and config tests.
 
 These proposed settings are not in the generated config yet:
 `agent_control.allowed_repo_roots`, `orchestration.max_concurrent_launches`,
@@ -1273,7 +1273,7 @@ These proposed settings are not in the generated config yet:
 - **Single writer.** Only the TUI mutates git worktrees, sessions, and SQLite.
   Agents and the CLI request work over the socket.
 - **Path validation.** Repo paths are canonicalized and rejected if they point
-  inside dux's data directory. A configurable `allowed_repo_roots` allowlist is
+  inside yvo's data directory. A configurable `allowed_repo_roots` allowlist is
   proposed but not implemented; today the boundary is
   `[agent_control] allow_unregistered_repos`.
 - **Brief/result privacy.** Delegation files are `0600` in a `0700` directory.
@@ -1295,8 +1295,8 @@ These proposed settings are not in the generated config yet:
 | Startup command fails | Keep the agent; mark `running` with a startup warning. |
 | Child PTY exits without `finish` | Delegation `exited`; parent wait returns; outcome is unknown. |
 | Child PTY exits after `finish` | Leave the terminal delegation state alone; a clean exit after reporting is normal for some providers. |
-| Dux restarts while child runs | On startup, live sessions become `interrupted`; delegation waits return `interrupted` until reattached. Auto-reopen can return it to `running`. |
-| Dux restarts after result file write but before callback | `result.json` is imported on startup. |
+| Yvo restarts while child runs | On startup, live sessions become `interrupted`; delegation waits return `interrupted` until reattached. Auto-reopen can return it to `running`. |
+| Yvo restarts after result file write but before callback | `result.json` is imported on startup. |
 | Socket unavailable during `finish` | File remains; command warns; the next status/result/wait/followup/integrate request imports it, or the next startup does. |
 | Duplicate or late `finish` | Same `result_id` is an idempotent success; a newer result for the same iteration supersedes the old one; a result for a cancelled delegation is archived but does not change state. |
 | `finish` arrives while `resuming` | Planned quiet-period queue behavior: archive the result but keep `resuming`. Not reachable in the current immediate-delivery implementation. |
@@ -1328,7 +1328,7 @@ On startup, reconcile every non-terminal delegation:
 - `running` with a live restored session → stays `running` if auto-reopen
   succeeded, otherwise `interrupted`. Reconciliation waits for the bounded
   auto-reopen attempt to settle, so a parent wait does not observe a transient
-  `interrupted` while dux is still restoring the child.
+  `interrupted` while yvo is still restoring the child.
 - `resuming` after a restart → restore the previous terminal state with
   `followup_interrupted`, keep the text in `inbox.md`, and let the parent retry.
   The in-memory delivery job does not survive a restart.
@@ -1346,10 +1346,10 @@ On startup, reconcile every non-terminal delegation:
   completion contract, the delegation ends as `exited`, not `completed`. That is
   an honest unknown, not a silent success. A provider that cannot run shell
   commands (for example a pure chat CLI) cannot call `finish` and therefore
-  cannot participate in turn-taking; it can still run as a normal dux agent.
+  cannot participate in turn-taking; it can still run as a normal yvo agent.
 - **Follow-ups need a live PTY.** If a provider exits after `finish`, follow-up
   returns `not_running`. The user can reconnect/resume the agent, then retry.
-  Dux does not silently relaunch a provider in the middle of a task.
+  Yvo does not silently relaunch a provider in the middle of a task.
 - **Follow-up delivery is immediate.** The planned quiet-period queue is not
   implemented. A follow-up can land while the child is still printing its final
   response or running a tool. `message` has the same limitation, though it
@@ -1360,9 +1360,9 @@ On startup, reconcile every non-terminal delegation:
 - **PTY cancellation is on the UI thread.** Dropping a `PtyClient` joins its
   reader thread and can briefly stall the TUI.
 - **Legacy split-out sessions are not delegations.** Groups created before this
-  migration still render in the sidebar and in `dux agent related`, but
+  migration still render in the sidebar and in `yvo agent related`, but
   `status`, `wait`, `result`, and `finish` do not synthesize rows for them.
-- **Results do not include git-derived facts.** `dux agent result` returns the
+- **Results do not include git-derived facts.** `yvo agent result` returns the
   child's reported payload and file path, not commits, changed files, diff
   stats, or PR links.
 - **No dirty-parent warning.** `parent-head` and `sibling-head` silently exclude
@@ -1371,8 +1371,8 @@ On startup, reconcile every non-terminal delegation:
   worktree and refuses dirty or running parents. There is no `--allow-dirty`,
   strategy selection, overlap warning, or temporary integration worktree.
 - **Integration is not atomic across children.** Later merges can conflict with
-  earlier ones; dux does not make the set conflict-free.
-- **Cross-repo work cannot be merged by dux.** It lands through commits and PRs.
+  earlier ones; yvo does not make the set conflict-free.
+- **Cross-repo work cannot be merged by yvo.** It lands through commits and PRs.
 - **Result import is lazy.** It runs at startup or when status/result/wait/
   followup/integrate is called. If a callback is lost and nobody polls, the TUI
   does not update until the next request or restart.
@@ -1394,7 +1394,7 @@ On startup, reconcile every non-terminal delegation:
 - **Snapshot excludes ignored files.** Local `.env`, dependency caches, and
   generated artifacts are not copied. Startup commands should recreate what a
   checkout needs.
-- **A parent agent's tool timeout is outside dux's control.** This is why `wait`
+- **A parent agent's tool timeout is outside yvo's control.** This is why `wait`
   defaults to a short timeout and must be repeated on exit code 2.
 
 ---
@@ -1411,12 +1411,12 @@ On startup, reconcile every non-terminal delegation:
   `SplitOutParams` field so an older CLI still parses against a new TUI. Keep
   `CONTROL_PROTOCOL = 1`; old clients talking to a new TUI keep working, and a
   new client talking to an old TUI receives `invalid_request` for unknown
-  commands. `DUX_BIN` normally keeps both sides in lockstep.
+  commands. `YVO_BIN` normally keeps both sides in lockstep.
 - Sessions have no new columns. A legacy session with no delegation keeps the
   current project-leading diff fallback; delegated sessions resolve their frozen
   base through the delegation row.
 - Legacy split-out sessions have no `agent_delegations` row. The sidebar tree
-  and `dux agent related` still show them, but `dux agent status`, `wait`,
+  and `yvo agent related` still show them, but `yvo agent status`, `wait`,
   `result`, and `finish` do not synthesize delegation rows for them.
 - Editable `agent_groups.mission` text is not implemented in this pass.
 - All schema changes use the existing `ensure_column` migration pattern and are
@@ -1446,11 +1446,11 @@ remain the target plan, including deferred polish.
 - Freeze the base SHA and make `diff_base_ref_for_session` and base-relative UI
   prefer it.
 - Add `--base-mode parent-head` and same-repo targeting.
-- Add `dux agent status`, `result`, and `finish`. Keep `status` a pure SQLite
+- Add `yvo agent status`, `result`, and `finish`. Keep `status` a pure SQLite
   read. Git-derived result facts are a later enhancement, not part of this pass.
 - Add durable `brief.md` / `result.json` files, idempotent result import, and
   `result_id`-based deduplication.
-- Add `dux agent wait` with the 100 s default and chunked polling semantics.
+- Add `yvo agent wait` with the 100 s default and chunked polling semantics.
 - Add one reconciliation function that maps `SessionStatus` events to
   delegation state.
 
@@ -1459,7 +1459,7 @@ remain the target plan, including deferred polish.
 - Replace global in-flight booleans with the create queue and per-repo locks.
 - Make `delegate` return after queue acceptance; keep `split-out` waiting for
   launch for compatibility.
-- Add policy limits, idempotency keys, deduplicated retries, `dux agent retry`,
+- Add policy limits, idempotency keys, deduplicated retries, `yvo agent retry`,
   and `--delegation` targets for queued children.
 - Add `--until started`, `--any`, `--all`, `--allow-empty`, and exit code `4`
   for `blocked`.
@@ -1496,8 +1496,8 @@ remain the target plan, including deferred polish.
 
 ### Phase 5 — Product polish
 
-- Add `skills/dux-orchestrate/SKILL.md` and update
-  `skills/dux-split-out/SKILL.md` for the completion contract.
+- Add `skills/yvo-orchestrate/SKILL.md` and update
+  `skills/yvo-split-out/SKILL.md` for the completion contract.
 - Update `README.md`, `docs/user-guide.md`, and config documentation.
 - Extend `demo/multi-repo` with an orchestrator tree that fans out to two
   repositories and one same-repo child.
@@ -1564,7 +1564,7 @@ deferred features are planned coverage, not existing tests.
 
 ### Integration tests
 
-- Fake provider that reads `DUX_BRIEF_FILE`, calls `dux agent finish`, and can
+- Fake provider that reads `YVO_BRIEF_FILE`, calls `yvo agent finish`, and can
   optionally delegate a grandchild.
 - Two-repo end-to-end: orchestrator fans out with `--no-wait`, polls with a short
   `wait`, reads results, sends a blocked follow-up, and reports PRs.
@@ -1593,7 +1593,7 @@ than running the TUI automatically.
 
 | Alternative | Why rejected |
 | --- | --- |
-| Provider-native subagents only | Not provider-neutral, no cross-repo worktree isolation, no shared dux state. |
+| Provider-native subagents only | Not provider-neutral, no cross-repo worktree isolation, no shared yvo state. |
 | One shared worktree for all children | Parallel writes conflict, diffs mix together, no isolation. |
 | Children write directly to SQLite/config | Breaks the single-writer model and races with the TUI. |
 | Full agent-to-agent RPC/MCP | Violates the no-protocol-layer tenet and adds adapter maintenance. |
@@ -1634,7 +1634,7 @@ Mission: ship gift-card support across billing and storefront.
 
 # 1. Same-repo child from the orchestrator's committed state.
 # `delegate` returns after queueing, so this is fast even with startup commands.
-dux agent delegate \
+yvo agent delegate \
   --same-repo \
   --title "Add gift-card ledger entries" \
   --name gift-card-ledger \
@@ -1648,7 +1648,7 @@ Do not touch checkout-api. Report the exact ledger API shape when done.
 BRIEF
 
 # 2. Cross-repo child in storefront from its leading branch.
-dux agent delegate \
+yvo agent delegate \
   --project storefront \
   --title "Add gift-card checkout button" \
   --name gift-card-button \
@@ -1656,25 +1656,25 @@ dux agent delegate \
   --brief-file storefront-brief.md --json
 
 # 3. Fan in. Keep the call under your provider's tool timeout. Exit code 2 means
-# "still running"; run the same wait again. Dux is not blocked while it waits.
-dux agent wait --all --timeout 100 --json
+# "still running"; run the same wait again. Yvo is not blocked while it waits.
+yvo agent wait --all --timeout 100 --json
 
 # 4. Read each result and inspect diffs in the UI. Use the delegation id until
 # a child has a session id.
-dux agent result --delegation <ledger-delegation-id> --json
-dux agent result --delegation <button-delegation-id> --json
+yvo agent result --delegation <ledger-delegation-id> --json
+yvo agent result --delegation <button-delegation-id> --json
 
 # 5. If storefront is blocked on the ledger API shape, answer it.
-dux agent followup --session <button-id> --text-file - <<'ANSWER'
+yvo agent followup --session <button-id> --text-file - <<'ANSWER'
 The ledger API is POST /ledger/entries with {gift_card_id, amount}.
 Continue and report the PR.
 ANSWER
 
 # 6. Integrate the same-repo child after review. The current command always
 # targets the parent and picks merge or patch from the base mode.
-dux agent integrate --session <ledger-id> --json
+yvo agent integrate --session <ledger-id> --json
 
-# 7. Cross-repo child opens a PR; dux tracks it and the parent reports the link.
+# 7. Cross-repo child opens a PR; yvo tracks it and the parent reports the link.
 ```
 
 ## Appendix B — Generated brief preamble
@@ -1682,13 +1682,13 @@ dux agent integrate --session <ledger-id> --json
 ````markdown
 # Delegated task
 
-You are a delegated worker in a dux mission. You have your own git worktree and
+You are a delegated worker in a yvo mission. You have your own git worktree and
 branch. Work only in your worktree.
 
 - Mission: Gift-card launch
 - Parent agent: checkout-orchestrator (branch: gift-cards)
 - Your branch: gift-card-ledger
-- Your worktree: /home/you/.config/dux/worktrees/billing-service/gift-card-ledger
+- Your worktree: /home/you/.config/yvo/worktrees/billing-service/gift-card-ledger
 - Base: parent HEAD @ 91be002
 - Depth: 1 of 3
 
@@ -1708,10 +1708,10 @@ branch. Work only in your worktree.
 When the task is done, run:
 
 ```bash
-"$DUX_BIN" agent finish --status success --summary-file - <<'DUX'
+"$YVO_BIN" agent finish --status success --summary-file - <<'YVO'
 One or two paragraphs: what changed, how it was verified, and anything the
 parent must know before integrating.
-DUX
+YVO
 ```
 
 If you need input, use `--status blocked` and put the question in the summary.
@@ -1722,5 +1722,5 @@ The typed initial prompt points at this file and repeats the finish command in a
 single line:
 
 ```text
-You are a delegated dux agent. Read the task brief at $DUX_BRIEF_FILE and complete it. When done, run "$DUX_BIN" agent finish --status success --summary-file - and pass your summary on stdin. If you need a decision, use --status blocked.
+You are a delegated yvo agent. Read the task brief at $YVO_BRIEF_FILE and complete it. When done, run "$YVO_BIN" agent finish --status success --summary-file - and pass your summary on stdin. If you need a decision, use --status blocked.
 ```

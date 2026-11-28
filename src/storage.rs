@@ -1694,8 +1694,8 @@ mod tests {
         let store = test_store();
         let project = ProjectConfig {
             id: "project-1".to_string(),
-            path: "$CODE/dux".to_string(),
-            name: Some("dux".to_string()),
+            path: "$CODE/yvo".to_string(),
+            name: Some("yvo".to_string()),
             default_provider: Some("codex".to_string()),
             leading_branch: Some("main".to_string()),
             auto_reopen_agents: Some(false),

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Deterministic stand-in for an AI coding CLI, used only by the screenshot demo.
-# The origin agent prints a plausible transcript and asks the running dux
+# The origin agent prints a plausible transcript and asks the running yvo
 # instance to split work into two related repositories.
 set -u
 
 stty -echo 2>/dev/null || true
 trap 'stty echo 2>/dev/null || true' EXIT
 
-DEMO_ROOT=${DUX_DEMO_ROOT:?DUX_DEMO_ROOT is not set}
-FIXTURES=${DUX_DEMO_FIXTURES:?DUX_DEMO_FIXTURES is not set}
+DEMO_ROOT=${YVO_DEMO_ROOT:?YVO_DEMO_ROOT is not set}
+FIXTURES=${YVO_DEMO_FIXTURES:?YVO_DEMO_FIXTURES is not set}
 
 RESET=$'\033[0m'
 DIM=$'\033[38;5;244m'
@@ -25,7 +25,7 @@ pause() { sleep "${1:-0.25}"; }
 repo_url=$(git config --get remote.origin.url 2>/dev/null || true)
 repo=${repo_url##*/}
 repo=${repo%.git}
-branch=${DUX_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}
+branch=${YVO_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}
 
 case "$repo" in
   storefront) role=origin ;;
@@ -70,8 +70,8 @@ if [ "$role" = origin ]; then
     local target_repo=$1
     local target_name=$2
     local prompt=$3
-    line "${YELLOW}●${RESET} ${BOLD}dux split-out${RESET}  ${TEXT}${target_repo}${RESET} / ${target_name}"
-    if "${DUX_BIN:-dux}" agent split-out \
+    line "${YELLOW}●${RESET} ${BOLD}yvo split-out${RESET}  ${TEXT}${target_repo}${RESET} / ${target_name}"
+    if "${YVO_BIN:-yvo}" agent split-out \
       --repo "$DEMO_ROOT/repos/$target_repo" \
       --name "$target_name" \
       --prompt "$prompt" \
@@ -83,7 +83,7 @@ if [ "$role" = origin ]; then
     pause 0.7
   }
 
-  if "${DUX_BIN:-dux}" agent related --json 2>/dev/null | grep -q 'add-gift-card-api'; then
+  if "${YVO_BIN:-yvo}" agent related --json 2>/dev/null | grep -q 'add-gift-card-api'; then
     line "${GREEN}●${RESET} Related agents are already linked under Multi-repo work."
     line "  ${DIM}Skipping split-out so the existing worktrees and PRs are reused.${RESET}"
     pause 0.5

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::config::{self, Config, DuxPaths};
+use crate::config::{self, Config, YvoPaths};
 use crate::git;
 use crate::keybindings::RuntimeBindings;
 use crate::logger;
@@ -17,7 +17,7 @@ use crate::storage::SessionStore;
 // CLI dispatch
 // ---------------------------------------------------------------------------
 
-pub fn run(args: &[String], paths: &DuxPaths) -> Result<()> {
+pub fn run(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_config_help();
         return Ok(());
@@ -39,6 +39,11 @@ pub fn run(args: &[String], paths: &DuxPaths) -> Result<()> {
             reject_unknown_flags(&args[1..], &["--yes"])?;
             run_regenerate(paths, yes)
         }
+        "migrate" => {
+            let yes = args[1..].iter().any(|a| a == "--yes");
+            reject_unknown_flags(&args[1..], &["--yes"])?;
+            run_migrate(paths, yes)
+        }
         "path" => {
             println!("{}", paths.config_path.display());
             Ok(())
@@ -47,7 +52,7 @@ pub fn run(args: &[String], paths: &DuxPaths) -> Result<()> {
             print_config_help();
             Ok(())
         }
-        other => bail!("unknown config subcommand: {other}\nRun `dux config --help` for usage."),
+        other => bail!("unknown config subcommand: {other}\nRun `yvo config --help` for usage."),
     }
 }
 
@@ -63,25 +68,27 @@ fn reject_unknown_flags(args: &[String], known: &[&str]) -> Result<()> {
 fn print_config_help() {
     println!(
         "\
-dux config — manage the dux configuration file
+yvo config — manage the yvo configuration file
 
 Subcommands:
-  dux config path          Print the config file path
-  dux config diff          Show settings that differ from defaults (summary)
-  dux config diff --raw    Show a unified diff against the default config
-  dux config reset         Remove config and logs (keeps agents and worktrees)
-  dux config reset --all   Full factory reset: remove config, logs, sessions, worktrees, and scratch workspaces
-  dux config regenerate    Preview a fresh default config (shows diff)
-  dux config regenerate --yes
-                           Overwrite the config file with fresh defaults"
+  yvo config path          Print the config file path
+  yvo config diff          Show settings that differ from defaults (summary)
+  yvo config diff --raw    Show a unified diff against the default config
+  yvo config reset         Remove config and logs (keeps agents and worktrees)
+  yvo config reset --all   Full factory reset: remove config, logs, sessions, worktrees, and scratch workspaces
+  yvo config regenerate    Preview a fresh default config (shows diff)
+  yvo config regenerate --yes
+                           Overwrite the config file with fresh defaults
+  yvo config migrate       Preview moving legacy dux data into yvo
+  yvo config migrate --yes Apply the move and rewrite stored paths"
     );
 }
 
 // ---------------------------------------------------------------------------
-// dux config reset
+// yvo config reset
 // ---------------------------------------------------------------------------
 
-fn run_reset(paths: &DuxPaths, all: bool) -> Result<()> {
+fn run_reset(paths: &YvoPaths, all: bool) -> Result<()> {
     if !paths.root.exists() {
         println!("nothing to reset: {} does not exist", paths.root.display());
         return Ok(());
@@ -99,7 +106,7 @@ fn run_reset(paths: &DuxPaths, all: bool) -> Result<()> {
     remove_file_with_message(&paths.config_path)?;
     prune_empty_ancestors(&paths.config_path, &paths.root)?;
 
-    // The lockfile (`dux.lock`) is intentionally left in place. Unlinking
+    // The lockfile (`yvo.lock`) is intentionally left in place. Unlinking
     // it while holding the flock would orphan the inode: a new process
     // could create a fresh file at the same path (different inode) and
     // successfully flock it, breaking the single-instance guarantee. The
@@ -113,10 +120,10 @@ fn run_reset(paths: &DuxPaths, all: bool) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// dux config diff
+// yvo config diff
 // ---------------------------------------------------------------------------
 
-fn run_diff(paths: &DuxPaths, raw: bool) -> Result<()> {
+fn run_diff(paths: &YvoPaths, raw: bool) -> Result<()> {
     if !paths.config_path.exists() {
         println!("no config file found at {}", paths.config_path.display());
         return Ok(());
@@ -478,10 +485,10 @@ fn run_diff_summary(current: &Config) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// dux config regenerate
+// yvo config regenerate
 // ---------------------------------------------------------------------------
 
-fn run_regenerate(paths: &DuxPaths, yes: bool) -> Result<()> {
+fn run_regenerate(paths: &YvoPaths, yes: bool) -> Result<()> {
     let fresh = config::render_default_config();
 
     if !yes {
@@ -493,7 +500,7 @@ fn run_regenerate(paths: &DuxPaths, yes: bool) -> Result<()> {
                 return Ok(());
             }
             print_unified_diff("current", "default", &current, &fresh);
-            println!("\nRun `dux config regenerate --yes` to overwrite with these defaults.");
+            println!("\nRun `yvo config regenerate --yes` to overwrite with these defaults.");
         } else {
             println!("no config file exists; regenerate --yes will create one at:");
             println!("  {}", paths.config_path.display());
@@ -504,6 +511,63 @@ fn run_regenerate(paths: &DuxPaths, yes: bool) -> Result<()> {
     paths.ensure_dirs()?;
     fs::write(&paths.config_path, fresh).with_context_path(&paths.config_path)?;
     println!("config regenerated at {}", paths.config_path.display());
+    Ok(())
+}
+
+fn run_migrate(paths: &YvoPaths, yes: bool) -> Result<()> {
+    let Some(plan) = crate::migrate::plan(paths)? else {
+        println!("No legacy dux data found. Nothing to migrate.");
+        return Ok(());
+    };
+
+    if !yes {
+        println!("Legacy dux data found at {}", plan.old_root.display());
+        println!("It will be moved to {}", plan.new_root.display());
+        println!();
+        println!("The migration will:");
+        println!(
+            "  - move config.toml, sessions.sqlite3, worktrees/, and scratch/ into the yvo directory"
+        );
+        println!("  - rename dux.log, dux.lock, and dux.sock to their yvo names");
+        println!("  - rewrite stored project and worktree paths in sessions.sqlite3");
+        println!("  - update the theme and logging.path settings in config.toml");
+        println!("  - run `git worktree repair` for affected repositories");
+        println!();
+        println!("Close all dux agents first, then run `yvo config migrate --yes`.");
+        return Ok(());
+    }
+
+    let new_root = plan.new_root.clone();
+    let summary = crate::migrate::execute(plan)?;
+    println!("Moved legacy data to {}", new_root.display());
+    println!(
+        "Rewrote {} session path(s), {} delegation path(s), {} project path(s), and {} scratch row(s).",
+        summary.session_paths,
+        summary.delegation_paths,
+        summary.project_paths,
+        summary.scratch_rows
+    );
+    if summary.config_updated {
+        println!("Updated config.toml settings and comments.");
+    }
+    if summary.worktrees_repaired > 0 {
+        println!(
+            "Repaired {} git worktree link(s).",
+            summary.worktrees_repaired
+        );
+    }
+    for warning in &summary.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    println!();
+    println!("Next steps:");
+    println!("  1. Reinstall the binary as `yvo` so it resolves on PATH.");
+    println!(
+        "  2. Re-copy skills/yvo-orchestrate and skills/yvo-split-out into your agent skill directory."
+    );
+    println!(
+        "  3. Update scripts that use DUX_BIN, DUX_SESSION_ID, or other DUX_* variables to YVO_*."
+    );
     Ok(())
 }
 
@@ -639,7 +703,7 @@ fn print_unified_diff(label_a: &str, label_b: &str, a: &str, b: &str) {
 // Agent data reset
 // ---------------------------------------------------------------------------
 
-fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
+fn reset_agent_data(paths: &YvoPaths) -> Result<()> {
     if paths.sessions_db_path.exists() {
         match SessionStore::open(&paths.sessions_db_path) {
             Ok(store) => match store.load_sessions() {
@@ -665,7 +729,7 @@ fn reset_agent_data(paths: &DuxPaths) -> Result<()> {
     Ok(())
 }
 
-fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSession) {
+fn remove_session_worktree(paths: &YvoPaths, session: &crate::model::AgentSession) {
     // Scratch workspaces are removed wholesale with the scratch root below;
     // they have no git worktree or branch to detach first.
     if session.is_scratch() {
@@ -702,10 +766,10 @@ fn remove_session_worktree(paths: &DuxPaths, session: &crate::model::AgentSessio
 }
 
 // ---------------------------------------------------------------------------
-// dux agent
+// yvo agent
 // ---------------------------------------------------------------------------
 
-pub fn run_agent(args: &[String], paths: &DuxPaths) -> Result<()> {
+pub fn run_agent(args: &[String], paths: &YvoPaths) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     let wants_json = args.iter().any(|arg| arg == "--json");
     let result = match sub {
@@ -726,7 +790,7 @@ pub fn run_agent(args: &[String], paths: &DuxPaths) -> Result<()> {
             print_agent_help();
             Ok(())
         }
-        other => bail!("unknown agent subcommand: {other}\nRun `dux agent --help` for usage."),
+        other => bail!("unknown agent subcommand: {other}\nRun `yvo agent --help` for usage."),
     };
     match result {
         Ok(()) => Ok(()),
@@ -744,26 +808,26 @@ pub fn run_agent(args: &[String], paths: &DuxPaths) -> Result<()> {
 fn print_agent_help() {
     println!(
         "\
-dux agent — work with agents from the command line
+yvo agent — work with agents from the command line
 
 Subcommands:
-  dux agent delegate      Create a delegated worktree/agent in this or another repo
-  dux agent split-out     Legacy alias for delegate (waits for launch by default)
-  dux agent status        Show the delegation tree for an agent
-  dux agent tree          Human-readable delegation tree
-  dux agent result        Read a delegation result
-  dux agent wait          Wait for delegations to reach a terminal state
-  dux agent finish        Report a delegated child's result
-  dux agent followup      Send another iteration to a completed/blocked child
-  dux agent message       Best-effort message to a running child
-  dux agent cancel        Cancel a delegation or subtree (worktrees are kept)
-  dux agent retry         Retry a failed delegation launch
-  dux agent integrate     Merge a completed same-repo child into its parent
-  dux agent related       List agents related to the current or selected agent
+  yvo agent delegate      Create a delegated worktree/agent in this or another repo
+  yvo agent split-out     Legacy alias for delegate (waits for launch by default)
+  yvo agent status        Show the delegation tree for an agent
+  yvo agent tree          Human-readable delegation tree
+  yvo agent result        Read a delegation result
+  yvo agent wait          Wait for delegations to reach a terminal state
+  yvo agent finish        Report a delegated child's result
+  yvo agent followup      Send another iteration to a completed/blocked child
+  yvo agent message       Best-effort message to a running child
+  yvo agent cancel        Cancel a delegation or subtree (worktrees are kept)
+  yvo agent retry         Retry a failed delegation launch
+  yvo agent integrate     Merge a completed same-repo child into its parent
+  yvo agent related       List agents related to the current or selected agent
 
 delegate options:
   --repo <path>           Target git checkout (may be auto-registered as a project)
-  --project <id|name>     Target project already registered in dux
+  --project <id|name>     Target project already registered in yvo
   --same-repo             Target the source session's project
   --name <branch>         Branch and worktree name (generated when omitted)
   --title <text>          Human-readable delegation title
@@ -776,14 +840,14 @@ delegate options:
   --prompt <text>         Alias for --brief
   --prompt-file <path|->  Alias for --brief-file
   --request-key <key>     Idempotency key (defaults to the branch name)
-  --source <session-id>   Source session (defaults to DUX_SESSION_ID)
+  --source <session-id>   Source session (defaults to YVO_SESSION_ID)
   --wait-for-launch       Block until the child PTY is running or has failed
   --no-wait               Return after queueing (default for delegate)
-  --timeout <seconds>     How long to wait for dux (default 120)
+  --timeout <seconds>     How long to wait for yvo (default 120)
   --json                  Print the machine-readable JSON response
 
 wait options:
-  --session <id>          Session to inspect (defaults to DUX_SESSION_ID)
+  --session <id>          Session to inspect (defaults to YVO_SESSION_ID)
   --delegation <id>       Delegation to inspect
   --all | --any           Wait for all / any current descendants
   --until started         Return when children are running or terminal
@@ -797,7 +861,7 @@ result options:
   --json                  Print the machine-readable JSON response
 
 finish options:
-  --session <id>          Delegated session (defaults to DUX_SESSION_ID)
+  --session <id>          Delegated session (defaults to YVO_SESSION_ID)
   --status success|failed|blocked
   --summary <text> | --summary-file <path|->
   --result-id <id>        Override the generated result id
@@ -811,13 +875,13 @@ cancel options:
   --json                  Print the machine-readable JSON response
 
 Environment:
-  DUX_BIN                 Path to the dux binary that launched the agent
-  DUX_SESSION_ID          Current agent session id
-  DUX_SOCKET              Override the control socket path"
+  YVO_BIN                 Path to the yvo binary that launched the agent
+  YVO_SESSION_ID          Current agent session id
+  YVO_SOCKET              Override the control socket path"
     );
 }
 
-fn run_agent_delegate(args: &[String], paths: &DuxPaths, legacy_split_out: bool) -> Result<()> {
+fn run_agent_delegate(args: &[String], paths: &YvoPaths, legacy_split_out: bool) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -907,12 +971,12 @@ fn run_agent_delegate(args: &[String], paths: &DuxPaths, legacy_split_out: bool)
         bail!("delegate requires a non-empty --brief or --brief-file.");
     }
     if source_session_id.is_none() {
-        source_session_id = std::env::var("DUX_SESSION_ID")
+        source_session_id = std::env::var("YVO_SESSION_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
     }
     if source_session_id.is_none() {
-        bail!("delegate must run inside a dux agent, or be given --source <session-id>.");
+        bail!("delegate must run inside a yvo agent, or be given --source <session-id>.");
     }
     let repo = repo.map(|raw| {
         if let Some(expanded) = crate::config::expand_path(&raw) {
@@ -1002,7 +1066,7 @@ fn read_brief_file(path: &str, limit: usize) -> Result<String> {
     Ok(text)
 }
 
-fn stage_brief(paths: &DuxPaths, text: &str) -> Result<String> {
+fn stage_brief(paths: &YvoPaths, text: &str) -> Result<String> {
     let dir = paths.root.join("delegations").join("pending");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
@@ -1013,7 +1077,7 @@ fn stage_brief(paths: &DuxPaths, text: &str) -> Result<String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_related(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1039,12 +1103,12 @@ fn run_agent_related(args: &[String], paths: &DuxPaths) -> Result<()> {
         index += 1;
     }
     if source_session_id.is_none() {
-        source_session_id = std::env::var("DUX_SESSION_ID")
+        source_session_id = std::env::var("YVO_SESSION_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
     }
     if source_session_id.is_none() {
-        bail!("related needs a session id, either from DUX_SESSION_ID or --session <session-id>.");
+        bail!("related needs a session id, either from YVO_SESSION_ID or --session <session-id>.");
     }
     let request = crate::ipc::ControlRequest::related(source_session_id);
     send_and_print_request(paths, request, json)
@@ -1080,14 +1144,14 @@ fn parse_delegation_target_args(args: &[String]) -> Result<DelegationTargetArgs>
         index += 1;
     }
     if parsed.source_session_id.is_none() {
-        parsed.source_session_id = std::env::var("DUX_SESSION_ID")
+        parsed.source_session_id = std::env::var("YVO_SESSION_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
     }
     Ok(parsed)
 }
 
-fn run_agent_status(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_status(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1101,7 +1165,7 @@ fn run_agent_status(args: &[String], paths: &DuxPaths) -> Result<()> {
     send_and_print_request(paths, request, parsed.json)
 }
 
-fn run_agent_tree(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_tree(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1125,7 +1189,7 @@ fn run_agent_tree(args: &[String], paths: &DuxPaths) -> Result<()> {
     Ok(())
 }
 
-fn run_agent_result(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_result(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1179,7 +1243,7 @@ enum WaitMode {
     UntilStarted,
 }
 
-fn run_agent_wait(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_wait(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1233,7 +1297,7 @@ fn run_agent_wait(args: &[String], paths: &DuxPaths) -> Result<()> {
         bail!("use either --all or --any, not both.");
     }
     if parsed.source_session_id.is_none() {
-        parsed.source_session_id = std::env::var("DUX_SESSION_ID")
+        parsed.source_session_id = std::env::var("YVO_SESSION_ID")
             .ok()
             .filter(|value| !value.trim().is_empty());
     }
@@ -1241,7 +1305,7 @@ fn run_agent_wait(args: &[String], paths: &DuxPaths) -> Result<()> {
         && parsed.session_id.is_none()
         && parsed.delegation_id.is_none()
     {
-        bail!("wait needs --session, --delegation, or a dux agent environment.");
+        bail!("wait needs --session, --delegation, or a yvo agent environment.");
     }
     let mode = if until_started {
         WaitMode::UntilStarted
@@ -1384,13 +1448,13 @@ fn wait_exit_code(response: &crate::ipc::ControlResponse, mode: WaitMode) -> i32
     0
 }
 
-fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_finish(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
     }
     let mut session_id = None;
-    let mut delegation_id = std::env::var("DUX_DELEGATION_ID")
+    let mut delegation_id = std::env::var("YVO_DELEGATION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let mut status = None;
@@ -1435,7 +1499,7 @@ fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
         bail!("--status must be success, failed, or blocked.");
     }
     let summary = summary.unwrap_or_else(|| format!("Delegation finished with status {status}."));
-    let source_session_id = std::env::var("DUX_SESSION_ID")
+    let source_session_id = std::env::var("YVO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let result = crate::model::DelegationResult {
@@ -1449,7 +1513,7 @@ fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
         artifacts: Vec::new(),
         reported_at: Some(Utc::now()),
     };
-    let result_path = std::env::var("DUX_RESULT_FILE")
+    let result_path = std::env::var("YVO_RESULT_FILE")
         .ok()
         .filter(|value| !value.trim().is_empty());
     if let Some(path) = result_path.as_deref() {
@@ -1485,16 +1549,16 @@ fn run_agent_finish(args: &[String], paths: &DuxPaths) -> Result<()> {
     send_and_print_request(paths, request, json)
 }
 
-fn run_agent_followup(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_followup(args: &[String], paths: &YvoPaths) -> Result<()> {
     run_agent_followup_inner(args, paths, false)
 }
 
-fn run_agent_followup_inner(args: &[String], paths: &DuxPaths, message_only: bool) -> Result<()> {
+fn run_agent_followup_inner(args: &[String], paths: &YvoPaths, message_only: bool) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
     }
-    let mut source_session_id = std::env::var("DUX_SESSION_ID")
+    let mut source_session_id = std::env::var("YVO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let mut session_id = None;
@@ -1552,16 +1616,16 @@ fn run_agent_followup_inner(args: &[String], paths: &DuxPaths, message_only: boo
     send_and_print_request(paths, request, json)
 }
 
-fn run_agent_message(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_message(args: &[String], paths: &YvoPaths) -> Result<()> {
     run_agent_followup_inner(args, paths, true)
 }
 
-fn run_agent_cancel(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_cancel(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
     }
-    let mut source_session_id = std::env::var("DUX_SESSION_ID")
+    let mut source_session_id = std::env::var("YVO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
     let mut session_id = None;
@@ -1597,7 +1661,7 @@ fn run_agent_cancel(args: &[String], paths: &DuxPaths) -> Result<()> {
     send_and_print_request(paths, request, json)
 }
 
-fn run_agent_retry(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_retry(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1630,7 +1694,7 @@ fn run_agent_retry(args: &[String], paths: &DuxPaths) -> Result<()> {
     )
 }
 
-fn run_agent_integrate(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_agent_integrate(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_agent_help();
         return Ok(());
@@ -1656,12 +1720,12 @@ fn run_agent_integrate(args: &[String], paths: &DuxPaths) -> Result<()> {
     }
     let session_id = session_id
         .or_else(|| {
-            std::env::var("DUX_SESSION_ID")
+            std::env::var("YVO_SESSION_ID")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
         .ok_or_else(|| anyhow!("integrate requires --session <id>."))?;
-    let source_session_id = std::env::var("DUX_SESSION_ID")
+    let source_session_id = std::env::var("YVO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
     send_and_print_request(
@@ -1705,10 +1769,10 @@ fn print_delegation_tree(response: &crate::ipc::ControlResponse) {
 }
 
 // ---------------------------------------------------------------------------
-// dux pr
+// yvo pr
 // ---------------------------------------------------------------------------
 
-pub fn run_pr(args: &[String], paths: &DuxPaths) -> Result<()> {
+pub fn run_pr(args: &[String], paths: &YvoPaths) -> Result<()> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     let wants_json = args.iter().any(|arg| arg == "--json");
     let result = match sub {
@@ -1718,7 +1782,7 @@ pub fn run_pr(args: &[String], paths: &DuxPaths) -> Result<()> {
             print_pr_help();
             Ok(())
         }
-        other => bail!("unknown pr subcommand: {other}\nRun `dux pr --help` for usage."),
+        other => bail!("unknown pr subcommand: {other}\nRun `yvo pr --help` for usage."),
     };
     match result {
         Ok(()) => Ok(()),
@@ -1736,35 +1800,35 @@ pub fn run_pr(args: &[String], paths: &DuxPaths) -> Result<()> {
 fn print_pr_help() {
     println!(
         "\
-dux pr — inspect and link pull requests for an agent
+yvo pr — inspect and link pull requests for an agent
 
 Subcommands:
-  dux pr list             List pull requests for an agent
-  dux pr link <pr>        Associate a PR with an agent worktree
+  yvo pr list             List pull requests for an agent
+  yvo pr link <pr>        Associate a PR with an agent worktree
 
 list options:
-  --session <session-id>  Session to inspect (defaults to DUX_SESSION_ID)
+  --session <session-id>  Session to inspect (defaults to YVO_SESSION_ID)
   --json                  Print the machine-readable JSON response
 
 link options:
-  --session <session-id>  Session to link (defaults to DUX_SESSION_ID)
+  --session <session-id>  Session to link (defaults to YVO_SESSION_ID)
   --json                  Print the machine-readable JSON response
 
 <pr> accepts a PR number, #number, or GitHub PR URL.
 
 Environment:
-  DUX_SESSION_ID          Current agent session id
-  DUX_SOCKET              Override the control socket path"
+  YVO_SESSION_ID          Current agent session id
+  YVO_SOCKET              Override the control socket path"
     );
 }
 
 fn default_pr_session() -> Option<String> {
-    std::env::var("DUX_SESSION_ID")
+    std::env::var("YVO_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
 
-fn run_pr_list(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_pr_list(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_pr_help();
         return Ok(());
@@ -1789,7 +1853,7 @@ fn run_pr_list(args: &[String], paths: &DuxPaths) -> Result<()> {
         index += 1;
     }
     let session_id = session_id.or_else(default_pr_session).ok_or_else(|| {
-        anyhow!("pr list needs a session id, either from DUX_SESSION_ID or --session <session-id>.")
+        anyhow!("pr list needs a session id, either from YVO_SESSION_ID or --session <session-id>.")
     })?;
     send_and_print_request(
         paths,
@@ -1798,7 +1862,7 @@ fn run_pr_list(args: &[String], paths: &DuxPaths) -> Result<()> {
     )
 }
 
-fn run_pr_link(args: &[String], paths: &DuxPaths) -> Result<()> {
+fn run_pr_link(args: &[String], paths: &YvoPaths) -> Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_pr_help();
         return Ok(());
@@ -1831,7 +1895,7 @@ fn run_pr_link(args: &[String], paths: &DuxPaths) -> Result<()> {
     }
     let input = input.ok_or_else(|| anyhow!("pr link requires a PR URL or number."))?;
     let session_id = session_id.or_else(default_pr_session).ok_or_else(|| {
-        anyhow!("pr link needs a session id, either from DUX_SESSION_ID or --session <session-id>.")
+        anyhow!("pr link needs a session id, either from YVO_SESSION_ID or --session <session-id>.")
     })?;
     send_and_print_request(
         paths,
@@ -1841,7 +1905,7 @@ fn run_pr_link(args: &[String], paths: &DuxPaths) -> Result<()> {
 }
 
 fn send_and_print_request(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     request: crate::ipc::ControlRequest,
     json: bool,
 ) -> Result<()> {
@@ -1854,7 +1918,7 @@ fn send_and_print_request(
 }
 
 fn send_request_or_print(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     request: &crate::ipc::ControlRequest,
 ) -> Result<crate::ipc::ControlResponse> {
     let timeout = request.command.timeout();
@@ -1873,7 +1937,7 @@ fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
     if json {
         match serde_json::to_string_pretty(response) {
             Ok(encoded) => println!("{encoded}"),
-            Err(err) => eprintln!("failed to encode dux response: {err}"),
+            Err(err) => eprintln!("failed to encode yvo response: {err}"),
         }
         return;
     }
@@ -1884,7 +1948,7 @@ fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
             response
                 .error
                 .as_deref()
-                .unwrap_or("dux could not complete the request.")
+                .unwrap_or("yvo could not complete the request.")
         );
         return;
     }
@@ -1964,7 +2028,7 @@ fn print_control_response(response: &crate::ipc::ControlResponse, json: bool) {
 // File / directory helpers
 // ---------------------------------------------------------------------------
 
-fn resolve_reset_log_path(paths: &DuxPaths) -> PathBuf {
+fn resolve_reset_log_path(paths: &YvoPaths) -> PathBuf {
     let logging = if paths.config_path.exists() {
         fs::read_to_string(&paths.config_path)
             .ok()
@@ -1984,7 +2048,7 @@ fn remove_file_with_message(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the agent control socket if it still exists. `DUX_SOCKET` may point
+/// Remove the agent control socket if it still exists. `YVO_SOCKET` may point
 /// anywhere, so never delete a regular file that happens to live at that path.
 fn remove_socket_with_message(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -2187,13 +2251,13 @@ mod tests {
     #[test]
     fn config_path_subcommand() {
         // Just verify it doesn't error.
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             root: PathBuf::from("/tmp/test"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             sessions_db_path: PathBuf::from("/tmp/test/sessions.sqlite3"),
             worktrees_root: PathBuf::from("/tmp/test/worktrees"),
-            control_socket_path: PathBuf::from("/tmp/test/dux.sock"),
-            lock_path: PathBuf::from("/tmp/test/dux.lock"),
+            control_socket_path: PathBuf::from("/tmp/test/yvo.sock"),
+            lock_path: PathBuf::from("/tmp/test/yvo.lock"),
         };
         let result = run(&["path".to_string()], &paths);
         assert!(result.is_ok());
@@ -2234,20 +2298,20 @@ mod tests {
 
     struct ResetHarness {
         _tempdir: TempDir,
-        paths: DuxPaths,
+        paths: YvoPaths,
     }
 
     impl ResetHarness {
         fn new() -> Self {
             let tempdir = TempDir::new().expect("tempdir");
-            let root = tempdir.path().join("dux");
+            let root = tempdir.path().join("yvo");
             fs::create_dir_all(&root).expect("root");
-            let paths = DuxPaths {
+            let paths = YvoPaths {
                 config_path: root.join("config.toml"),
                 sessions_db_path: root.join("sessions.sqlite3"),
                 worktrees_root: root.join("worktrees"),
-                control_socket_path: root.join("dux.sock"),
-                lock_path: root.join("dux.lock"),
+                control_socket_path: root.join("yvo.sock"),
+                lock_path: root.join("yvo.lock"),
                 root,
             };
             Self {

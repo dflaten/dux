@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
 
-use crate::config::{DuxPaths, StartupCommandTerminalConfig};
+use crate::config::{StartupCommandTerminalConfig, YvoPaths};
 use crate::model::{AgentSession, Project};
 
 pub const LOG_ROOT: &str = "startup-command-logs";
@@ -53,11 +53,11 @@ pub struct StartupCommandLatestLog {
     pub content: String,
 }
 
-pub fn agent_log_dir(paths: &DuxPaths, project_id: &str, session_id: &str) -> PathBuf {
+pub fn agent_log_dir(paths: &YvoPaths, project_id: &str, session_id: &str) -> PathBuf {
     paths.root.join(LOG_ROOT).join(project_id).join(session_id)
 }
 
-pub fn delete_agent_logs(paths: &DuxPaths, project_id: &str, session_id: &str) -> Result<()> {
+pub fn delete_agent_logs(paths: &YvoPaths, project_id: &str, session_id: &str) -> Result<()> {
     let dir = agent_log_dir(paths, project_id, session_id);
     if !dir.exists() {
         return Ok(());
@@ -66,7 +66,7 @@ pub fn delete_agent_logs(paths: &DuxPaths, project_id: &str, session_id: &str) -
 }
 
 pub fn list_agent_logs(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     project_id: &str,
     session_id: &str,
 ) -> Result<Vec<StartupCommandLogEntry>> {
@@ -74,7 +74,7 @@ pub fn list_agent_logs(
 }
 
 pub fn list_project_logs(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     project_id: &str,
 ) -> Result<Vec<StartupCommandLogEntry>> {
     let root = paths.root.join(LOG_ROOT).join(project_id);
@@ -139,7 +139,7 @@ pub fn read_log(path: &Path) -> Result<String> {
 }
 
 pub fn latest_log_for_scope(
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     scope: StartupCommandLogScope,
 ) -> Result<StartupCommandLatestLog> {
     let entries = match scope {
@@ -177,7 +177,7 @@ pub fn open_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_startup_command(paths: &DuxPaths, run: StartupCommandRun) -> StartupCommandResult {
+pub fn run_startup_command(paths: &YvoPaths, run: StartupCommandRun) -> StartupCommandResult {
     let log_dir = agent_log_dir(paths, &run.project.id, &run.session.id);
     let timestamp = Utc::now();
     let file_stamp = timestamp.format("%Y%m%dT%H%M%SZ");
@@ -195,12 +195,12 @@ pub fn run_startup_command(paths: &DuxPaths, run: StartupCommandRun) -> StartupC
             .args(&shell_args)
             .arg(&run.command)
             .current_dir(&run.session.worktree_path)
-            .env("DUX_PROJECT_PATH", &run.project.path)
-            .env("DUX_WORKTREE_PATH", &run.session.worktree_path)
-            .env("DUX_AGENT_ID", &run.session.id)
-            .env("DUX_AGENT_BRANCH", &run.session.branch_name)
-            .env("DUX_PROVIDER", run.session.provider.as_str())
-            .env("DUX_STARTUP_COMMAND_LOG", &log_path);
+            .env("YVO_PROJECT_PATH", &run.project.path)
+            .env("YVO_WORKTREE_PATH", &run.session.worktree_path)
+            .env("YVO_AGENT_ID", &run.session.id)
+            .env("YVO_AGENT_BRANCH", &run.session.branch_name)
+            .env("YVO_PROVIDER", run.session.provider.as_str())
+            .env("YVO_STARTUP_COMMAND_LOG", &log_path);
         for (name, value) in &run.env {
             command.env(name, value);
         }
@@ -294,7 +294,7 @@ fn write_log(path: &Path, run: &StartupCommandRun, outcome: &CommandOutcome) -> 
         .ok_or_else(|| anyhow!("startup command log path has no parent"))?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let mut body = String::new();
-    body.push_str("dux startup command log\n");
+    body.push_str("yvo startup command log\n");
     body.push_str(&format!("started_at = {}\n", outcome.started.to_rfc3339()));
     body.push_str(&format!("ended_at = {}\n", outcome.ended.to_rfc3339()));
     body.push_str(&format!("duration_ms = {}\n", outcome.duration_ms));
@@ -354,14 +354,14 @@ mod tests {
 
     use crate::model::{ProjectBranchStatus, ProviderKind, SessionStatus};
 
-    fn test_paths(root: &Path) -> DuxPaths {
-        DuxPaths {
+    fn test_paths(root: &Path) -> YvoPaths {
+        YvoPaths {
             root: root.to_path_buf(),
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.to_path_buf().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.to_path_buf().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
         }
     }
 
@@ -454,9 +454,9 @@ mod tests {
 
     #[test]
     fn startup_command_shell_expands_config_env_vars() {
-        unsafe { std::env::set_var("DUX_TEST_STARTUP_SHELL", "/bin/sh") };
-        assert_eq!(startup_shell_command("$DUX_TEST_STARTUP_SHELL"), "/bin/sh");
-        unsafe { std::env::remove_var("DUX_TEST_STARTUP_SHELL") };
+        unsafe { std::env::set_var("YVO_TEST_STARTUP_SHELL", "/bin/sh") };
+        assert_eq!(startup_shell_command("$YVO_TEST_STARTUP_SHELL"), "/bin/sh");
+        unsafe { std::env::remove_var("YVO_TEST_STARTUP_SHELL") };
     }
 
     #[test]

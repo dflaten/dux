@@ -8,8 +8,8 @@
 //! Matching is deliberately forgiving: a term matches a candidate when it
 //! appears literally inside it, or — for longer terms — when its characters
 //! appear in order. Every whitespace separated term of the query has to
-//! match *some* candidate of a row, so `dux claude` finds the Claude agents
-//! of the `dux` project without also listing every other agent of `dux`.
+//! match *some* candidate of a row, so `yvo claude` finds the Claude agents
+//! of the `yvo` project without also listing every other agent of `yvo`.
 
 use super::*;
 
@@ -925,7 +925,7 @@ mod tests {
         // subsequence match would treat this as a hit for "trea" even though
         // nothing visible contains the query.
         sessions[0].worktree_path =
-            "/home/david/.config/dux/worktrees/alpha/agent/first".to_string();
+            "/home/david/.config/yvo/worktrees/alpha/agent/first".to_string();
         assert!(
             filtered(&projects(), &sessions, "trea").is_empty(),
             "path fields must not match as a subsequence"

@@ -1,6 +1,6 @@
 # Isolated configuration for the multi-repo screenshot demo.
 #
-# setup.sh copies this file into the demo's DUX_HOME and replaces
+# setup.sh copies this file into the demo's YVO_HOME and replaces
 # __DEMO_ROOT__ with the absolute demo work directory. The provider command is
 # on PATH because env.sh prepends demo/multi-repo/bin.
 
@@ -16,7 +16,7 @@ allow_unregistered_repos = true
 
 [providers.claude]
 # Deterministic stand-in for an AI coding CLI so the screenshot is stable.
-command = "dux-demo-agent"
+command = "yvo-demo-agent"
 args = []
 resume_args = ["--continue"]
 fork_args = []
@@ -36,7 +36,7 @@ args = ["-l", "-c"]
 
 [logging]
 level = "info"
-path = "dux.log"
+path = "yvo.log"
 
 [ui]
 left_width_pct = 24
@@ -54,7 +54,7 @@ github_poll_interval_seconds = 15
 pr_section = true
 pr_section_max_rows = 4
 pr_section_show_related = true
-theme = "dux_dark"
+theme = "yvo_dark"
 
 [editor]
 default = "cursor"

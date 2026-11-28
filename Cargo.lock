@@ -556,40 +556,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "dux"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "arboard",
- "chrono",
- "compact_str",
- "content_inspector",
- "crokey",
- "crossterm",
- "home",
- "indexmap",
- "notify",
- "opaline",
- "petname",
- "portable-pty",
- "ratatui",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "signal-hook 0.4.4",
- "similar",
- "syntect",
- "sysinfo",
- "tempfile",
- "toml 1.1.2+spec-1.1.0",
- "toml_edit 0.25.11+spec-1.1.0",
- "unicode-width",
- "uuid",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3364,6 +3330,40 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "yvo"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "arboard",
+ "chrono",
+ "compact_str",
+ "content_inspector",
+ "crokey",
+ "crossterm",
+ "home",
+ "indexmap",
+ "notify",
+ "opaline",
+ "petname",
+ "portable-pty",
+ "ratatui",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "signal-hook 0.4.4",
+ "similar",
+ "syntect",
+ "sysinfo",
+ "tempfile",
+ "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.11+spec-1.1.0",
+ "unicode-width",
+ "uuid",
+]
 
 [[package]]
 name = "zerocopy"

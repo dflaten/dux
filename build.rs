@@ -3,9 +3,9 @@ use std::fs;
 
 fn main() {
     println!("cargo:rerun-if-changed=DEV_VERSION");
-    println!("cargo:rerun-if-env-changed=DUX_RELEASE_BUILD");
+    println!("cargo:rerun-if-env-changed=YVO_RELEASE_BUILD");
 
-    let display_version = if env::var("DUX_RELEASE_BUILD").as_deref() == Ok("1") {
+    let display_version = if env::var("YVO_RELEASE_BUILD").as_deref() == Ok("1") {
         format!("v{}", env!("CARGO_PKG_VERSION"))
     } else {
         fs::read_to_string("DEV_VERSION")
@@ -14,5 +14,5 @@ fn main() {
             .to_string()
     };
 
-    println!("cargo:rustc-env=DUX_DISPLAY_VERSION={display_version}");
+    println!("cargo:rustc-env=YVO_DISPLAY_VERSION={display_version}");
 }

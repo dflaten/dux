@@ -1,16 +1,16 @@
-//! Single-instance enforcement for dux.
+//! Single-instance enforcement for yvo.
 //!
-//! dux keeps all per-user state (config, session database, worktree registry)
-//! in a single directory resolved by [`crate::config::DuxPaths`]. Running two
-//! dux processes against the same directory produces silently divergent
+//! yvo keeps all per-user state (config, session database, worktree registry)
+//! in a single directory resolved by [`crate::config::YvoPaths`]. Running two
+//! yvo processes against the same directory produces silently divergent
 //! in-memory state: each process only sees sessions it created itself, while
 //! the shared SQLite database and git worktrees on disk end up as the union
 //! of both processes' activity.
 //!
-//! This module enforces a hard invariant: exactly one dux instance per config
+//! This module enforces a hard invariant: exactly one yvo instance per config
 //! directory. The guarantee comes from an OS-level advisory lock
 //! ([`flock(2)`]) on a well-known lockfile. Users who want multiple concurrent
-//! workspaces can point `DUX_HOME` at different directories.
+//! workspaces can point `YVO_HOME` at different directories.
 //!
 //! The lockfile also contains the holder's PID — written after the lock is
 //! acquired — so a colliding launch can tell the user which process to close.
@@ -26,7 +26,7 @@ use rustix::io::Errno;
 
 use crate::io_retry::retry_on_interrupt_errno;
 
-/// Exclusive single-instance lock on the dux config directory.
+/// Exclusive single-instance lock on the yvo config directory.
 ///
 /// The file handle is kept open for the lifetime of this value. The kernel
 /// releases the advisory lock when the file descriptor is closed — including
@@ -50,7 +50,7 @@ impl Drop for SingleInstanceLock {
 /// Result of attempting to acquire the single-instance lock.
 #[derive(Debug)]
 pub enum AcquireError {
-    /// Another live dux process already holds the lock. `pid` is the holder's
+    /// Another live yvo process already holds the lock. `pid` is the holder's
     /// PID as read from the lockfile — `None` if the file was empty or its
     /// contents could not be parsed.
     AlreadyRunning { pid: Option<u32>, path: PathBuf },
@@ -69,16 +69,16 @@ impl std::fmt::Display for AcquireError {
                 // stray leading space sneaking in on a reformat.
                 match pid {
                     Some(pid) => {
-                        writeln!(f, "Another dux instance is already running (PID {pid}).")?
+                        writeln!(f, "Another yvo instance is already running (PID {pid}).")?
                     }
                     None => writeln!(
                         f,
-                        "Another dux instance is already running (PID unknown — lockfile is empty or unreadable)."
+                        "Another yvo instance is already running (PID unknown — lockfile is empty or unreadable)."
                     )?,
                 }
                 writeln!(
                     f,
-                    "Close it before starting a new one, or set DUX_HOME to a \
+                    "Close it before starting a new one, or set YVO_HOME to a \
                      different directory to run a separate workspace."
                 )?;
                 write!(f, "Lockfile: {}", path.display())
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn acquire_writes_own_pid_to_lockfile() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
 
         let _lock = SingleInstanceLock::acquire(&path).expect("first acquire should succeed");
         let contents = fs::read_to_string(&path).unwrap();
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn second_acquire_same_path_reports_running_with_pid() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
 
         let first = SingleInstanceLock::acquire(&path).expect("first acquire should succeed");
         let err = SingleInstanceLock::acquire(&path)
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn releasing_first_lock_allows_second_acquire() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
 
         let first = SingleInstanceLock::acquire(&path).expect("first acquire");
         drop(first);
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn stale_pid_in_preexisting_lockfile_is_overwritten_on_acquire() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
 
         // Simulate a lockfile left over from a prior crashed instance: the
         // file exists with an old PID but no one holds the flock.
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn acquire_in_missing_directory_returns_io_error() {
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("does_not_exist").join("dux.lock");
+        let path = tmp.path().join("does_not_exist").join("yvo.lock");
 
         let err =
             SingleInstanceLock::acquire(&path).expect_err("acquire in missing dir should fail");
@@ -314,7 +314,7 @@ mod tests {
     fn display_message_has_no_leading_whitespace_on_wrapped_lines() {
         let err = AcquireError::AlreadyRunning {
             pid: Some(12345),
-            path: PathBuf::from("/tmp/dux/dux.lock"),
+            path: PathBuf::from("/tmp/yvo/yvo.lock"),
         };
         let msg = format!("{err}");
 
@@ -330,14 +330,14 @@ mod tests {
         );
         assert_eq!(
             lines[0],
-            "Another dux instance is already running (PID 12345)."
+            "Another yvo instance is already running (PID 12345)."
         );
         assert!(
             lines[1].starts_with("Close it before starting a new one,"),
             "line 2 should start at column 0, got: {:?}",
             lines[1]
         );
-        assert_eq!(lines[2], "Lockfile: /tmp/dux/dux.lock");
+        assert_eq!(lines[2], "Lockfile: /tmp/yvo/yvo.lock");
 
         for (i, line) in lines.iter().enumerate() {
             assert!(
@@ -351,11 +351,11 @@ mod tests {
     fn display_message_without_pid_keeps_unknown_explanation() {
         let err = AcquireError::AlreadyRunning {
             pid: None,
-            path: PathBuf::from("/tmp/dux/dux.lock"),
+            path: PathBuf::from("/tmp/yvo/yvo.lock"),
         };
         let msg = format!("{err}");
         assert!(msg.contains("PID unknown"));
-        assert!(msg.contains("/tmp/dux/dux.lock"));
+        assert!(msg.contains("/tmp/yvo/yvo.lock"));
         for (i, line) in msg.split('\n').enumerate() {
             assert!(
                 !line.starts_with(' '),
@@ -380,7 +380,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
         fs::write(&path, "").unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
@@ -413,7 +413,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
         fs::write(&path, "9999\n").unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
@@ -441,7 +441,7 @@ mod tests {
         // When the PID is already written and stable, two consecutive
         // reads agree and the loop returns on the second attempt.
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
         fs::write(&path, "4242\n").unwrap();
 
         let mut file = OpenOptions::new().read(true).open(&path).unwrap();
@@ -456,7 +456,7 @@ mod tests {
         // Use minimal budget here — no writer thread, so every attempt
         // fails immediately and there's nothing to wait for.
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("dux.lock");
+        let path = tmp.path().join("yvo.lock");
         fs::write(&path, "").unwrap();
 
         let mut file = OpenOptions::new().read(true).open(&path).unwrap();

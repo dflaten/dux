@@ -130,7 +130,7 @@ pub struct Defaults {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentControlConfig {
-    /// Whether agents running inside dux may use the local control socket.
+    /// Whether agents running inside yvo may use the local control socket.
     pub enabled: bool,
     /// Whether split-out may add an unregistered repository as a project.
     pub allow_unregistered_repos: bool,
@@ -241,9 +241,9 @@ pub struct ProviderCommandConfig {
     pub session_discovery: Option<SessionDiscoveryConfig>,
 }
 
-/// How dux finds a provider's own conversation session IDs.
+/// How yvo finds a provider's own conversation session IDs.
 ///
-/// Providers that expose session IDs in a local store can opt in here. Dux
+/// Providers that expose session IDs in a local store can opt in here. Yvo
 /// uses the discovered ID for `{provider_session_id}` placeholders in
 /// `resume_args` and `fork_args`, and for auto-reopening agents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,7 +364,7 @@ impl Default for Config {
             startup_command_terminal: StartupCommandTerminalConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),
-                path: "dux.log".to_string(),
+                path: "yvo.log".to_string(),
             },
             projects: Vec::new(),
             ui: UiConfig {
@@ -517,7 +517,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-            path: "dux.log".to_string(),
+            path: "yvo.log".to_string(),
         }
     }
 }
@@ -623,36 +623,36 @@ impl ProvidersConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct DuxPaths {
+pub struct YvoPaths {
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub sessions_db_path: PathBuf,
     pub worktrees_root: PathBuf,
     /// Path to the agent control socket. Agent processes use this to ask the
-    /// running dux instance to create related worktrees.
+    /// running yvo instance to create related worktrees.
     pub control_socket_path: PathBuf,
-    /// Path to the lockfile that enforces a single dux instance per
+    /// Path to the lockfile that enforces a single yvo instance per
     /// config directory. Contains the PID of the holder.
     pub lock_path: PathBuf,
 }
 
-impl DuxPaths {
+impl YvoPaths {
     pub fn discover() -> Result<Self> {
         let root = resolve_root(
-            env::var_os("DUX_HOME"),
+            env::var_os("YVO_HOME"),
             home::home_dir(),
             env::var_os("XDG_CONFIG_HOME"),
         )?;
-        let control_socket_path = env::var_os("DUX_SOCKET")
+        let control_socket_path = env::var_os("YVO_SOCKET")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| root.join("dux.sock"));
+            .unwrap_or_else(|| root.join("yvo.sock"));
         Ok(Self {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
             control_socket_path,
-            lock_path: root.join("dux.lock"),
+            lock_path: root.join("yvo.lock"),
             root,
         })
     }
@@ -666,14 +666,14 @@ impl DuxPaths {
     }
 
     /// Root directory for scratch agents that are not attached to a project.
-    /// Scratch workspaces live under the dux data directory and are runtime
+    /// Scratch workspaces live under the yvo data directory and are runtime
     /// state, not project configuration.
     pub fn scratch_root(&self) -> PathBuf {
         self.root.join("scratch")
     }
 }
 
-pub fn ensure_config(paths: &DuxPaths) -> Result<Config> {
+pub fn ensure_config(paths: &YvoPaths) -> Result<Config> {
     paths.ensure_dirs()?;
     if !paths.config_path.exists() {
         fs::write(&paths.config_path, render_default_config())
@@ -799,8 +799,8 @@ fn migrate_prompt_for_name(
     Ok(())
 }
 
-/// Providers dux used to ship as defaults but has since retired. Each entry
-/// carries the exact stock config dux shipped, so an untouched block can be
+/// Providers yvo used to ship as defaults but has since retired. Each entry
+/// carries the exact stock config yvo shipped, so an untouched block can be
 /// recognized and removed from existing configs while a user-customized block
 /// of the same name is preserved (config wins for explicit preferences).
 ///
@@ -812,7 +812,7 @@ fn retired_providers() -> [(&'static str, ProviderCommandConfig); 1] {
     [("gemini", retired_stock_gemini())]
 }
 
-/// The exact `[gemini]` block dux shipped before Gemini was retired (Google
+/// The exact `[gemini]` block yvo shipped before Gemini was retired (Google
 /// deprecated the Gemini CLI in favor of Antigravity). Used to recognize an
 /// untouched stock block so it can be pruned from existing configs.
 fn retired_stock_gemini() -> ProviderCommandConfig {
@@ -830,9 +830,9 @@ fn retired_stock_gemini() -> ProviderCommandConfig {
     }
 }
 
-/// The OpenCode block dux shipped before disabling provider-level resume. Its
+/// The OpenCode block yvo shipped before disabling provider-level resume. Its
 /// `--continue` flag resumes OpenCode's most recent global session, so startup
-/// auto-reopen could attach several dux worktrees to the same conversation.
+/// auto-reopen could attach several yvo worktrees to the same conversation.
 fn unsafe_stock_opencode_resume() -> ProviderCommandConfig {
     ProviderCommandConfig {
         command: "opencode".to_string(),
@@ -891,7 +891,7 @@ fn disable_unsafe_stock_opencode_resume(doc: &mut DocumentMut) -> bool {
 }
 
 /// Remove top-level provider tables for retired providers when they still match
-/// the stock block dux shipped. A customized block (or one a user adds back
+/// the stock block yvo shipped. A customized block (or one a user adds back
 /// later) does not match and is left untouched. Returns whether the document
 /// changed.
 fn prune_retired_providers(doc: &mut DocumentMut) -> bool {
@@ -928,7 +928,7 @@ fn provider_table_config(table: &Table) -> Option<ProviderCommandConfig> {
         .map(|wrapper| wrapper.provider)
 }
 
-/// The stock provider config dux shipped, normalized through the same
+/// The stock provider config yvo shipped, normalized through the same
 /// render → parse round-trip a real config undergoes. This matters because the
 /// renderer writes optional fields explicitly (e.g. a `None`
 /// `resume_wait_timeout_ms` is written as `0`), so the on-disk block parses back
@@ -942,7 +942,7 @@ fn canonical_stock_config(stock: &ProviderCommandConfig) -> Option<ProviderComma
     provider_table_config(table)
 }
 
-/// Whether a config's provider table is the stock block dux shipped (so it can
+/// Whether a config's provider table is the stock block yvo shipped (so it can
 /// be retired), as opposed to one the user customized (which is preserved).
 fn table_matches_provider_config(table: &Table, stock: &ProviderCommandConfig) -> bool {
     match (provider_table_config(table), canonical_stock_config(stock)) {
@@ -1005,7 +1005,7 @@ enum ConfigEntry {
 
 fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
     vec![
-        ConfigEntry::Comment("# dux configuration"),
+        ConfigEntry::Comment("# yvo configuration"),
         ConfigEntry::Comment(
             "# Every value is materialized here so the file doubles as documentation.",
         ),
@@ -1015,7 +1015,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "provider",
             comment: Some(CommentSource::Static(
                 "# Global fallback provider for new sessions.\n\
-                 # Project-specific provider overrides are managed inside dux, not in this file.",
+                 # Project-specific provider overrides are managed inside yvo, not in this file.",
             )),
             value_fn: |c| FieldValue::Str(c.defaults.provider.clone()),
         },
@@ -1042,14 +1042,14 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             comment: Some(CommentSource::Static(
                 "# Legacy setting retained for older config files.\n\
                  # New-agent prompts now start empty by default; use the prompt's pet-name checkbox\n\
-                 # when you want dux to fill in a random two-word pet name.",
+                 # when you want yvo to fill in a random two-word pet name.",
             )),
             value_fn: |c| FieldValue::Bool(c.defaults.enable_randomized_pet_name_by_default),
         },
         ConfigEntry::Field {
             key: "pull_before_creating_agent_by_default",
             comment: Some(CommentSource::Static(
-                "# When true, dux safely fast-forward pulls the project source checkout\n\
+                "# When true, yvo safely fast-forward pulls the project source checkout\n\
                  # before creating a fresh project agent worktree.\n\
                  # This uses `git pull --ff-only`; it will not create merge commits or rebase.\n\
                  # Set to false to keep fresh agent creation from contacting the remote.",
@@ -1061,9 +1061,9 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "enabled",
             comment: Some(CommentSource::Static(
-                "# Allow agents running inside dux to control dux through the local socket\n\
-                 # at <config_dir>/dux.sock. The socket is user-only and is used by commands\n\
-                 # such as `dux agent split-out`, which create related worktrees in other repos.\n\
+                "# Allow agents running inside yvo to control yvo through the local socket\n\
+                 # at <config_dir>/yvo.sock. The socket is user-only and is used by commands\n\
+                 # such as `yvo agent split-out`, which create related worktrees in other repos.\n\
                  # Set to false to disable agent-initiated workspace changes.",
             )),
             value_fn: |c| FieldValue::Bool(c.agent_control.enabled),
@@ -1071,8 +1071,8 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "allow_unregistered_repos",
             comment: Some(CommentSource::Static(
-                "# When true, `dux agent split-out --repo <path>` may add an unregistered git\n\
-                 # checkout as a dux project before creating the related worktree. The repo path\n\
+                "# When true, `yvo agent split-out --repo <path>` may add an unregistered git\n\
+                 # checkout as a yvo project before creating the related worktree. The repo path\n\
                  # is still validated and the new project is written to config.toml and SQLite.",
             )),
             value_fn: |c| FieldValue::Bool(c.agent_control.allow_unregistered_repos),
@@ -1082,7 +1082,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "enabled",
             comment: Some(CommentSource::Static(
-                "# Allow agents to delegate work to child agents (`dux agent delegate`).\n\
+                "# Allow agents to delegate work to child agents (`yvo agent delegate`).\n\
                  # The control socket must also be enabled in [agent_control].",
             )),
             value_fn: |c| FieldValue::Bool(c.orchestration.enabled),
@@ -1163,7 +1163,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "wait_default_timeout_secs",
             comment: Some(CommentSource::Static(
-                "# Default timeout for `dux agent wait`. Keep this below your agent CLI's\n\
+                "# Default timeout for `yvo agent wait`. Keep this below your agent CLI's\n\
                  # tool-call timeout; a timeout exits 2 and the caller polls again.",
             )),
             value_fn: |c| FieldValue::Usize(c.orchestration.wait_default_timeout_secs),
@@ -1179,7 +1179,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "result_max_bytes",
             comment: Some(CommentSource::Static(
                 "# Maximum result payload stored on disk. Status and wait only return\n\
-                 # summaries; `dux agent result --full` reads the file directly.",
+                 # summaries; `yvo agent result --full` reads the file directly.",
             )),
             value_fn: |c| FieldValue::Usize(c.orchestration.result_max_bytes),
         },
@@ -1202,7 +1202,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "path",
             comment: Some(CommentSource::Static(
-                "# Relative paths are resolved from the dux config directory.",
+                "# Relative paths are resolved from the yvo config directory.",
             )),
             value_fn: |c| FieldValue::Str(c.logging.path.clone()),
         },
@@ -1271,7 +1271,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "branch_sync_interval",
             comment: Some(CommentSource::Static(
-                "# Interval in seconds for syncing git branch names in the background.\n# Keeps dux in sync if a branch is renamed outside the app.\n# Set to 0 to disable.",
+                "# Interval in seconds for syncing git branch names in the background.\n# Keeps yvo in sync if a branch is renamed outside the app.\n# Set to 0 to disable.",
             )),
             value_fn: |c| FieldValue::U16(c.ui.branch_sync_interval),
         },
@@ -1306,7 +1306,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "auto_reopen_agents",
             comment: Some(CommentSource::Static(
-                "# Reopen agent PTYs that were still running when dux last exited.\n# Disabled by default. Toggle project-level and agent-level opt-outs from the command palette.",
+                "# Reopen agent PTYs that were still running when yvo last exited.\n# Disabled by default. Toggle project-level and agent-level opt-outs from the command palette.",
             )),
             value_fn: |c| FieldValue::Bool(c.ui.auto_reopen_agents),
         },
@@ -1356,7 +1356,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
             key: "macro_focus_on_launch",
             comment: Some(CommentSource::Static(
                 "# When true, jump to the agent or terminal pane after a macro runs in it.\n\
-                 # When false, macros run in the background and dux shows a session badge\n\
+                 # When false, macros run in the background and yvo shows a session badge\n\
                  # plus a status hint with the key to view the target pane.",
             )),
             value_fn: |c| FieldValue::Bool(c.ui.macro_focus_on_launch),
@@ -1364,7 +1364,7 @@ fn config_schema(generate_commit_key: &str) -> Vec<ConfigEntry> {
         ConfigEntry::Field {
             key: "theme",
             comment: Some(CommentSource::Static(
-                "# Visual theme for the dux interface.\n# Built-in options include \"dux_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to dux_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",
+                "# Visual theme for the yvo interface.\n# Built-in options include \"yvo_dark\" (the default), plus any theme\n# bundled with the opaline engine, for example: \"catppuccin_mocha\",\n# \"catppuccin_frappe\", \"nord\", \"dracula\", \"gruvbox_dark\",\n# \"tokyo_night\", \"solarized_dark\", \"one_dark\", \"rose_pine\", and others.\n# To use a custom theme, drop a TOML file into <config_dir>/themes/<name>.toml\n# (with the same token format as opaline themes) and reference it here\n# by file stem. Unknown names fall back to yvo_dark with a warning.\n# Use the `change-theme` command in the palette (Ctrl-p) for an interactive picker.",
             )),
             value_fn: |c| FieldValue::Str(c.ui.theme.clone()),
         },
@@ -2114,7 +2114,7 @@ fn render_keys_config(
     );
     out.push_str("#\n");
     out.push_str("# Some keys shown in hints are terminal conventions (e.g. Ctrl-j for newline)\n");
-    out.push_str("# that dux documents but does not control. Set this to false to hide them.\n");
+    out.push_str("# that yvo documents but does not control. Set this to false to hide them.\n");
     let _ = writeln!(out, "show_terminal_keys = {}", keys.show_terminal_keys);
     out.push('\n');
 
@@ -2171,7 +2171,7 @@ fn render_macros_config(
     let _ = writeln!(
         out,
         "# Text macros: press {macro_key} to open the macro bar and select one to send.\n\
-         # Each macro runs in the agent or the companion terminal, and dux creates\n\
+         # Each macro runs in the agent or the companion terminal, and yvo creates\n\
          # the target first when it is not already running. Each entry is a name\n\
          # mapped to its text, an optional description, and a routing target.\n\
          # description = \"...\"  — optional one-line summary shown in the macro bar and\n\
@@ -2389,7 +2389,7 @@ fn render_provider_configs(out: &mut String, providers: &ProvidersConfig) {
 
 fn render_project_configs(out: &mut String, projects: &[ProjectConfig]) {
     out.push_str(
-        "# Projects are mirrored with dux's runtime database.\n\
+        "# Projects are mirrored with yvo's runtime database.\n\
          # Paths may use $HOME, ${HOME}, or ~ for portability across machines.\n\
          # startup_command runs in each new agent worktree before the provider launches.\n\
          # env defines per-project variables passed to agent and companion terminal PTYs.\n\
@@ -2471,7 +2471,7 @@ fn render_env_config(out: &mut String, env: &BTreeMap<String, String>) {
 fn render_terminal_config(out: &mut String, terminal: &TerminalConfig) {
     out.push_str("[terminal]\n");
     out.push_str(
-        "# CLI command dux should use for the companion terminal bound to an agent session.\n",
+        "# CLI command yvo should use for the companion terminal bound to an agent session.\n",
     );
     out.push_str(&format!(
         "command = \"{}\"\n",
@@ -2521,7 +2521,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     );
     out.push_str(&format!("args = {}\n", render_string_list(&config.args)));
     out.push_str(
-        "# Optional args dux should use when reconnecting a detached session.\n\
+        "# Optional args yvo should use when reconnecting a detached session.\n\
          # Use {provider_session_id} for CLIs that need their own persisted session id.\n\
          # Leave this empty for CLIs that do not support scoped session resume.\n",
     );
@@ -2530,7 +2530,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
         render_string_list(config.resume_args.as_deref().unwrap_or(&[]))
     ));
     out.push_str(
-        "# Optional args dux should use to fork a source agent's provider context into a new worktree.\n\
+        "# Optional args yvo should use to fork a source agent's provider context into a new worktree.\n\
          # Use {provider_session_id} for CLIs that need the source provider session id.\n\
          # Leave this empty to copy only the worktree when an agent is forked.\n",
     );
@@ -2540,7 +2540,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     ));
     out.push_str(
         "# Optional timeout for resumed sessions that produce no visible output.\n\
-         # If resume hangs before rendering anything, dux kills it and retries fresh after this many milliseconds.\n\
+         # If resume hangs before rendering anything, yvo kills it and retries fresh after this many milliseconds.\n\
          # Set to 0 to disable the timeout.\n",
     );
     out.push_str(&format!(
@@ -2568,7 +2568,7 @@ fn render_provider_config(out: &mut String, name: &str, config: &ProviderCommand
     }
     out.push_str(
         "# When true, scroll events are forwarded to the provider instead of being\n\
-         # handled as dux host scrollback. Enable this for agents that manage their\n\
+         # handled as yvo host scrollback. Enable this for agents that manage their\n\
          # own scrollback buffer (e.g. opencode).\n",
     );
     out.push_str(&format!("forward_scroll = {}\n", config.forward_scroll));
@@ -2586,7 +2586,7 @@ fn render_session_discovery_config(
 ) {
     out.push_str(
         "# Optional lookup for the provider's own conversation session ids.\n\
-         # Dux uses a discovered id for the {provider_session_id} placeholder in\n\
+         # Yvo uses a discovered id for the {provider_session_id} placeholder in\n\
          # resume_args and fork_args, and for auto-reopening agents. Set\n\
          # strategy = \"none\" to disable discovery for this provider.\n",
     );
@@ -2742,29 +2742,75 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn resolve_root(
-    dux_home: Option<std::ffi::OsString>,
+    yvo_home: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
     xdg_config_home: Option<std::ffi::OsString>,
 ) -> Result<PathBuf> {
-    if let Some(dux_home) = dux_home.map(PathBuf::from) {
-        if dux_home.is_absolute() {
-            return Ok(dux_home);
+    if let Some(yvo_home) = yvo_home.map(PathBuf::from) {
+        if yvo_home.is_absolute() {
+            return Ok(yvo_home);
         }
         bail!(
-            "DUX_HOME must be an absolute path, got: {}",
-            dux_home.display()
+            "YVO_HOME must be an absolute path, got: {}",
+            yvo_home.display()
         );
     }
 
     let home = home.ok_or_else(|| anyhow!("failed to determine user home directory"))?;
-    Ok(discover_root(&home, xdg_config_home))
+    Ok(discover_root(&home, xdg_config_home, "yvo"))
 }
 
-fn discover_root(home: &Path, xdg_config_home: Option<std::ffi::OsString>) -> PathBuf {
+/// Root used by the pre-rename `dux` binary. This is only for the one-time
+/// migration path; normal startup uses [`YvoPaths::discover`].
+pub fn legacy_root() -> Result<PathBuf> {
+    if let Some(dir) = env::var_os("DUX_HOME") {
+        let path = PathBuf::from(dir);
+        if !path.is_absolute() {
+            bail!("DUX_HOME must be an absolute path, got: {}", path.display());
+        }
+        return Ok(path);
+    }
+
+    let home =
+        home::home_dir().ok_or_else(|| anyhow!("failed to determine user home directory"))?;
+    Ok(discover_root(&home, env::var_os("XDG_CONFIG_HOME"), "dux"))
+}
+
+/// Return the legacy root when real dux state is waiting to be migrated into a
+/// still-unused yvo directory. An explicit `YVO_HOME` always opts out: that is
+/// a deliberate separate workspace, not an upgrade.
+pub fn legacy_data_pending(paths: &YvoPaths) -> Result<Option<PathBuf>> {
+    if env::var_os("YVO_HOME").is_some() {
+        return Ok(None);
+    }
+
+    let old_root = legacy_root()?;
+    if old_root == paths.root || !has_legacy_state(&old_root) {
+        return Ok(None);
+    }
+    if paths.root.join("config.toml").exists() || paths.root.join("sessions.sqlite3").exists() {
+        return Ok(None);
+    }
+    Ok(Some(old_root))
+}
+
+/// True when the legacy directory actually owns yvo-relevant state. A bare
+/// directory left over from an old experiment should not block startup.
+pub fn has_legacy_state(root: &Path) -> bool {
+    root.join("config.toml").exists()
+        || root.join("sessions.sqlite3").exists()
+        || root.join("worktrees").exists()
+}
+
+fn discover_root(
+    home: &Path,
+    xdg_config_home: Option<std::ffi::OsString>,
+    app_dir: &str,
+) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let _ = xdg_config_home;
-        home.join(".dux")
+        home.join(format!(".{app_dir}"))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2772,9 +2818,9 @@ fn discover_root(home: &Path, xdg_config_home: Option<std::ffi::OsString>) -> Pa
         if let Some(xdg) = xdg_config_home.map(PathBuf::from)
             && xdg.is_absolute()
         {
-            return xdg.join("dux");
+            return xdg.join(app_dir);
         }
-        home.join(".config").join("dux")
+        home.join(".config").join(app_dir)
     }
 }
 
@@ -3011,7 +3057,7 @@ mod tests {
     #[test]
     fn default_config_is_commented_and_complete() {
         let rendered = render_default_config();
-        assert!(rendered.contains("# dux configuration"));
+        assert!(rendered.contains("# yvo configuration"));
         assert!(rendered.contains("[defaults]"));
         assert!(rendered.contains("provider = \"claude\""));
         assert!(rendered.contains("enable_randomized_pet_name_by_default = false"));
@@ -3319,7 +3365,7 @@ agent_scrollback_lines = 10000
 
     #[test]
     fn prune_retired_providers_removes_stock_gemini_block() {
-        // Render the stock gemini block with the real renderer (exactly how dux
+        // Render the stock gemini block with the real renderer (exactly how yvo
         // wrote it into existing configs), then confirm the migration prunes it.
         let mut providers = ProvidersConfig::default();
         providers
@@ -3494,17 +3540,17 @@ forward_scroll = true
     fn ensure_config_prunes_stock_gemini_from_existing_config() {
         use tempfile::tempdir;
         let tmp = tempdir().expect("tempdir");
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: tmp.path().join("config.toml"),
             sessions_db_path: tmp.path().join("sessions.sqlite3"),
             worktrees_root: tmp.path().join("worktrees"),
-            control_socket_path: tmp.path().to_path_buf().join("dux.sock"),
-            lock_path: tmp.path().join("dux.lock"),
+            control_socket_path: tmp.path().to_path_buf().join("yvo.sock"),
+            lock_path: tmp.path().join("yvo.lock"),
             root: tmp.path().to_path_buf(),
         };
 
         // Seed an existing config that still ships the stock gemini provider,
-        // rendered exactly as dux would have written it.
+        // rendered exactly as yvo would have written it.
         let mut config = Config::default();
         config
             .providers
@@ -3892,7 +3938,7 @@ dangerous = true
 
             [logging]
             level = "info"
-            path = "dux.log"
+            path = "yvo.log"
 
             [ui]
             left_width_pct = 20
@@ -4072,18 +4118,30 @@ strategy = "none"
         );
     }
 
+    #[test]
+    fn has_legacy_state_requires_real_state_not_a_bare_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!has_legacy_state(dir.path()));
+        std::fs::write(dir.path().join("config.toml"), "").expect("write config");
+        assert!(has_legacy_state(dir.path()));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn config_root_uses_hidden_home_dir_on_macos() {
-        let root = discover_root(Path::new("/example/home"), Some("/tmp/ignored".into()));
-        assert_eq!(root, PathBuf::from("/example/home/.dux"));
+        let root = discover_root(
+            Path::new("/example/home"),
+            Some("/tmp/ignored".into()),
+            "yvo",
+        );
+        assert_eq!(root, PathBuf::from("/example/home/.yvo"));
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn config_root_uses_xdg_config_home_when_absolute() {
-        let root = discover_root(Path::new("/example/home"), Some("/tmp/xdg".into()));
-        assert_eq!(root, PathBuf::from("/tmp/xdg/dux"));
+        let root = discover_root(Path::new("/example/home"), Some("/tmp/xdg".into()), "yvo");
+        assert_eq!(root, PathBuf::from("/tmp/xdg/yvo"));
     }
 
     #[test]
@@ -4096,25 +4154,29 @@ strategy = "none"
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn config_root_falls_back_to_dot_config_when_xdg_missing() {
-        let root = discover_root(Path::new("/example/home"), None);
-        assert_eq!(root, PathBuf::from("/example/home/.config/dux"));
+        let root = discover_root(Path::new("/example/home"), None, "yvo");
+        assert_eq!(root, PathBuf::from("/example/home/.config/yvo"));
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn config_root_ignores_relative_xdg_config_home() {
-        let root = discover_root(Path::new("/example/home"), Some("relative/path".into()));
-        assert_eq!(root, PathBuf::from("/example/home/.config/dux"));
+        let root = discover_root(
+            Path::new("/example/home"),
+            Some("relative/path".into()),
+            "yvo",
+        );
+        assert_eq!(root, PathBuf::from("/example/home/.config/yvo"));
     }
 
     #[test]
-    fn resolve_root_uses_dux_home_when_absolute() {
-        let root = resolve_root(Some("/custom/dux".into()), None, None).unwrap();
-        assert_eq!(root, PathBuf::from("/custom/dux"));
+    fn resolve_root_uses_yvo_home_when_absolute() {
+        let root = resolve_root(Some("/custom/yvo".into()), None, None).unwrap();
+        assert_eq!(root, PathBuf::from("/custom/yvo"));
     }
 
     #[test]
-    fn resolve_root_errors_on_relative_dux_home() {
+    fn resolve_root_errors_on_relative_yvo_home() {
         let err = resolve_root(
             Some("relative/path".into()),
             Some(PathBuf::from("/home")),
@@ -4123,7 +4185,7 @@ strategy = "none"
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("DUX_HOME must be an absolute path"),
+                .contains("YVO_HOME must be an absolute path"),
             "unexpected error: {err}"
         );
         assert!(
@@ -4133,23 +4195,23 @@ strategy = "none"
     }
 
     #[test]
-    fn resolve_root_errors_on_empty_dux_home() {
+    fn resolve_root_errors_on_empty_yvo_home() {
         let err = resolve_root(Some("".into()), Some(PathBuf::from("/home")), None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("DUX_HOME must be an absolute path"),
+                .contains("YVO_HOME must be an absolute path"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn resolve_root_falls_through_when_dux_home_unset() {
+    fn resolve_root_falls_through_when_yvo_home_unset() {
         let root = resolve_root(None, Some(PathBuf::from("/example/home")), None).unwrap();
         // Should delegate to discover_root with platform defaults
         #[cfg(target_os = "macos")]
-        assert_eq!(root, PathBuf::from("/example/home/.dux"));
+        assert_eq!(root, PathBuf::from("/example/home/.yvo"));
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(root, PathBuf::from("/example/home/.config/dux"));
+        assert_eq!(root, PathBuf::from("/example/home/.config/yvo"));
     }
 
     #[test]
@@ -4660,7 +4722,7 @@ github_integration = true
 
 [logging]
 level = \"info\"
-path = \"dux.log\"
+path = \"yvo.log\"
 
 [defaults]
 provider = \"claude\"
@@ -4852,28 +4914,28 @@ session_discovery = { strategy = "json", roots = ["/tmp/sessions"] }
     fn expand_path_dollar_var() {
         // SAFETY: test-only env manipulation; tests are run with --test-threads=1
         // or use unique variable names to avoid races.
-        unsafe { std::env::set_var("DUX_TEST_VAR_1", "/test/value") };
-        let result = expand_path("$DUX_TEST_VAR_1/subdir").unwrap();
+        unsafe { std::env::set_var("YVO_TEST_VAR_1", "/test/value") };
+        let result = expand_path("$YVO_TEST_VAR_1/subdir").unwrap();
         assert_eq!(result, "/test/value/subdir");
-        unsafe { std::env::remove_var("DUX_TEST_VAR_1") };
+        unsafe { std::env::remove_var("YVO_TEST_VAR_1") };
     }
 
     #[test]
     fn expand_path_braced_var() {
-        unsafe { std::env::set_var("DUX_TEST_VAR_2", "/braced") };
-        let result = expand_path("${DUX_TEST_VAR_2}/sub").unwrap();
+        unsafe { std::env::set_var("YVO_TEST_VAR_2", "/braced") };
+        let result = expand_path("${YVO_TEST_VAR_2}/sub").unwrap();
         assert_eq!(result, "/braced/sub");
-        unsafe { std::env::remove_var("DUX_TEST_VAR_2") };
+        unsafe { std::env::remove_var("YVO_TEST_VAR_2") };
     }
 
     #[test]
     fn expand_path_unresolved_var_kept_literal() {
         // Unresolved var is preserved literally; if the overall path is still
         // absolute the function succeeds (the path just won't exist on disk).
-        let result = expand_path("/prefix/$NONEXISTENT_DUX_VAR_999/suffix");
+        let result = expand_path("/prefix/$NONEXISTENT_YVO_VAR_999/suffix");
         assert_eq!(
             result.as_deref(),
-            Some("/prefix/$NONEXISTENT_DUX_VAR_999/suffix")
+            Some("/prefix/$NONEXISTENT_YVO_VAR_999/suffix")
         );
     }
 
@@ -4889,9 +4951,9 @@ session_discovery = { strategy = "json", roots = ["/tmp/sessions"] }
 
     #[test]
     fn expand_path_rejects_traversal() {
-        unsafe { std::env::set_var("DUX_TEST_VAR_3", "/safe") };
-        assert!(expand_path("$DUX_TEST_VAR_3/../etc/passwd").is_none());
-        unsafe { std::env::remove_var("DUX_TEST_VAR_3") };
+        unsafe { std::env::set_var("YVO_TEST_VAR_3", "/safe") };
+        assert!(expand_path("$YVO_TEST_VAR_3/../etc/passwd").is_none());
+        unsafe { std::env::remove_var("YVO_TEST_VAR_3") };
     }
 
     #[test]
@@ -4917,13 +4979,13 @@ session_discovery = { strategy = "json", roots = ["/tmp/sessions"] }
 
     #[test]
     fn project_env_lines_parse_and_expand() {
-        unsafe { std::env::set_var("DUX_TEST_PROJECT_ENV_SOURCE", "secret") };
-        let env = parse_project_env_lines("EDITOR=true\nAPI_KEY=${DUX_TEST_PROJECT_ENV_SOURCE}")
+        unsafe { std::env::set_var("YVO_TEST_PROJECT_ENV_SOURCE", "secret") };
+        let env = parse_project_env_lines("EDITOR=true\nAPI_KEY=${YVO_TEST_PROJECT_ENV_SOURCE}")
             .expect("parse env");
         let resolved = resolve_project_env(&env).expect("resolve env");
         assert!(resolved.contains(&("EDITOR".to_string(), "true".to_string())));
         assert!(resolved.contains(&("API_KEY".to_string(), "secret".to_string())));
-        unsafe { std::env::remove_var("DUX_TEST_PROJECT_ENV_SOURCE") };
+        unsafe { std::env::remove_var("YVO_TEST_PROJECT_ENV_SOURCE") };
     }
 
     #[test]

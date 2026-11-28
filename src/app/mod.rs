@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::clipboard::Clipboard;
 use crate::config::{
-    Config, DuxPaths, MacroSurface, ProviderCommandConfig, check_provider_available, ensure_config,
+    Config, MacroSurface, ProviderCommandConfig, YvoPaths, check_provider_available, ensure_config,
     save_config, validate_keys,
 };
 use crate::diff::SyntaxCache;
@@ -57,7 +57,7 @@ use crate::theme::Theme;
 
 use text_input::TextInput;
 
-const DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE: &str = concat!(
+const YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE: &str = concat!(
     // Normal tracking: report button press/release and scroll events.
     "\x1b[?1000h",
     // Button-event tracking: report drag motion while a button is held.
@@ -69,17 +69,17 @@ const DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE: &str = concat!(
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DuxEnableMouseCapture;
+struct YvoEnableMouseCapture;
 
-impl Command for DuxEnableMouseCapture {
+impl Command for YvoEnableMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE)
+        f.write_str(YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE)
     }
 }
 
 pub struct App {
     pub(crate) config: Config,
-    pub(crate) paths: DuxPaths,
+    pub(crate) paths: YvoPaths,
     pub(crate) bindings: RuntimeBindings,
     pub(crate) session_store: SessionStore,
     pub(crate) projects: Vec<Project>,
@@ -302,7 +302,7 @@ pub struct App {
     pub(crate) terminal_selection_text: Option<String>,
     /// Active text selection in the startup command log output pane, if any.
     pub(crate) startup_log_selection: Option<TerminalSelection>,
-    /// Exclusive lock held for the lifetime of this `App` so only one dux
+    /// Exclusive lock held for the lifetime of this `App` so only one yvo
     /// instance runs against a given config directory. Released
     /// automatically on drop (including crashes), so there is nothing to
     /// clean up on exit.
@@ -707,7 +707,7 @@ pub(crate) struct StartupLogViewer {
 pub(crate) struct ProjectWorktreeEntry {
     pub(crate) path: PathBuf,
     pub(crate) branch_name: String,
-    pub(crate) is_managed_by_dux: bool,
+    pub(crate) is_managed_by_yvo: bool,
     pub(crate) existing_session_id: Option<String>,
     pub(crate) is_external: bool,
     pub(crate) is_project_checkout: bool,
@@ -967,7 +967,7 @@ pub(crate) enum PromptState {
         current_branch: String,
         kind: BranchWarningKind,
         focus: ConfirmNonDefaultBranchFocus,
-        /// When true and `kind == Known`, dux runs `git switch
+        /// When true and `kind == Known`, yvo runs `git switch
         /// <default_branch>` in the source repo before registering the project.
         /// Ignored for `BranchWarningKind::Heuristic` because we can't
         /// confidently identify the target.
@@ -1226,7 +1226,7 @@ fn canonical_or_original(path: &Path) -> PathBuf {
 
 pub(crate) fn classify_project_worktrees(
     project: &Project,
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     sessions: &[AgentSession],
     worktrees: Vec<git::GitWorktree>,
 ) -> Vec<ProjectWorktreeEntry> {
@@ -1248,13 +1248,13 @@ pub(crate) fn classify_project_worktrees(
             let canonical_path = canonical_or_original(&worktree.path);
             let existing_session_id = session_by_path.get(&canonical_path).cloned();
             let is_project_checkout = canonical_path == project_checkout_path;
-            let is_managed_by_dux = git::is_under(&managed_project_root, &worktree.path);
-            let is_external = !is_managed_by_dux;
+            let is_managed_by_yvo = git::is_under(&managed_project_root, &worktree.path);
+            let is_external = !is_managed_by_yvo;
             let is_selectable = existing_session_id.is_none() && !is_project_checkout;
             ProjectWorktreeEntry {
                 path: canonical_path,
                 branch_name: worktree.label(),
-                is_managed_by_dux,
+                is_managed_by_yvo,
                 existing_session_id,
                 is_external,
                 is_project_checkout,
@@ -2207,7 +2207,7 @@ pub(crate) struct SplitOutPrepareRequest {
     pub(crate) projects: Vec<Project>,
     pub(crate) sessions: Vec<AgentSession>,
     pub(crate) config: Config,
-    pub(crate) paths: DuxPaths,
+    pub(crate) paths: YvoPaths,
 }
 
 /// A resolved split-out request. It becomes executable immediately when the
@@ -2528,13 +2528,13 @@ impl App {
     /// This ensures the lock covers every entrypoint (TUI + config
     /// subcommands) and that a losing process never touches shared state.
     pub fn bootstrap_with_lock(
-        paths: DuxPaths,
+        paths: YvoPaths,
         single_instance_lock: SingleInstanceLock,
     ) -> Result<Self> {
         let mut config = ensure_config(&paths)?;
 
         logger::init(&config.logging, &paths);
-        logger::info("bootstrapping dux");
+        logger::info("bootstrapping yvo");
 
         // Validate and build runtime keybindings from config.
         if let Err(msg) = validate_keys(&config.keys) {
@@ -2755,7 +2755,7 @@ impl App {
         self.spawn_gh_status_check();
         self.start_control_server();
         let mut terminal = ratatui::init();
-        execute!(stdout(), DuxEnableMouseCapture)?;
+        execute!(stdout(), YvoEnableMouseCapture)?;
 
         let result: Result<()> = {
             loop {
@@ -2781,7 +2781,7 @@ impl App {
                     }
                     // Re-enable mouse capture — terminal.clear() resets
                     // terminal state which drops the mouse capture mode.
-                    let _ = execute!(stdout(), DuxEnableMouseCapture);
+                    let _ = execute!(stdout(), YvoEnableMouseCapture);
                 }
 
                 if let Err(err) = terminal.draw(|frame| self.render(frame)) {
@@ -4468,7 +4468,7 @@ pub(crate) fn default_scratch_project_destination(
 /// Build the built-in scratch workspace. It is added to the runtime project
 /// list on boot and config reload, but intentionally omitted from every
 /// config/SQLite project write.
-pub(crate) fn scratch_project(paths: &DuxPaths, config: &Config) -> Result<Project> {
+pub(crate) fn scratch_project(paths: &YvoPaths, config: &Config) -> Result<Project> {
     let root = paths.scratch_root();
     std::fs::create_dir_all(&root).map_err(|err| {
         anyhow::anyhow!(
@@ -4495,7 +4495,7 @@ pub(crate) fn scratch_project(paths: &DuxPaths, config: &Config) -> Result<Proje
 pub(crate) fn persist_runtime_projects_to_config_and_store(
     projects: &[Project],
     config: &mut Config,
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     bindings: &RuntimeBindings,
     session_store: &SessionStore,
 ) -> Result<()> {
@@ -4534,7 +4534,7 @@ pub(crate) fn persist_runtime_projects_to_config_and_store(
 
 pub(crate) fn sync_config_projects_with_store(
     config: &mut Config,
-    paths: &DuxPaths,
+    paths: &YvoPaths,
     bindings: &RuntimeBindings,
     session_store: &SessionStore,
 ) -> Result<()> {
@@ -4607,13 +4607,13 @@ fn validate_project_records(source: &str, projects: &[crate::config::ProjectConf
         for other in projects.iter().skip(index + 1) {
             if project.id == other.id {
                 anyhow::bail!(
-                    "Project sync conflict in {source}: duplicate project id \"{}\". Remove or rename one [[projects]] entry, then restart dux.",
+                    "Project sync conflict in {source}: duplicate project id \"{}\". Remove or rename one [[projects]] entry, then restart yvo.",
                     project.id
                 );
             }
             if same_expanded_project_path(project, other) {
                 anyhow::bail!(
-                    "Project sync conflict in {source}: duplicate project path \"{}\". Remove one duplicate project entry, then restart dux.",
+                    "Project sync conflict in {source}: duplicate project path \"{}\". Remove one duplicate project entry, then restart yvo.",
                     expanded_project_path(project).unwrap_or_else(|| project.path.clone())
                 );
             }
@@ -4746,7 +4746,7 @@ pub(crate) fn runtime_project_to_config(
 
 // ── Resource monitor helpers ───────────────────────────────────────────────
 
-/// Collect CPU and memory stats for dux itself plus each labeled target
+/// Collect CPU and memory stats for yvo itself plus each labeled target
 /// process tree. Runs on a background thread — no `&self` needed.
 fn collect_resource_stats(targets: Vec<(String, u32)>) -> Vec<ResourceStats> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -4757,11 +4757,11 @@ fn collect_resource_stats(targets: Vec<(String, u32)>) -> Vec<ResourceStats> {
 
     let mut rows = Vec::new();
 
-    // Row: dux itself.
+    // Row: yvo itself.
     let self_pid = Pid::from_u32(std::process::id());
     if let Some(proc_info) = sys.process(self_pid) {
         rows.push(ResourceStats {
-            label: "dux (this process)".into(),
+            label: "yvo (this process)".into(),
             pid: Some(std::process::id()),
             cpu_percent: proc_info.cpu_usage(),
             rss_bytes: proc_info.memory(),
@@ -4872,12 +4872,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dux_mouse_capture_keeps_hover_motion_untracked() {
-        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1000h"));
-        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1002h"));
-        assert!(DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1006h"));
+    fn yvo_mouse_capture_keeps_hover_motion_untracked() {
+        assert!(YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1000h"));
+        assert!(YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1002h"));
+        assert!(YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1006h"));
         assert!(
-            !DUX_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1003h"),
+            !YVO_ENABLE_MOUSE_CAPTURE_SEQUENCE.contains("\x1b[?1003h"),
             "all-motion tracking competes with terminal-side link hover detection"
         );
     }
@@ -5007,7 +5007,7 @@ mod tests {
     fn test_scratch_project() -> Project {
         let mut project = test_project(SCRATCH_PROJECT_ID);
         project.name = SCRATCH_PROJECT_NAME.to_string();
-        project.path = "/tmp/dux-scratch".to_string();
+        project.path = "/tmp/yvo-scratch".to_string();
         project.current_branch = String::new();
         project.leading_branch = None;
         project
@@ -5649,12 +5649,12 @@ mod tests {
     fn config_only_project_is_synced_to_sqlite_and_preserved() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees");
@@ -5666,8 +5666,8 @@ provider = "codex"
 
 [[projects]]
 id = "project-1"
-path = "$CODE/dux"
-name = "dux"
+path = "$CODE/yvo"
+name = "yvo"
 default_provider = "claude"
 leading_branch = "main"
 "#,
@@ -5685,8 +5685,8 @@ leading_branch = "main"
         let projects = store.load_projects().expect("load projects");
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, "project-1");
-        assert_eq!(projects[0].path, "$CODE/dux");
-        assert_eq!(projects[0].name.as_deref(), Some("dux"));
+        assert_eq!(projects[0].path, "$CODE/yvo");
+        assert_eq!(projects[0].name.as_deref(), Some("yvo"));
         assert_eq!(projects[0].default_provider.as_deref(), Some("claude"));
         assert_eq!(projects[0].leading_branch.as_deref(), Some("main"));
 
@@ -5700,12 +5700,12 @@ leading_branch = "main"
     fn sqlite_only_project_is_written_to_config() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         paths.ensure_dirs().expect("dirs");
@@ -5740,12 +5740,12 @@ leading_branch = "main"
     fn config_project_backfills_missing_sqlite_optional_fields() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         paths.ensure_dirs().expect("dirs");
@@ -5789,12 +5789,12 @@ leading_branch = "main"
     fn derived_project_leading_branch_is_persisted_to_sqlite_only() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         paths.ensure_dirs().expect("dirs");
@@ -5860,12 +5860,12 @@ leading_branch = "main"
     fn config_project_values_update_sqlite_on_sync() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().to_path_buf();
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         paths.ensure_dirs().expect("dirs");
@@ -5957,7 +5957,7 @@ leading_branch = "main"
     fn build_visual_rows_respects_expansion() {
         let rows = vec![
             ResourceStats {
-                label: "dux".into(),
+                label: "yvo".into(),
                 pid: Some(1),
                 cpu_percent: 0.0,
                 rss_bytes: 0,
@@ -6020,7 +6020,7 @@ leading_branch = "main"
     #[test]
     fn classify_project_worktrees_marks_managed_external_and_existing_agent() {
         let root =
-            std::env::temp_dir().join(format!("dux-classify-worktrees-{}", std::process::id()));
+            std::env::temp_dir().join(format!("yvo-classify-worktrees-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let repo = root.join("repo");
         let managed = root.join("worktrees").join("demo").join("managed-orphan");
@@ -6045,12 +6045,12 @@ leading_branch = "main"
             branch_status: ProjectBranchStatus::Leading,
             path_missing: false,
         };
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             root: root.clone(),
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
+            control_socket_path: root.clone().join("yvo.sock"),
             lock_path: root.join("lock"),
         };
         let sessions = vec![AgentSession {
@@ -6104,7 +6104,7 @@ leading_branch = "main"
             .iter()
             .find(|entry| entry.path == managed.canonicalize().unwrap())
             .unwrap();
-        assert!(managed_entry.is_managed_by_dux);
+        assert!(managed_entry.is_managed_by_yvo);
         assert!(!managed_entry.is_external);
         assert!(managed_entry.is_selectable);
 
@@ -6112,7 +6112,7 @@ leading_branch = "main"
             .iter()
             .find(|entry| entry.path == external.canonicalize().unwrap())
             .unwrap();
-        assert!(!external_entry.is_managed_by_dux);
+        assert!(!external_entry.is_managed_by_yvo);
         assert!(external_entry.is_external);
         assert!(external_entry.is_selectable);
 
@@ -6142,7 +6142,7 @@ leading_branch = "main"
             ProjectWorktreeEntry {
                 path: PathBuf::from("/repo/managed"),
                 branch_name: "feature".to_string(),
-                is_managed_by_dux: true,
+                is_managed_by_yvo: true,
                 existing_session_id: None,
                 is_external: false,
                 is_project_checkout: false,
@@ -6151,7 +6151,7 @@ leading_branch = "main"
             ProjectWorktreeEntry {
                 path: PathBuf::from("/repo/main"),
                 branch_name: "main".to_string(),
-                is_managed_by_dux: false,
+                is_managed_by_yvo: false,
                 existing_session_id: None,
                 is_external: true,
                 is_project_checkout: true,
@@ -6185,9 +6185,9 @@ leading_branch = "main"
     #[test]
     fn project_worktree_filter_matches_name_branch_and_path_fuzzily() {
         let entry = ProjectWorktreeEntry {
-            path: PathBuf::from("/repos/dux/worktrees/customer-search"),
+            path: PathBuf::from("/repos/yvo/worktrees/customer-search"),
             branch_name: "feature/recover-agent".to_string(),
-            is_managed_by_dux: true,
+            is_managed_by_yvo: true,
             existing_session_id: None,
             is_external: false,
             is_project_checkout: false,
@@ -6205,7 +6205,7 @@ leading_branch = "main"
         let entries = vec![ProjectWorktreeEntry {
             path: PathBuf::from("/repo/managed"),
             branch_name: "feature".to_string(),
-            is_managed_by_dux: true,
+            is_managed_by_yvo: true,
             existing_session_id: None,
             is_external: false,
             is_project_checkout: false,

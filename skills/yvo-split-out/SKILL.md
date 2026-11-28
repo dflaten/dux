@@ -1,24 +1,24 @@
 ---
-name: dux-split-out
-description: Create a related worktree in another dux project, or in the same repository, when the work you are doing requires a separate agent.
+name: yvo-split-out
+description: Create a related worktree in another yvo project, or in the same repository, when the work you are doing requires a separate agent.
 ---
 
-# Dux Split Out
+# Yvo Split Out
 
-Use this skill when the current task in dux requires a separate child worktree,
+Use this skill when the current task in yvo requires a separate child worktree,
 either in another repository or in the same repository, and the user wants that
-work managed as an independent dux agent.
+work managed as an independent yvo agent.
 
-Dux owns worktrees and agent sessions. Do not run `git worktree add` yourself for
-this. Ask the running dux instance to create the related worktree so it appears
+Yvo owns worktrees and agent sessions. Do not run `git worktree add` yourself for
+this. Ask the running yvo instance to create the related worktree so it appears
 in the sidebar under **Delegated work** and stays linked to this agent.
 
 ## Workflow
 
 1. Identify the target repository path (or use `--same-repo`) and a short
    kebab-case branch name.
-2. Decide whether the target repository is already a dux project. If not, pass
-   `--repo` with its path; dux can register it automatically when
+2. Decide whether the target repository is already a yvo project. If not, pass
+   `--repo` with its path; yvo can register it automatically when
    `[agent_control] allow_unregistered_repos` is enabled.
 3. Choose a base. Same-repo children default to the parent's HEAD
    (`--base-mode parent-head`). Use `--base-mode leading` for the project
@@ -32,11 +32,11 @@ in the sidebar under **Delegated work** and stays linked to this agent.
    - acceptance criteria and constraints;
    - what not to touch;
    - the relevant source worktree and branch for context.
-5. Run the delegation through the dux binary that launched you. Use
+5. Run the delegation through the yvo binary that launched you. Use
    `--same-repo` instead of `--repo` when the child belongs in your repository:
 
 ```bash
-"${DUX_BIN:-dux}" agent delegate \
+"${YVO_BIN:-yvo}" agent delegate \
   --repo /absolute/path/to/other-repo \
   --name descriptive-branch-name \
   --brief-file - \
@@ -55,14 +55,14 @@ PROMPT
    answer.
 
 ```bash
-"${DUX_BIN:-dux}" agent wait --delegation <id> --timeout 100 --json
-"${DUX_BIN:-dux}" agent result --delegation <id> --json
+"${YVO_BIN:-yvo}" agent wait --delegation <id> --timeout 100 --json
+"${YVO_BIN:-yvo}" agent result --delegation <id> --json
 ```
 
 8. If the child reports `blocked`, answer it, then wait again:
 
 ```bash
-"${DUX_BIN:-dux}" agent followup --delegation <id> --text-file -
+"${YVO_BIN:-yvo}" agent followup --delegation <id> --text-file -
 ```
 
 ## Important behavior
@@ -72,24 +72,24 @@ PROMPT
   **not** copied. Same-repo children default to the parent's HEAD; use
   `parent-snapshot` for uncommitted parent work.
 - The child agent is launched automatically and receives a short prompt that
-  points at a durable brief file. Dux flattens newlines to spaces before typing
+  points at a durable brief file. Yvo flattens newlines to spaces before typing
   the prompt once the child starts producing output, so keep the typed prompt
   short. A provider's first-run trust or onboarding prompt can consume the typed
   text; if the child does not start the work, open it and send the prompt again.
-- A child reports completion with `dux agent finish --status success --summary-file -`.
+- A child reports completion with `yvo agent finish --status success --summary-file -`.
   If it ignores the contract, the delegation becomes `exited` and its outcome is
   unknown; inspect the worktree and report that to the user.
 - Use `--name` for deterministic retries. If you are unsure whether a previous
-  request succeeded after a timeout, run `dux agent status --json` before
+  request succeeded after a timeout, run `yvo agent status --json` before
   retrying so you do not create duplicate worktrees.
-- If `DUX_BIN` and `DUX_SESSION_ID` are not set, you are not running inside a
-  dux-managed agent. Ask the user to run dux and start the agent there.
+- If `YVO_BIN` and `YVO_SESSION_ID` are not set, you are not running inside a
+  yvo-managed agent. Ask the user to run yvo and start the agent there.
 
 ## Options
 
 ```text
 --repo <path>           Target git checkout (may be auto-registered)
---project <id|name>     Target project already registered in dux
+--project <id|name>     Target project already registered in yvo
 --same-repo             Target the source agent's repository
 --name <branch>         Branch and worktree name
 --title <text>          Human-readable delegation title
@@ -99,7 +99,7 @@ PROMPT
 --provider <name>       Provider override
 --brief <text>          Task brief
 --brief-file <path|->   Read the task brief from a file or stdin
---source <session-id>   Source session (defaults to DUX_SESSION_ID)
+--source <session-id>   Source session (defaults to YVO_SESSION_ID)
 --wait-for-launch       Block until the child launches
 --no-wait               Return after queueing (default for delegate)
 --timeout <seconds>     Request timeout for --wait-for-launch

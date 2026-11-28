@@ -2,7 +2,7 @@
 
 ## Design Tenets
 
-Principles that guide every decision in dux. If a change conflicts with a tenet, the tenet wins.
+Principles that guide every decision in yvo. If a change conflicts with a tenet, the tenet wins.
 
 ### Configuration
 
@@ -28,7 +28,7 @@ Principles that guide every decision in dux. If a change conflicts with a tenet,
 ### Agents and Providers
 
 - **A provider is supported if and only if it supports PTY and oneshot mode.** PTY for interactive sessions; oneshot (headless: send a prompt, get one response) for automated tasks like commit message generation.
-- **Any CLI tool can be a provider.** Configure `command` in `config.toml` and dux spawns it. No adapters, no protocol layer. Adding a new provider is a config-only change, not a code change.
+- **Any CLI tool can be a provider.** Configure `command` in `config.toml` and yvo spawns it. No adapters, no protocol layer. Adding a new provider is a config-only change, not a code change.
 - **Claude, Codex, and OpenCode are the defaults.**
 - **No protocol layer.** No JSON-RPC, no custom message format, no adapter binaries. The CLI runs exactly as it would in a normal terminal.
 
@@ -41,7 +41,7 @@ Principles that guide every decision in dux. If a change conflicts with a tenet,
 
 ### Tone
 
-- **Welcome tips are playful and sassy.** They should feel fun, not like a manual. Lead with surprise or delight, highlight non-obvious features that differentiate dux, and keep keybinding references secondary to the feature discovery. Avoid dry "press X to do Y" phrasing.
+- **Welcome tips are playful and sassy.** They should feel fun, not like a manual. Lead with surprise or delight, highlight non-obvious features that differentiate yvo, and keep keybinding references secondary to the feature discovery. Avoid dry "press X to do Y" phrasing.
 
 ### Quality
 
@@ -50,16 +50,16 @@ Principles that guide every decision in dux. If a change conflicts with a tenet,
 
 ## Project Summary
 
-`dux` is a Rust terminal UI for orchestrating AI coding sessions per git worktree.
+`yvo` is a Rust terminal UI for orchestrating AI coding sessions per git worktree.
 
 The current app provides:
 
 - A left pane for projects and agent sessions
 - A center pane showing the agent's terminal output (embedded via PTY) or diff viewing
 - A right pane for changed files and diffs
-- Commented user config in the platform-specific dux config directory (`~/.dux/` on macOS, `~/.config/dux/` on Linux)
+- Commented user config in the platform-specific yvo config directory (`~/.yvo/` on macOS, `~/.config/yvo/` on Linux)
 - Session persistence in `sessions.sqlite3` alongside the config
-- Logging in `dux.log` alongside the config
+- Logging in `yvo.log` alongside the config
 - PTY-based agent startup: spawns CLI tools (`claude`, `codex`, `opencode`) directly in a pseudo-terminal
 
 ## Important Constraints
@@ -68,10 +68,10 @@ The current app provides:
 - Long-running actions should not block the UI thread.
 - All periodic or potentially-blocking work (git commands, file I/O, network) must run in background workers, never on the main UI thread. Even fast operations like `git symbolic-ref` should use workers to prevent UI freezes if the filesystem or git lock stalls.
 - Async operations must keep the status line updated for the full operation lifecycle: set a Busy message when the worker starts, then replace it with a clear success or failure message when the worker completes. Do not start background work silently.
-- User state lives under `~/.dux/` on macOS and `$XDG_CONFIG_HOME/dux/` (or `~/.config/dux/`) on Linux.
+- User state lives under `~/.yvo/` on macOS and `$XDG_CONFIG_HOME/yvo/` (or `~/.config/yvo/`) on Linux.
 - Worktrees are user data and should not be removed or mutated casually.
 - Git operations should be explicit and conservative, especially around the source checkout.
-- **Target platforms are macOS and Linux only.** Windows users run dux through WSL2, which is Linux. Do not add `#[cfg(windows)]` branches, `cfg!(windows)` checks, or Windows-specific code paths. Assume Unix throughout.
+- **Target platforms are macOS and Linux only.** Windows users run yvo through WSL2, which is Linux. Do not add `#[cfg(windows)]` branches, `cfg!(windows)` checks, or Windows-specific code paths. Assume Unix throughout.
 
 ## App Module Structure
 
@@ -106,7 +106,7 @@ When making changes, edit only the relevant submodule. If you need to add a new 
 
 ## Recommendations For Debugging
 
-- First check the `dux.log` file in the dux config directory (`~/.dux/` on macOS, `~/.config/dux/` on Linux).
+- First check the `yvo.log` file in the yvo config directory (`~/.yvo/` on macOS, `~/.config/yvo/` on Linux).
 - Confirm whether the provider command in `config.toml` is installed and on PATH.
 - If agent creation fails, determine whether it stopped in:
   - worktree creation
@@ -135,7 +135,7 @@ When shelling out to git, **always ensure the command output is immune to user-s
 - Keep changes scoped to one submodule at a time; avoid cross-cutting edits across multiple app submodules in the same PR when possible.
 - Use `theme.rs` constants for all colors and styles — never use raw `Color::*` values in rendering code.
 - When adding new UI elements, reuse existing semantic color names in `Theme` when they fit. Define a new semantic color only when no existing token fits, and update every supported theme/default mapping in the same change. `theme.rs` is the single source of truth for visual styling.
-- The canonical config renderer produces a fully commented config on first creation. Subsequent saves preserve user edits via `toml_edit`. Users can run `dux config diff` to see what changed or `dux config regenerate` to get the latest canonical template.
+- The canonical config renderer produces a fully commented config on first creation. Subsequent saves preserve user edits via `toml_edit`. Users can run `yvo config diff` to see what changed or `yvo config regenerate` to get the latest canonical template.
 - When a setting can have a sensible default at first boot (e.g., the user's home directory, platform-specific paths), resolve and store the concrete value in `config.toml` right away — do not leave it commented out or empty. Users should see a working value they can edit, not a placeholder they have to fill in.
 - Preserve safe failure behavior around project refresh and failed agent startup.
 - **Never use byte-based `.len()` or `[..n]` slicing to truncate user-visible strings.** Terminal output, file paths, and UI text can contain multi-byte UTF-8 characters (box-drawing, block elements, CJK, emoji). Always use `.chars().count()` for length and `.chars().take(n).collect()` (or `char_indices().nth()`) for truncation. Byte-based slicing will panic if the index falls inside a multi-byte character.

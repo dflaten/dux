@@ -7,7 +7,7 @@ use opaline::{OpalineColor, Theme as OpalineTheme};
 use ratatui::prelude::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-use crate::config::DuxPaths;
+use crate::config::YvoPaths;
 
 /// Braille dot-pattern frames for spinner animations. Shared by the loading
 /// card, status line, and left-pane streaming indicator.
@@ -15,11 +15,20 @@ pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', 
 
 /// Name of the bundled default theme — also the value that ships in the
 /// generated `config.toml` on first boot.
-pub const DEFAULT_THEME_NAME: &str = "dux_dark";
+pub const DEFAULT_THEME_NAME: &str = "yvo_dark";
 
-/// The bundled `dux_dark` theme TOML, embedded at compile time so the default
+/// Accept the pre-rename default theme ids so an older config keeps working
+/// even if the user has not migrated the directory yet.
+fn normalize_theme_name(name: &str) -> &str {
+    match name {
+        "dux_dark" | "dux-dark" => DEFAULT_THEME_NAME,
+        other => other,
+    }
+}
+
+/// The bundled `yvo_dark` theme TOML, embedded at compile time so the default
 /// path never depends on a file on disk.
-const DUX_DARK_TOML: &str = include_str!("../assets/themes/dux_dark.toml");
+const YVO_DARK_TOML: &str = include_str!("../assets/themes/yvo_dark.toml");
 
 const GITHUB_PR_OPEN_BG: OpalineColor = OpalineColor::new(35, 134, 54);
 const GITHUB_PR_MERGED_BG: OpalineColor = OpalineColor::new(130, 80, 223);
@@ -29,7 +38,7 @@ const GITHUB_PR_MERGED_LABEL: OpalineColor = OpalineColor::new(170, 100, 220);
 const GITHUB_PR_CLOSED_LABEL: OpalineColor = OpalineColor::new(140, 80, 80);
 
 pub struct Theme {
-    /// Base surface color for the dux app — used as a frame-wide pre-fill so
+    /// Base surface color for the yvo app — used as a frame-wide pre-fill so
     /// every cell that no widget explicitly paints (gutters, modal interiors,
     /// the row behind the PR pill caps, etc.) inherits the active theme's
     /// background instead of the user's terminal default.
@@ -131,13 +140,14 @@ pub struct Theme {
 ///
 /// Resolution order:
 ///  1. `<config_dir>/themes/<name>.toml` — user-authored themes win first.
-///  2. The bundled `dux-dark` TOML (embedded at compile time).
+///  2. The bundled `yvo-dark` TOML (embedded at compile time).
 ///  3. An Opaline built-in (Catppuccin, Nord, Dracula, …). Names use
 ///     underscores, e.g. `tokyo_night`, `catppuccin_mocha`.
 ///
 /// Returns an error if none of the above match. The caller is expected to fall
 /// back to [`Theme::fallback`] in that case.
-pub fn load(name: &str, paths: &DuxPaths) -> Result<Theme> {
+pub fn load(name: &str, paths: &YvoPaths) -> Result<Theme> {
+    let name = normalize_theme_name(name);
     let user_path = paths.root.join("themes").join(format!("{name}.toml"));
     if user_path.exists() {
         return load_from_file(&user_path)
@@ -145,11 +155,11 @@ pub fn load(name: &str, paths: &DuxPaths) -> Result<Theme> {
     }
 
     if name == DEFAULT_THEME_NAME {
-        return load_from_str(DUX_DARK_TOML)
-            .context("bundled dux-dark theme failed to load (this is a dux bug)");
+        return load_from_str(YVO_DARK_TOML)
+            .context("bundled yvo-dark theme failed to load (this is a yvo bug)");
     }
 
-    // Theme ids in dux match opaline's TOML filenames (`catppuccin_mocha`,
+    // Theme ids in yvo match opaline's TOML filenames (`catppuccin_mocha`,
     // `tokyo_night`). Opaline's runtime registry uses kebab-case ids derived
     // from those filenames, so translate underscores → hyphens before the
     // lookup. The original form is also tried as a fallback to forgive any
@@ -157,7 +167,7 @@ pub fn load(name: &str, paths: &DuxPaths) -> Result<Theme> {
     let candidates: [String; 2] = [name.replace('_', "-"), name.to_string()];
     for candidate in candidates.iter() {
         if let Some(mut theme) = opaline::load_by_name(candidate) {
-            register_dux_defaults(&mut theme);
+            register_yvo_defaults(&mut theme);
             return Ok(Theme::from_opaline(&theme));
         }
     }
@@ -174,7 +184,7 @@ pub fn load(name: &str, paths: &DuxPaths) -> Result<Theme> {
 /// disambiguate same-named user themes from built-ins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeSource {
-    /// The bundled `dux-dark` theme — always present, always first in the list.
+    /// The bundled `yvo-dark` theme — always present, always first in the list.
     Bundled,
     /// A theme compiled into the opaline crate (e.g. `nord`, `catppuccin-mocha`).
     Opaline,
@@ -186,18 +196,18 @@ pub enum ThemeSource {
 #[derive(Clone, Debug)]
 pub struct ThemeListing {
     /// Identifier passed to [`load`] — file stem for user themes, kebab-case
-    /// id for built-ins, `dux-dark` for the bundled default.
+    /// id for built-ins, `yvo-dark` for the bundled default.
     pub id: String,
     /// Human-readable label shown in the picker.
     pub display_name: String,
     pub source: ThemeSource,
 }
 
-/// Enumerate every theme reachable from the dux runtime: the bundled
-/// `dux-dark`, the opaline built-ins, and any TOML files the user has
-/// dropped in `<config_dir>/themes/`. Sorted with `dux-dark` first, then
+/// Enumerate every theme reachable from the yvo runtime: the bundled
+/// `yvo-dark`, the opaline built-ins, and any TOML files the user has
+/// dropped in `<config_dir>/themes/`. Sorted with `yvo-dark` first, then
 /// user themes, then built-ins alphabetically — predictable scrolling.
-pub fn discover_available(paths: &DuxPaths) -> Vec<ThemeListing> {
+pub fn discover_available(paths: &YvoPaths) -> Vec<ThemeListing> {
     let mut themes = Vec::new();
 
     themes.push(ThemeListing {
@@ -217,9 +227,9 @@ pub fn discover_available(paths: &DuxPaths) -> Vec<ThemeListing> {
                 }
                 let stem = path.file_stem()?.to_str()?.to_string();
                 if stem == DEFAULT_THEME_NAME {
-                    // dux-dark stays the bundled entry; a user file with the
+                    // yvo-dark stays the bundled entry; a user file with the
                     // same name still loads first via `theme::load`, but we
-                    // don't show two "dux-dark" rows in the picker.
+                    // don't show two "yvo-dark" rows in the picker.
                     return None;
                 }
                 Some(ThemeListing {
@@ -251,10 +261,10 @@ pub fn discover_available(paths: &DuxPaths) -> Vec<ThemeListing> {
     themes
 }
 
-/// Load a theme by name and fall back to the bundled `dux-dark` if the lookup
+/// Load a theme by name and fall back to the bundled `yvo-dark` if the lookup
 /// fails. Returns the theme and an optional human-readable warning message
 /// suitable for the status line (`Some` only when a fallback occurred).
-pub fn load_or_fallback(name: &str, paths: &DuxPaths) -> (Theme, Option<String>) {
+pub fn load_or_fallback(name: &str, paths: &YvoPaths) -> (Theme, Option<String>) {
     match load(name, paths) {
         Ok(theme) => (theme, None),
         Err(err) => {
@@ -263,7 +273,7 @@ pub fn load_or_fallback(name: &str, paths: &DuxPaths) -> (Theme, Option<String>)
                 Theme::fallback(),
                 Some(format!(
                     "Theme '{name}' could not be loaded — falling back to {DEFAULT_THEME_NAME}. \
-                     See dux.log for details."
+                     See yvo.log for details."
                 )),
             )
         }
@@ -273,22 +283,22 @@ pub fn load_or_fallback(name: &str, paths: &DuxPaths) -> (Theme, Option<String>)
 fn load_from_file(path: &Path) -> Result<Theme> {
     let mut theme = opaline::load_from_file(path)
         .with_context(|| format!("opaline failed to parse {}", path.display()))?;
-    register_dux_defaults(&mut theme);
+    register_yvo_defaults(&mut theme);
     Ok(Theme::from_opaline(&theme))
 }
 
 fn load_from_str(toml_str: &str) -> Result<Theme> {
     let mut theme =
         opaline::load_from_str(toml_str, None).context("opaline failed to parse TOML")?;
-    register_dux_defaults(&mut theme);
+    register_yvo_defaults(&mut theme);
     Ok(Theme::from_opaline(&theme))
 }
 
-/// Inject derived `dux.*` tokens into a theme that doesn't already define
+/// Inject derived `yvo.*` tokens into a theme that doesn't already define
 /// them. This lets generic Opaline built-ins (Nord, Catppuccin, …) drive the
-/// dux UI without having to know the dux token namespace, while still letting
-/// dux-aware themes override every dux token explicitly.
-fn register_dux_defaults(theme: &mut OpalineTheme) {
+/// yvo UI without having to know the yvo token namespace, while still letting
+/// yvo-aware themes override every yvo token explicitly.
+fn register_yvo_defaults(theme: &mut OpalineTheme) {
     // Resolve the standard Opaline semantic tokens once. `theme.color()`
     // returns OpalineColor::FALLBACK (gray) for missing tokens, which keeps
     // unknown themes legible rather than panicking.
@@ -297,8 +307,8 @@ fn register_dux_defaults(theme: &mut OpalineTheme) {
     let text_dim = theme.color("text.dim");
     let bg_base = theme.color("bg.base");
     let bg_panel = theme.color("bg.panel");
-    theme.register_default_token("dux.app_bg", bg_base);
-    theme.register_default_token("dux.text_fg", text_primary);
+    theme.register_default_token("yvo.app_bg", bg_base);
+    theme.register_default_token("yvo.text_fg", text_primary);
     let bg_highlight = theme.color("bg.highlight");
     let bg_active = theme.color("bg.active");
     let accent_primary = theme.color("accent.primary");
@@ -311,118 +321,118 @@ fn register_dux_defaults(theme: &mut OpalineTheme) {
     let info = theme.color("info");
 
     // Header / chrome
-    theme.register_default_token("dux.header_fg", text_primary);
-    theme.register_default_token("dux.header_bg", bg_base);
-    theme.register_default_token("dux.header_label_fg", text_muted);
-    theme.register_default_token("dux.header_separator_fg", border_unfocused);
+    theme.register_default_token("yvo.header_fg", text_primary);
+    theme.register_default_token("yvo.header_bg", bg_base);
+    theme.register_default_token("yvo.header_label_fg", text_muted);
+    theme.register_default_token("yvo.header_separator_fg", border_unfocused);
 
     // Borders & titles
-    theme.register_default_token("dux.border_focused", border_focused);
-    theme.register_default_token("dux.border_normal", border_unfocused);
-    theme.register_default_token("dux.title_focused", accent_primary);
-    theme.register_default_token("dux.title_normal", text_muted);
+    theme.register_default_token("yvo.border_focused", border_focused);
+    theme.register_default_token("yvo.border_normal", border_unfocused);
+    theme.register_default_token("yvo.title_focused", accent_primary);
+    theme.register_default_token("yvo.title_normal", text_muted);
 
     // Selection
-    theme.register_default_token("dux.selection_fg", bg_base);
-    theme.register_default_token("dux.selection_bg", accent_primary);
+    theme.register_default_token("yvo.selection_fg", bg_base);
+    theme.register_default_token("yvo.selection_bg", accent_primary);
 
     // Projects & sessions
-    theme.register_default_token("dux.project_icon", accent_primary);
-    theme.register_default_token("dux.project_missing_fg", warning);
-    theme.register_default_token("dux.related_link_fg", accent_secondary);
-    theme.register_default_token("dux.session_active", text_primary);
-    theme.register_default_token("dux.session_detached", warning);
-    theme.register_default_token("dux.session_exited", text_dim);
-    theme.register_default_token("dux.session_deleting", text_dim);
+    theme.register_default_token("yvo.project_icon", accent_primary);
+    theme.register_default_token("yvo.project_missing_fg", warning);
+    theme.register_default_token("yvo.related_link_fg", accent_secondary);
+    theme.register_default_token("yvo.session_active", text_primary);
+    theme.register_default_token("yvo.session_detached", warning);
+    theme.register_default_token("yvo.session_exited", text_dim);
+    theme.register_default_token("yvo.session_deleting", text_dim);
 
     // Status line
-    theme.register_default_token("dux.status_info_fg", text_muted);
-    theme.register_default_token("dux.status_info_bg", bg_panel);
-    theme.register_default_token("dux.status_busy_fg", warning);
-    theme.register_default_token("dux.status_busy_bg", bg_panel);
-    theme.register_default_token("dux.status_error_fg", error);
-    theme.register_default_token("dux.status_error_bg", bg_panel);
+    theme.register_default_token("yvo.status_info_fg", text_muted);
+    theme.register_default_token("yvo.status_info_bg", bg_panel);
+    theme.register_default_token("yvo.status_busy_fg", warning);
+    theme.register_default_token("yvo.status_busy_bg", bg_panel);
+    theme.register_default_token("yvo.status_error_fg", error);
+    theme.register_default_token("yvo.status_error_bg", bg_panel);
 
     // Diff
-    theme.register_default_token("dux.diff_add", success);
-    theme.register_default_token("dux.diff_remove", error);
-    theme.register_default_token("dux.diff_hunk", accent_secondary);
-    theme.register_default_token("dux.diff_file_header", text_primary);
-    theme.register_default_token("dux.file_status_fg", warning);
-    theme.register_default_token("dux.diff_add_bg", bg_panel);
-    theme.register_default_token("dux.diff_remove_bg", bg_panel);
-    theme.register_default_token("dux.diff_binary_fg", warning);
-    theme.register_default_token("dux.diff_stat_add_fg", success);
-    theme.register_default_token("dux.diff_stat_remove_fg", error);
-    theme.register_default_token("dux.diff_line_number_fg", text_dim);
-    theme.register_default_token("dux.diff_line_number_sep", border_unfocused);
+    theme.register_default_token("yvo.diff_add", success);
+    theme.register_default_token("yvo.diff_remove", error);
+    theme.register_default_token("yvo.diff_hunk", accent_secondary);
+    theme.register_default_token("yvo.diff_file_header", text_primary);
+    theme.register_default_token("yvo.file_status_fg", warning);
+    theme.register_default_token("yvo.diff_add_bg", bg_panel);
+    theme.register_default_token("yvo.diff_remove_bg", bg_panel);
+    theme.register_default_token("yvo.diff_binary_fg", warning);
+    theme.register_default_token("yvo.diff_stat_add_fg", success);
+    theme.register_default_token("yvo.diff_stat_remove_fg", error);
+    theme.register_default_token("yvo.diff_line_number_fg", text_dim);
+    theme.register_default_token("yvo.diff_line_number_sep", border_unfocused);
 
     // Hint / footer bar
-    theme.register_default_token("dux.hint_key_fg", accent_primary);
-    theme.register_default_token("dux.hint_bracket_fg", text_dim);
-    theme.register_default_token("dux.hint_key_bg", bg_panel);
-    theme.register_default_token("dux.hint_desc_fg", text_muted);
-    theme.register_default_token("dux.hint_dim_key_fg", text_dim);
-    theme.register_default_token("dux.hint_dim_bracket_fg", border_unfocused);
-    theme.register_default_token("dux.hint_dim_desc_fg", text_dim);
-    theme.register_default_token("dux.hint_bar_bg", bg_panel);
+    theme.register_default_token("yvo.hint_key_fg", accent_primary);
+    theme.register_default_token("yvo.hint_bracket_fg", text_dim);
+    theme.register_default_token("yvo.hint_key_bg", bg_panel);
+    theme.register_default_token("yvo.hint_desc_fg", text_muted);
+    theme.register_default_token("yvo.hint_dim_key_fg", text_dim);
+    theme.register_default_token("yvo.hint_dim_bracket_fg", border_unfocused);
+    theme.register_default_token("yvo.hint_dim_desc_fg", text_dim);
+    theme.register_default_token("yvo.hint_bar_bg", bg_panel);
 
     // Overlays
-    theme.register_default_token("dux.overlay_border", border_focused);
-    theme.register_default_token("dux.overlay_bg", bg_panel);
-    theme.register_default_token("dux.overlay_dim_bg", bg_base);
-    theme.register_default_token("dux.overlay_dim_fg", text_dim);
-    theme.register_default_token("dux.prompt_cursor", accent_primary);
+    theme.register_default_token("yvo.overlay_border", border_focused);
+    theme.register_default_token("yvo.overlay_bg", bg_panel);
+    theme.register_default_token("yvo.overlay_dim_bg", bg_base);
+    theme.register_default_token("yvo.overlay_dim_fg", text_dim);
+    theme.register_default_token("yvo.prompt_cursor", accent_primary);
 
     // Provider / branch / scrollback
-    theme.register_default_token("dux.provider_label_fg", text_muted);
-    theme.register_default_token("dux.branch_fg", accent_primary);
-    theme.register_default_token("dux.terminal_hint_fg", text_dim);
-    theme.register_default_token("dux.scroll_indicator_fg", text_primary);
-    theme.register_default_token("dux.scroll_indicator_bg", bg_active);
-    theme.register_default_token("dux.warning_fg", warning);
+    theme.register_default_token("yvo.provider_label_fg", text_muted);
+    theme.register_default_token("yvo.branch_fg", accent_primary);
+    theme.register_default_token("yvo.terminal_hint_fg", text_dim);
+    theme.register_default_token("yvo.scroll_indicator_fg", text_primary);
+    theme.register_default_token("yvo.scroll_indicator_bg", bg_active);
+    theme.register_default_token("yvo.warning_fg", warning);
 
     // Buttons
-    theme.register_default_token("dux.button_active_fg", text_primary);
-    theme.register_default_token("dux.button_confirm_border", accent_primary);
-    theme.register_default_token("dux.button_danger_border", error);
+    theme.register_default_token("yvo.button_active_fg", text_primary);
+    theme.register_default_token("yvo.button_confirm_border", accent_primary);
+    theme.register_default_token("yvo.button_danger_border", error);
 
     // Help overlay
-    theme.register_default_token("dux.help_section_header_fg", accent_primary);
-    theme.register_default_token("dux.help_banner_fg", bg_base);
-    theme.register_default_token("dux.help_banner_bg", accent_primary);
-    theme.register_default_token("dux.help_body_fg", text_muted);
+    theme.register_default_token("yvo.help_section_header_fg", accent_primary);
+    theme.register_default_token("yvo.help_banner_fg", bg_base);
+    theme.register_default_token("yvo.help_banner_bg", accent_primary);
+    theme.register_default_token("yvo.help_body_fg", text_muted);
 
     // Input
-    theme.register_default_token("dux.input_cursor_fg", bg_base);
-    theme.register_default_token("dux.input_cursor_bg", text_primary);
-    theme.register_default_token("dux.input_label_fg", text_primary);
+    theme.register_default_token("yvo.input_cursor_fg", bg_base);
+    theme.register_default_token("yvo.input_cursor_bg", text_primary);
+    theme.register_default_token("yvo.input_label_fg", text_primary);
 
     // Misc UI surfaces
-    theme.register_default_token("dux.runtime_context_value_fg", info);
-    theme.register_default_token("dux.nudge_border", warning);
-    theme.register_default_token("dux.tip_pill_fg", text_primary);
-    theme.register_default_token("dux.tip_pill_bg", bg_highlight);
-    theme.register_default_token("dux.tip_text_fg", text_dim);
-    theme.register_default_token("dux.tip_highlight_fg", accent_secondary);
+    theme.register_default_token("yvo.runtime_context_value_fg", info);
+    theme.register_default_token("yvo.nudge_border", warning);
+    theme.register_default_token("yvo.tip_pill_fg", text_primary);
+    theme.register_default_token("yvo.tip_pill_bg", bg_highlight);
+    theme.register_default_token("yvo.tip_text_fg", text_dim);
+    theme.register_default_token("yvo.tip_highlight_fg", accent_secondary);
 
     // Pull request colors default to GitHub's PR state palette instead of the
     // active theme's semantic colors. User themes may still override these
-    // `dux.pr_*` tokens explicitly, but generic themes should not accidentally
+    // `yvo.pr_*` tokens explicitly, but generic themes should not accidentally
     // repaint GitHub-specific open/closed/merged statuses.
-    theme.register_default_token("dux.pr_open_bg", GITHUB_PR_OPEN_BG);
-    theme.register_default_token("dux.pr_merged_bg", GITHUB_PR_MERGED_BG);
-    theme.register_default_token("dux.pr_closed_bg", GITHUB_PR_CLOSED_BG);
-    theme.register_default_token("dux.pr_banner_fg", OpalineColor::WHITE);
-    theme.register_default_token("dux.pr_open_label", GITHUB_PR_OPEN_LABEL);
-    theme.register_default_token("dux.pr_merged_label", GITHUB_PR_MERGED_LABEL);
-    theme.register_default_token("dux.pr_closed_label", GITHUB_PR_CLOSED_LABEL);
+    theme.register_default_token("yvo.pr_open_bg", GITHUB_PR_OPEN_BG);
+    theme.register_default_token("yvo.pr_merged_bg", GITHUB_PR_MERGED_BG);
+    theme.register_default_token("yvo.pr_closed_bg", GITHUB_PR_CLOSED_BG);
+    theme.register_default_token("yvo.pr_banner_fg", OpalineColor::WHITE);
+    theme.register_default_token("yvo.pr_open_label", GITHUB_PR_OPEN_LABEL);
+    theme.register_default_token("yvo.pr_merged_label", GITHUB_PR_MERGED_LABEL);
+    theme.register_default_token("yvo.pr_closed_label", GITHUB_PR_CLOSED_LABEL);
 }
 
 /// Convert an [`OpalineColor`] (always RGB) into a [`ratatui::style::Color`],
 /// remapping a few canonical RGB values back to their named ANSI equivalents.
 ///
-/// The remap exists to keep the dux-dark default visually identical to the
+/// The remap exists to keep the yvo-dark default visually identical to the
 /// pre-Opaline palette, which used `Color::Cyan`, `Color::Yellow`, etc.
 /// directly. On terminals that honor the user's customized 16-color profile
 /// (where "cyan" may not be `#00ffff`), this preserves that behavior. Custom
@@ -445,103 +455,103 @@ fn into_ratatui(color: OpalineColor) -> Color {
 
 impl Theme {
     /// Build a [`Theme`] from a fully-resolved Opaline theme. Every field is
-    /// looked up via the `dux.<field>` namespace; defaults are injected by
-    /// [`register_dux_defaults`] before this is called, so missing tokens fall
+    /// looked up via the `yvo.<field>` namespace; defaults are injected by
+    /// [`register_yvo_defaults`] before this is called, so missing tokens fall
     /// back to standard Opaline semantic colors rather than the `FALLBACK`
     /// gray.
     pub fn from_opaline(theme: &OpalineTheme) -> Self {
         let pick = |token: &str| into_ratatui(theme.color(token));
         Self {
-            app_bg: pick("dux.app_bg"),
-            text_fg: pick("dux.text_fg"),
-            header_fg: pick("dux.header_fg"),
-            header_bg: pick("dux.header_bg"),
-            header_label_fg: pick("dux.header_label_fg"),
-            header_separator_fg: pick("dux.header_separator_fg"),
-            border_focused: pick("dux.border_focused"),
-            border_normal: pick("dux.border_normal"),
-            title_focused: pick("dux.title_focused"),
-            title_normal: pick("dux.title_normal"),
-            selection_fg: pick("dux.selection_fg"),
-            selection_bg: pick("dux.selection_bg"),
-            project_icon: pick("dux.project_icon"),
-            project_missing_fg: pick("dux.project_missing_fg"),
-            related_link_fg: pick("dux.related_link_fg"),
-            session_active: pick("dux.session_active"),
-            session_detached: pick("dux.session_detached"),
-            session_exited: pick("dux.session_exited"),
-            session_deleting: pick("dux.session_deleting"),
-            status_info_fg: pick("dux.status_info_fg"),
-            status_info_bg: pick("dux.status_info_bg"),
-            status_busy_fg: pick("dux.status_busy_fg"),
-            status_busy_bg: pick("dux.status_busy_bg"),
-            status_error_fg: pick("dux.status_error_fg"),
-            status_error_bg: pick("dux.status_error_bg"),
-            diff_add: pick("dux.diff_add"),
-            diff_remove: pick("dux.diff_remove"),
-            diff_hunk: pick("dux.diff_hunk"),
-            diff_file_header: pick("dux.diff_file_header"),
-            file_status_fg: pick("dux.file_status_fg"),
-            hint_key_fg: pick("dux.hint_key_fg"),
-            hint_bracket_fg: pick("dux.hint_bracket_fg"),
-            hint_key_bg: pick("dux.hint_key_bg"),
-            hint_desc_fg: pick("dux.hint_desc_fg"),
-            hint_dim_key_fg: pick("dux.hint_dim_key_fg"),
-            hint_dim_bracket_fg: pick("dux.hint_dim_bracket_fg"),
-            hint_dim_desc_fg: pick("dux.hint_dim_desc_fg"),
-            hint_bar_bg: pick("dux.hint_bar_bg"),
-            overlay_border: pick("dux.overlay_border"),
-            overlay_bg: pick("dux.overlay_bg"),
-            overlay_dim_bg: pick("dux.overlay_dim_bg"),
-            prompt_cursor: pick("dux.prompt_cursor"),
-            provider_label_fg: pick("dux.provider_label_fg"),
-            branch_fg: pick("dux.branch_fg"),
-            terminal_hint_fg: pick("dux.terminal_hint_fg"),
-            scroll_indicator_fg: pick("dux.scroll_indicator_fg"),
-            scroll_indicator_bg: pick("dux.scroll_indicator_bg"),
-            warning_fg: pick("dux.warning_fg"),
-            button_active_fg: pick("dux.button_active_fg"),
-            button_confirm_border: pick("dux.button_confirm_border"),
-            button_danger_border: pick("dux.button_danger_border"),
-            overlay_dim_fg: pick("dux.overlay_dim_fg"),
-            diff_add_bg: pick("dux.diff_add_bg"),
-            diff_remove_bg: pick("dux.diff_remove_bg"),
-            help_section_header_fg: pick("dux.help_section_header_fg"),
-            input_cursor_fg: pick("dux.input_cursor_fg"),
-            input_cursor_bg: pick("dux.input_cursor_bg"),
-            input_label_fg: pick("dux.input_label_fg"),
-            diff_binary_fg: pick("dux.diff_binary_fg"),
-            diff_stat_add_fg: pick("dux.diff_stat_add_fg"),
-            diff_stat_remove_fg: pick("dux.diff_stat_remove_fg"),
-            runtime_context_value_fg: pick("dux.runtime_context_value_fg"),
-            nudge_border: pick("dux.nudge_border"),
-            tip_pill_fg: pick("dux.tip_pill_fg"),
-            tip_pill_bg: pick("dux.tip_pill_bg"),
-            tip_text_fg: pick("dux.tip_text_fg"),
-            tip_highlight_fg: pick("dux.tip_highlight_fg"),
-            diff_line_number_fg: pick("dux.diff_line_number_fg"),
-            diff_line_number_sep: pick("dux.diff_line_number_sep"),
-            pr_open_bg: pick("dux.pr_open_bg"),
-            pr_merged_bg: pick("dux.pr_merged_bg"),
-            pr_closed_bg: pick("dux.pr_closed_bg"),
-            pr_banner_fg: pick("dux.pr_banner_fg"),
-            pr_merged_label: pick("dux.pr_merged_label"),
-            pr_closed_label: pick("dux.pr_closed_label"),
-            pr_open_label: pick("dux.pr_open_label"),
-            help_banner_fg: pick("dux.help_banner_fg"),
-            help_banner_bg: pick("dux.help_banner_bg"),
-            help_body_fg: pick("dux.help_body_fg"),
+            app_bg: pick("yvo.app_bg"),
+            text_fg: pick("yvo.text_fg"),
+            header_fg: pick("yvo.header_fg"),
+            header_bg: pick("yvo.header_bg"),
+            header_label_fg: pick("yvo.header_label_fg"),
+            header_separator_fg: pick("yvo.header_separator_fg"),
+            border_focused: pick("yvo.border_focused"),
+            border_normal: pick("yvo.border_normal"),
+            title_focused: pick("yvo.title_focused"),
+            title_normal: pick("yvo.title_normal"),
+            selection_fg: pick("yvo.selection_fg"),
+            selection_bg: pick("yvo.selection_bg"),
+            project_icon: pick("yvo.project_icon"),
+            project_missing_fg: pick("yvo.project_missing_fg"),
+            related_link_fg: pick("yvo.related_link_fg"),
+            session_active: pick("yvo.session_active"),
+            session_detached: pick("yvo.session_detached"),
+            session_exited: pick("yvo.session_exited"),
+            session_deleting: pick("yvo.session_deleting"),
+            status_info_fg: pick("yvo.status_info_fg"),
+            status_info_bg: pick("yvo.status_info_bg"),
+            status_busy_fg: pick("yvo.status_busy_fg"),
+            status_busy_bg: pick("yvo.status_busy_bg"),
+            status_error_fg: pick("yvo.status_error_fg"),
+            status_error_bg: pick("yvo.status_error_bg"),
+            diff_add: pick("yvo.diff_add"),
+            diff_remove: pick("yvo.diff_remove"),
+            diff_hunk: pick("yvo.diff_hunk"),
+            diff_file_header: pick("yvo.diff_file_header"),
+            file_status_fg: pick("yvo.file_status_fg"),
+            hint_key_fg: pick("yvo.hint_key_fg"),
+            hint_bracket_fg: pick("yvo.hint_bracket_fg"),
+            hint_key_bg: pick("yvo.hint_key_bg"),
+            hint_desc_fg: pick("yvo.hint_desc_fg"),
+            hint_dim_key_fg: pick("yvo.hint_dim_key_fg"),
+            hint_dim_bracket_fg: pick("yvo.hint_dim_bracket_fg"),
+            hint_dim_desc_fg: pick("yvo.hint_dim_desc_fg"),
+            hint_bar_bg: pick("yvo.hint_bar_bg"),
+            overlay_border: pick("yvo.overlay_border"),
+            overlay_bg: pick("yvo.overlay_bg"),
+            overlay_dim_bg: pick("yvo.overlay_dim_bg"),
+            prompt_cursor: pick("yvo.prompt_cursor"),
+            provider_label_fg: pick("yvo.provider_label_fg"),
+            branch_fg: pick("yvo.branch_fg"),
+            terminal_hint_fg: pick("yvo.terminal_hint_fg"),
+            scroll_indicator_fg: pick("yvo.scroll_indicator_fg"),
+            scroll_indicator_bg: pick("yvo.scroll_indicator_bg"),
+            warning_fg: pick("yvo.warning_fg"),
+            button_active_fg: pick("yvo.button_active_fg"),
+            button_confirm_border: pick("yvo.button_confirm_border"),
+            button_danger_border: pick("yvo.button_danger_border"),
+            overlay_dim_fg: pick("yvo.overlay_dim_fg"),
+            diff_add_bg: pick("yvo.diff_add_bg"),
+            diff_remove_bg: pick("yvo.diff_remove_bg"),
+            help_section_header_fg: pick("yvo.help_section_header_fg"),
+            input_cursor_fg: pick("yvo.input_cursor_fg"),
+            input_cursor_bg: pick("yvo.input_cursor_bg"),
+            input_label_fg: pick("yvo.input_label_fg"),
+            diff_binary_fg: pick("yvo.diff_binary_fg"),
+            diff_stat_add_fg: pick("yvo.diff_stat_add_fg"),
+            diff_stat_remove_fg: pick("yvo.diff_stat_remove_fg"),
+            runtime_context_value_fg: pick("yvo.runtime_context_value_fg"),
+            nudge_border: pick("yvo.nudge_border"),
+            tip_pill_fg: pick("yvo.tip_pill_fg"),
+            tip_pill_bg: pick("yvo.tip_pill_bg"),
+            tip_text_fg: pick("yvo.tip_text_fg"),
+            tip_highlight_fg: pick("yvo.tip_highlight_fg"),
+            diff_line_number_fg: pick("yvo.diff_line_number_fg"),
+            diff_line_number_sep: pick("yvo.diff_line_number_sep"),
+            pr_open_bg: pick("yvo.pr_open_bg"),
+            pr_merged_bg: pick("yvo.pr_merged_bg"),
+            pr_closed_bg: pick("yvo.pr_closed_bg"),
+            pr_banner_fg: pick("yvo.pr_banner_fg"),
+            pr_merged_label: pick("yvo.pr_merged_label"),
+            pr_closed_label: pick("yvo.pr_closed_label"),
+            pr_open_label: pick("yvo.pr_open_label"),
+            help_banner_fg: pick("yvo.help_banner_fg"),
+            help_banner_bg: pick("yvo.help_banner_bg"),
+            help_body_fg: pick("yvo.help_body_fg"),
         }
     }
 
     /// Last-resort theme used when `theme::load` fails. Loads the bundled
-    /// `dux-dark.toml` which is embedded at compile time, so this never fails
+    /// `yvo-dark.toml` which is embedded at compile time, so this never fails
     /// in a correctly-built binary.
     pub fn fallback() -> Self {
-        load_from_str(DUX_DARK_TOML).expect("bundled dux-dark theme must always parse")
+        load_from_str(YVO_DARK_TOML).expect("bundled yvo-dark theme must always parse")
     }
 
-    /// The original dux dark palette. Kept for tests, snapshots, and any
+    /// The original yvo dark palette. Kept for tests, snapshots, and any
     /// future caller that wants the exact pre-Opaline default without
     /// going through the loader. Equivalent to [`Self::fallback`].
     pub fn default_dark() -> Self {
@@ -647,7 +657,7 @@ impl Theme {
         // cells emit an SGR that overrides the surrounding pre-fill and
         // falls through to the user's terminal default — which on a dark
         // terminal kept those badges dark even after switching to a light
-        // dux theme.
+        // yvo theme.
         self.key_badge(key, self.app_bg)
     }
 
@@ -661,17 +671,17 @@ mod tests {
     use super::*;
 
     /// Snapshot of the original `Theme::default_dark()` palette, kept here as
-    /// an oracle so the bundled dux-dark TOML can be verified field-for-field
+    /// an oracle so the bundled yvo-dark TOML can be verified field-for-field
     /// against the pre-Opaline behavior.
     fn default_dark_archived() -> Theme {
         Theme {
             // app_bg matches the historical overlay_bg shade so dark-terminal
-            // dux-dark users see no perceptible change after the frame
+            // yvo-dark users see no perceptible change after the frame
             // pre-fill landed.
             app_bg: Color::Rgb(20, 20, 20),
             // text_fg matches the historical "default fg" — pure white on
             // dark — so unstyled body text (project names, modal "Current:"
-            // labels, etc.) renders identically to before for dux-dark.
+            // labels, etc.) renders identically to before for yvo-dark.
             text_fg: Color::White,
             header_fg: Color::White,
             header_bg: Color::Rgb(30, 30, 30),
@@ -753,12 +763,12 @@ mod tests {
         }
     }
 
-    /// Bundled dux-dark TOML must reproduce the original palette exactly,
-    /// field for field. If a token in `assets/themes/dux-dark.toml` is
+    /// Bundled yvo-dark TOML must reproduce the original palette exactly,
+    /// field for field. If a token in `assets/themes/yvo-dark.toml` is
     /// retyped wrong, this test will pinpoint which one drifted.
     #[test]
-    fn dux_dark_matches_original_palette() {
-        let actual = load_from_str(DUX_DARK_TOML).expect("bundled dux-dark must parse");
+    fn yvo_dark_matches_original_palette() {
+        let actual = load_from_str(YVO_DARK_TOML).expect("bundled yvo-dark must parse");
         let expected = default_dark_archived();
 
         macro_rules! assert_field {
@@ -858,7 +868,14 @@ mod tests {
     /// The fallback path must always produce a valid Theme — it is what the
     /// app falls back to when the user's configured theme name is unknown.
     #[test]
-    fn fallback_is_dux_dark() {
+    fn legacy_theme_names_map_to_bundled_default() {
+        assert_eq!(normalize_theme_name("dux_dark"), DEFAULT_THEME_NAME);
+        assert_eq!(normalize_theme_name("dux-dark"), DEFAULT_THEME_NAME);
+        assert_eq!(normalize_theme_name("nord"), "nord");
+    }
+
+    #[test]
+    fn fallback_is_yvo_dark() {
         let fallback = Theme::fallback();
         let archived = default_dark_archived();
         assert_eq!(fallback.border_focused, archived.border_focused);
@@ -867,14 +884,14 @@ mod tests {
         assert_eq!(fallback.app_bg, archived.app_bg);
     }
 
-    /// An Opaline built-in (no `dux.*` tokens defined) should still produce a
+    /// An Opaline built-in (no `yvo.*` tokens defined) should still produce a
     /// fully-populated Theme via the derivation registered in
-    /// `register_dux_defaults`. This guards against the trap of `from_opaline`
-    /// returning a sea of FALLBACK gray for non-dux themes.
+    /// `register_yvo_defaults`. This guards against the trap of `from_opaline`
+    /// returning a sea of FALLBACK gray for non-yvo themes.
     #[test]
     fn builtin_theme_loads_via_derivation() {
         let mut nord = opaline::load_by_name("nord").expect("nord built-in must exist");
-        register_dux_defaults(&mut nord);
+        register_yvo_defaults(&mut nord);
         let theme = Theme::from_opaline(&nord);
         // Nord's accent.primary is `nord8` (#88c0d0) — distinctly not the
         // FALLBACK gray, so this is a real assertion that derivation worked.
@@ -948,13 +965,13 @@ name = "Custom PR Theme"
 variant = "dark"
 
 [tokens]
-"dux.pr_open_bg" = "#010203"
-"dux.pr_merged_bg" = "#040506"
-"dux.pr_closed_bg" = "#070809"
-"dux.pr_banner_fg" = "#101112"
-"dux.pr_open_label" = "#131415"
-"dux.pr_merged_label" = "#161718"
-"dux.pr_closed_label" = "#192021"
+"yvo.pr_open_bg" = "#010203"
+"yvo.pr_merged_bg" = "#040506"
+"yvo.pr_closed_bg" = "#070809"
+"yvo.pr_banner_fg" = "#101112"
+"yvo.pr_open_label" = "#131415"
+"yvo.pr_merged_label" = "#161718"
+"yvo.pr_closed_label" = "#192021"
 "##,
         )
         .expect("theme must parse");

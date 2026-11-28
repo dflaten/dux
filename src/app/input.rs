@@ -126,7 +126,7 @@ pub(crate) fn build_remote_divergence_prompt(
         ));
     }
     out.push_str(&format!(
-        "\nDux did not change the local branch or push anything during this attempt.\n\n\
+        "\nYvo did not change the local branch or push anything during this attempt.\n\n\
          Inspect these commits with:\n\
          `git log --oneline refs/heads/{branch_name}..{}`\n\
          `git show <sha>`\n\n\
@@ -674,7 +674,7 @@ impl App {
         }
         // The files search field owns every key while it is active. Without
         // this, plain characters are handled by the global bindings first and
-        // typing `q` in a file search would quit dux. The commit message
+        // typing `q` in a file search would quit yvo. The commit message
         // input keeps priority when it is engaged.
         if self.focus == FocusPane::Files
             && self.files_search_active
@@ -2795,7 +2795,7 @@ impl App {
                 continue;
             }
             // Mouse events must be handled by the UI, not forwarded to the
-            // PTY. Dux mouse capture uses SGR (1006) encoding, so terminal
+            // PTY. Yvo mouse capture uses SGR (1006) encoding, so terminal
             // mouse events arrive as CSI `<…M` / `<…m`.
             if let Some(mouse_ev) = crate::raw_input::parse_sgr_mouse(seq) {
                 actions.push(SeqAction::Mouse(mouse_ev, seq.to_vec()));
@@ -7259,7 +7259,7 @@ impl App {
         };
 
         // Always handle scroll as host scrollback — never forward to the child
-        // process. The outer terminal's EnableMouseCapture means dux owns the
+        // process. The outer terminal's EnableMouseCapture means yvo owns the
         // mouse; forwarding scroll events causes confusion.
         provider.scroll(
             matches!(mouse.kind, MouseEventKind::ScrollUp),
@@ -8312,7 +8312,7 @@ mod tests {
         WorktreeCleanupCandidate,
     };
     use crate::clipboard::Clipboard;
-    use crate::config::{Config, DuxPaths, ProjectConfig};
+    use crate::config::{Config, ProjectConfig, YvoPaths};
     use crate::editor::{DetectedEditor, EditorKind};
     use crate::git;
     use crate::keybindings::{Action, BINDING_DEFS, BindingScope, RuntimeBindings};
@@ -8449,12 +8449,12 @@ mod tests {
         std::mem::forget(tmp);
         init_test_repo(&root);
 
-        let paths = DuxPaths {
+        let paths = YvoPaths {
             config_path: root.join("config.toml"),
             sessions_db_path: root.join("sessions.sqlite3"),
             worktrees_root: root.join("worktrees"),
-            control_socket_path: root.clone().join("dux.sock"),
-            lock_path: root.join("dux.lock"),
+            control_socket_path: root.clone().join("yvo.sock"),
+            lock_path: root.join("yvo.lock"),
             root: root.clone(),
         };
         std::fs::create_dir_all(&paths.worktrees_root).expect("worktrees dir");
@@ -10118,7 +10118,7 @@ not_a_real_action = ["x"]
                 ProjectWorktreeEntry {
                     path: PathBuf::from("/tmp/alpha"),
                     branch_name: "alpha".to_string(),
-                    is_managed_by_dux: true,
+                    is_managed_by_yvo: true,
                     existing_session_id: None,
                     is_external: false,
                     is_project_checkout: false,
@@ -10127,7 +10127,7 @@ not_a_real_action = ["x"]
                 ProjectWorktreeEntry {
                     path: PathBuf::from("/tmp/jukebox"),
                     branch_name: "feature/jukebox".to_string(),
-                    is_managed_by_dux: true,
+                    is_managed_by_yvo: true,
                     existing_session_id: None,
                     is_external: false,
                     is_project_checkout: false,
@@ -10164,7 +10164,7 @@ not_a_real_action = ["x"]
                 ProjectWorktreeEntry {
                     path: PathBuf::from("/tmp/alpha"),
                     branch_name: "alpha".to_string(),
-                    is_managed_by_dux: true,
+                    is_managed_by_yvo: true,
                     existing_session_id: None,
                     is_external: false,
                     is_project_checkout: false,
@@ -10173,7 +10173,7 @@ not_a_real_action = ["x"]
                 ProjectWorktreeEntry {
                     path: PathBuf::from("/tmp/beta"),
                     branch_name: "beta".to_string(),
-                    is_managed_by_dux: true,
+                    is_managed_by_yvo: true,
                     existing_session_id: None,
                     is_external: false,
                     is_project_checkout: false,
@@ -10237,7 +10237,7 @@ not_a_real_action = ["x"]
             entries: vec![ProjectWorktreeEntry {
                 path: PathBuf::from("/tmp/has-agent"),
                 branch_name: "main".to_string(),
-                is_managed_by_dux: true,
+                is_managed_by_yvo: true,
                 existing_session_id: Some("session-1".to_string()),
                 is_external: false,
                 is_project_checkout: false,
@@ -10270,7 +10270,7 @@ not_a_real_action = ["x"]
             entries: vec![ProjectWorktreeEntry {
                 path: worktree_path.clone(),
                 branch_name: "orphan".to_string(),
-                is_managed_by_dux: true,
+                is_managed_by_yvo: true,
                 existing_session_id: None,
                 is_external: false,
                 is_project_checkout: false,
@@ -10314,7 +10314,7 @@ not_a_real_action = ["x"]
             entries: vec![ProjectWorktreeEntry {
                 path: worktree_path,
                 branch_name: "feature/other-name".to_string(),
-                is_managed_by_dux: true,
+                is_managed_by_yvo: true,
                 existing_session_id: None,
                 is_external: false,
                 is_project_checkout: false,
@@ -10417,7 +10417,7 @@ not_a_real_action = ["x"]
             entries: vec![ProjectWorktreeEntry {
                 path: worktree_path.clone(),
                 branch_name: "feature".to_string(),
-                is_managed_by_dux: false,
+                is_managed_by_yvo: false,
                 existing_session_id: None,
                 is_external: true,
                 is_project_checkout: false,
@@ -10459,7 +10459,7 @@ not_a_real_action = ["x"]
             entries: vec![ProjectWorktreeEntry {
                 path: worktree_path,
                 branch_name: "feature".to_string(),
-                is_managed_by_dux: false,
+                is_managed_by_yvo: false,
                 existing_session_id: None,
                 is_external: true,
                 is_project_checkout: false,
@@ -12435,7 +12435,7 @@ cyan = "#00ffff"
 "error" = "#ff0000"
 "warning" = "#ffff00"
 "info" = "#00ffff"
-"dux.app_bg" = "#123456"
+"yvo.app_bg" = "#123456"
 "##,
         )
         .expect("write theme");
@@ -12475,7 +12475,7 @@ cyan = "#00ffff"
         app.prompt = PromptState::ResourceMonitor {
             rows: vec![
                 ResourceStats {
-                    label: "dux".into(),
+                    label: "yvo".into(),
                     pid: Some(1),
                     cpu_percent: 0.0,
                     rss_bytes: 0,
@@ -13495,7 +13495,7 @@ cyan = "#00ffff"
 
         assert!(
             app.should_resume_session(&session),
-            "opencode can resume once dux has captured its session id"
+            "opencode can resume once yvo has captured its session id"
         );
         let cfg = crate::app::provider_config(&app.config, &session.provider);
         assert_eq!(
@@ -13536,7 +13536,7 @@ cyan = "#00ffff"
                 );
                 assert!(
                     !opencode.resume_available,
-                    "opencode should not advertise resume until dux captures a session id"
+                    "opencode should not advertise resume until yvo captures a session id"
                 );
             }
             other => panic!("expected change-agent-provider prompt, got {other:?}"),
@@ -15716,7 +15716,7 @@ cyan = "#00ffff"
 
         assert!(
             app.terminal_selection.is_none(),
-            "Shift-click in mouse mode should clear stale dux text selection"
+            "Shift-click in mouse mode should clear stale yvo text selection"
         );
         assert!(
             app.terminal_selection_text.is_none(),
@@ -16731,7 +16731,7 @@ cyan = "#00ffff"
         );
         assert_eq!(
             app.status.message(),
-            "Scanning for inactive dux-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes."
+            "Scanning for inactive yvo-managed worktrees and scratch workspaces eligible for cleanup. The review list will appear when the scan finishes."
         );
     }
 
@@ -19256,7 +19256,7 @@ cyan = "#00ffff"
             .map(|cell| cell.symbol())
             .collect();
 
-        let expected = format!("dux {}", env!("DUX_DISPLAY_VERSION"));
+        let expected = format!("yvo {}", env!("YVO_DISPLAY_VERSION"));
         assert!(
             rendered.contains(&expected),
             "expected local build version label {expected:?}, got: {rendered}"
@@ -19522,7 +19522,7 @@ cyan = "#00ffff"
         app.projects.push(Project {
             id: id.to_string(),
             name: name.to_string(),
-            path: format!("/tmp/dux-test-{id}"),
+            path: format!("/tmp/yvo-test-{id}"),
             explicit_default_provider: None,
             default_provider: ProviderKind::from_str("codex"),
             leading_branch: Some("main".to_string()),
@@ -19550,7 +19550,7 @@ cyan = "#00ffff"
             provider: ProviderKind::from_str("codex"),
             source_branch: "main".to_string(),
             branch_name: branch.to_string(),
-            worktree_path: format!("/tmp/dux-test-{id}"),
+            worktree_path: format!("/tmp/yvo-test-{id}"),
             title: Some(title.to_string()),
             started_providers: Vec::new(),
             provider_session_ids: Default::default(),
@@ -19911,7 +19911,7 @@ cyan = "#00ffff"
             .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
             .expect("handle key");
 
-        assert!(!quit, "typing in the search must not quit dux");
+        assert!(!quit, "typing in the search must not quit yvo");
         assert!(matches!(app.prompt, PromptState::None));
         assert_eq!(app.left_search.text, "q");
     }
@@ -19927,7 +19927,7 @@ cyan = "#00ffff"
             .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
             .expect("handle key");
 
-        assert!(!quit, "typing in the search must not quit dux");
+        assert!(!quit, "typing in the search must not quit yvo");
         assert!(matches!(app.prompt, PromptState::None));
         assert_eq!(app.files_search.text, "q");
     }
